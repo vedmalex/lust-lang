@@ -27,9 +27,14 @@
 // Scope & Limitations explicitly acknowledged:
 // - Feasibility prototype only: does NOT construct actual `lust::bytecode::Value` (no VM runtime).
 // - CapacityLedger accounts for requested bytes with checked arithmetic, not OS allocator rounding.
-// - Does not expose C FFI exports or perform VM memory accounting transfer.
+//   `Arc<Mutex<LedgerState>>` and `ArenaDropWitness` are test-only measurement bookkeeping
+//   instrumentation excluded from bridge payload capacity accounting (never described as
+//   bridge-owned parser allocation).
+// - Does not expose C FFI exports or perform VM memory accounting transfer / VM quota adoption;
+//   does not claim to prove OS RSS/allocator usable size.
 
 use std::fmt;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 // ---------------------------------------------------------------------------
@@ -88,6 +93,13 @@ impl Default for LustJsonLimits {
 // Capacity Ledger & Pre-growth Reservation with Fault Injection
 // ---------------------------------------------------------------------------
 
+// TEST-ONLY MEASUREMENT BOOKKEEPING NOTE:
+// `LedgerState` and `CapacityLedger` (including `Arc<Mutex<LedgerState>>`) are
+// test-only measurement bookkeeping instrumentation used solely by probes to
+// track and verify bridge payload capacity constraints and lifecycle invariants.
+// This instrumentation bookkeeping is strictly excluded from bridge payload capacity
+// accounting and is never counted as bridge-owned parser allocation.
+
 #[derive(Debug, Default)]
 struct LedgerState {
     allocated: usize,
@@ -97,6 +109,9 @@ struct LedgerState {
     fail_after_reservations: Option<usize>,
 }
 
+/// Test-only capacity ledger tracking payload buffer allocation charges.
+/// The internal `Arc<Mutex<LedgerState>>` is probe measurement infrastructure,
+/// not bridge payload memory.
 #[derive(Debug, Clone)]
 pub struct CapacityLedger {
     state: Arc<Mutex<LedgerState>>,
@@ -259,9 +274,13 @@ impl<T> PreallocatedVec<T> {
     }
 
     pub fn release_early(&mut self) {
+        let detached = std::mem::take(&mut self.inner);
+        drop(detached);
+        self.capacity = 0;
         if self.reserved_bytes > 0 {
-            self.ledger.release(self.reserved_bytes);
+            let bytes = self.reserved_bytes;
             self.reserved_bytes = 0;
+            self.ledger.release(bytes);
         }
     }
 }
@@ -278,18 +297,25 @@ impl<T: fmt::Debug> fmt::Debug for PreallocatedVec<T> {
 
 impl<T> Drop for PreallocatedVec<T> {
     fn drop(&mut self) {
-        if self.reserved_bytes > 0 {
-            self.ledger.release(self.reserved_bytes);
-            self.reserved_bytes = 0;
-        }
+        self.release_early();
     }
 }
+
+// TEST-ONLY MEASUREMENT BOOKKEEPING NOTE:
+// `ArenaDropWitness` is a test-only instrumentation callback invoked strictly after
+// dropping the detached backing `Vec<u8>` storage and immediately before `ledger.release(...)`.
+// It allows probes to observe and verify that the backing buffer is physically deallocated before
+// the capacity ledger charge is released, without requiring global allocator hooks.
+// This callback and its captured state are strictly test-only instrumentation,
+// excluded from bridge payload capacity accounting (never counted as bridge-owned parser allocation).
+pub type ArenaDropWitness = Box<dyn FnMut(&CapacityLedger) + Send + 'static>;
 
 pub struct PreallocatedStringArena {
     bytes: Vec<u8>,
     capacity: usize,
     reserved_bytes: usize,
     ledger: CapacityLedger,
+    drop_witness: Option<ArenaDropWitness>,
 }
 
 impl fmt::Debug for PreallocatedStringArena {
@@ -298,6 +324,7 @@ impl fmt::Debug for PreallocatedStringArena {
             .field("capacity", &self.capacity)
             .field("len", &self.bytes.len())
             .field("reserved_bytes", &self.reserved_bytes)
+            .field("has_drop_witness", &self.drop_witness.is_some())
             .finish()
     }
 }
@@ -309,6 +336,7 @@ impl PreallocatedStringArena {
             capacity: 0,
             reserved_bytes: 0,
             ledger: ledger.clone(),
+            drop_witness: None,
         }
     }
 
@@ -333,7 +361,15 @@ impl PreallocatedStringArena {
             capacity,
             reserved_bytes,
             ledger: ledger.clone(),
+            drop_witness: None,
         })
+    }
+
+    pub fn set_drop_witness<F>(&mut self, witness: F)
+    where
+        F: FnMut(&CapacityLedger) + Send + 'static,
+    {
+        self.drop_witness = Some(Box::new(witness));
     }
 
     pub fn push_str(&mut self, s: &str) -> Result<(usize, usize), LustJsonStatus> {
@@ -385,19 +421,23 @@ impl PreallocatedStringArena {
     }
 
     pub fn release_early(&mut self) {
+        let detached = std::mem::take(&mut self.bytes);
+        drop(detached);
+        self.capacity = 0;
+        if let Some(mut witness_fn) = self.drop_witness.take() {
+            witness_fn(&self.ledger);
+        }
         if self.reserved_bytes > 0 {
-            self.ledger.release(self.reserved_bytes);
+            let bytes = self.reserved_bytes;
             self.reserved_bytes = 0;
+            self.ledger.release(bytes);
         }
     }
 }
 
 impl Drop for PreallocatedStringArena {
     fn drop(&mut self) {
-        if self.reserved_bytes > 0 {
-            self.ledger.release(self.reserved_bytes);
-            self.reserved_bytes = 0;
-        }
+        self.release_early();
     }
 }
 
@@ -712,6 +752,13 @@ impl<'a> BoundedLexer<'a> {
 
     pub fn ledger(&self) -> &CapacityLedger {
         &self.ledger
+    }
+
+    pub fn set_arena_drop_witness<F>(&mut self, witness: F)
+    where
+        F: FnMut(&CapacityLedger) + Send + 'static,
+    {
+        self.doc_arena.set_drop_witness(witness);
     }
 
     #[inline]
@@ -2153,6 +2200,10 @@ fn test_pre_growth_reservation_and_ledger_lifecycle() {
         BoundedLexer::new(r#"[{"a": 1, "a": 2}]"#, limits, err_ledger.clone()).unwrap();
     let parse_res = lexer_err.parse_root_arguments();
     assert_eq!(parse_res.err().unwrap(), LustJsonStatus::InvalidJson);
+    assert!(
+        err_ledger.allocated() > 0,
+        "Ledger must remain charged while lexer error instance and its allocations are live"
+    );
     drop(lexer_err);
     assert_eq!(
         err_ledger.allocated(),
@@ -2246,9 +2297,482 @@ fn test_prototype_limitations_evidence() {
     //
     // CANNOT establish (deferred to later gates):
     // 1. Actual `lust::bytecode::Value` construction (requires Lust VM & runtime integration).
-    // 2. Allocation identity & OS allocator rounding (CapacityLedger tracks requested bytes, not jemalloc page/chunk headers).
-    // 3. VM memory accounting transfer (requires active VM instance).
+    // 2. Allocation identity & OS allocator rounding (CapacityLedger tracks requested bytes, not jemalloc page/chunk headers;
+    //    `Arc<Mutex<LedgerState>>` and `ArenaDropWitness` are test-only measurement bookkeeping excluded from bridge payload capacity,
+    //    not bridge-owned parser allocation; probe does not use global allocator hooks and does not claim to prove OS RSS/allocator usable size).
+    // 3. VM memory accounting transfer / VM quota adoption (requires active VM instance).
     // 4. C ABI export & dynamic linker symbols.
 
     println!("All Gate 1 prototype capabilities and explicit limitations witnessed.");
+}
+
+#[test]
+fn test_drop_probe_allocation_released_before_ledger_decrement() {
+    println!("\n=== 9. DROP PROBE: BACKING STORAGE RELEASED BEFORE LEDGER DECREMENT ===");
+
+    struct DropProbe {
+        ledger: CapacityLedger,
+        dropped: Arc<AtomicBool>,
+        allocated_at_drop: Arc<AtomicUsize>,
+    }
+
+    impl Drop for DropProbe {
+        fn drop(&mut self) {
+            self.dropped.store(true, Ordering::SeqCst);
+            // Crucial verification: at the exact moment the element inside backing
+            // storage is dropped, the ledger charge must STILL be active.
+            self.allocated_at_drop
+                .store(self.ledger.allocated(), Ordering::SeqCst);
+        }
+    }
+
+    // --- Sub-test A: PreallocatedVec::release_early ---
+    {
+        let ledger = CapacityLedger::new(4096);
+        let dropped = Arc::new(AtomicBool::new(false));
+        let allocated_at_drop = Arc::new(AtomicUsize::new(0));
+
+        let mut pvec = PreallocatedVec::try_with_capacity(4, &ledger).unwrap();
+        let expected_bytes = 4 * std::mem::size_of::<DropProbe>();
+        assert_eq!(ledger.allocated(), expected_bytes);
+
+        pvec.push(DropProbe {
+            ledger: ledger.clone(),
+            dropped: dropped.clone(),
+            allocated_at_drop: allocated_at_drop.clone(),
+        })
+        .unwrap();
+
+        assert!(!dropped.load(Ordering::SeqCst));
+        assert_eq!(pvec.len(), 1);
+        assert_eq!(pvec.capacity(), 4);
+
+        // Call release_early: must drop backing storage detached Vec BEFORE decrementing ledger!
+        pvec.release_early();
+
+        assert!(
+            dropped.load(Ordering::SeqCst),
+            "DropProbe must be dropped when backing storage is released"
+        );
+        assert_eq!(
+            allocated_at_drop.load(Ordering::SeqCst),
+            expected_bytes,
+            "Ledger must remain fully charged while backing storage elements are being dropped"
+        );
+        assert_eq!(
+            ledger.allocated(),
+            0,
+            "Ledger charge must be released only after backing storage is dropped"
+        );
+        assert_eq!(pvec.capacity(), 0);
+        assert_eq!(pvec.len(), 0);
+
+        // Verify subsequent drop of already-released vector does not underflow or double-release
+        drop(pvec);
+        assert_eq!(ledger.allocated(), 0);
+    }
+
+    // --- Sub-test B: Wrapper Drop for PreallocatedVec ---
+    {
+        let ledger = CapacityLedger::new(4096);
+        let dropped = Arc::new(AtomicBool::new(false));
+        let allocated_at_drop = Arc::new(AtomicUsize::new(0));
+        let expected_bytes = 2 * std::mem::size_of::<DropProbe>();
+
+        {
+            let mut pvec = PreallocatedVec::try_with_capacity(2, &ledger).unwrap();
+            pvec.push(DropProbe {
+                ledger: ledger.clone(),
+                dropped: dropped.clone(),
+                allocated_at_drop: allocated_at_drop.clone(),
+            })
+            .unwrap();
+
+            assert_eq!(ledger.allocated(), expected_bytes);
+            assert!(!dropped.load(Ordering::SeqCst));
+            // pvec goes out of scope here, invoking <PreallocatedVec as Drop>::drop
+        }
+
+        assert!(
+            dropped.load(Ordering::SeqCst),
+            "DropProbe must be dropped on PreallocatedVec drop"
+        );
+        assert_eq!(
+            allocated_at_drop.load(Ordering::SeqCst),
+            expected_bytes,
+            "Ledger must remain charged when backing storage element is dropped by wrapper Drop"
+        );
+        assert_eq!(
+            ledger.allocated(),
+            0,
+            "Ledger must return to zero after wrapper Drop completes"
+        );
+    }
+
+    // --- Sub-test C: PreallocatedStringArena::release_early with ArenaDropWitness ---
+    {
+        let ledger = CapacityLedger::new(4096);
+        let witness_called = Arc::new(AtomicBool::new(false));
+        let allocated_at_witness = Arc::new(AtomicUsize::new(0));
+
+        let mut arena = PreallocatedStringArena::try_with_capacity(128, &ledger).unwrap();
+        arena.push_str("sample payload string").unwrap();
+
+        assert_eq!(ledger.allocated(), 128);
+        assert_eq!(arena.capacity(), 128);
+
+        let w_called = witness_called.clone();
+        let a_witness = allocated_at_witness.clone();
+        arena.set_drop_witness(move |l| {
+            w_called.store(true, Ordering::SeqCst);
+            // Crucial verification: at the moment the witness runs (strictly after
+            // the detached backing Vec<u8> has been dropped and strictly before ledger.release),
+            // the ledger charge must STILL be active and nonzero.
+            a_witness.store(l.allocated(), Ordering::SeqCst);
+        });
+
+        assert!(!witness_called.load(Ordering::SeqCst));
+
+        // Call release_early: must drop backing storage detached Vec<u8> BEFORE decrementing ledger,
+        // invoking the witness while the ledger is still charged!
+        arena.release_early();
+
+        assert!(
+            witness_called.load(Ordering::SeqCst),
+            "ArenaDropWitness must be invoked when arena backing storage is released early"
+        );
+        assert_eq!(
+            allocated_at_witness.load(Ordering::SeqCst),
+            128,
+            "Ledger must remain fully charged when arena backing storage is dropped in release_early"
+        );
+        assert_eq!(
+            ledger.allocated(),
+            0,
+            "Ledger charge must be released only after arena backing storage is dropped"
+        );
+        assert_eq!(arena.capacity(), 0);
+        assert_eq!(arena.len(), 0);
+
+        // Calling push_str on released arena must cleanly fail with Limit
+        assert_eq!(arena.push_str("more").unwrap_err(), LustJsonStatus::Limit);
+
+        // Subsequent drop must not double-decrement or double-fire witness
+        drop(arena);
+        assert_eq!(ledger.allocated(), 0);
+    }
+
+    // --- Sub-test D: Wrapper Drop for PreallocatedStringArena with ArenaDropWitness ---
+    {
+        let ledger = CapacityLedger::new(4096);
+        let witness_called = Arc::new(AtomicBool::new(false));
+        let allocated_at_witness = Arc::new(AtomicUsize::new(0));
+
+        {
+            let mut arena = PreallocatedStringArena::try_with_capacity(256, &ledger).unwrap();
+            arena.push_str("wrapper drop test payload").unwrap();
+            assert_eq!(ledger.allocated(), 256);
+
+            let w_called = witness_called.clone();
+            let a_witness = allocated_at_witness.clone();
+            arena.set_drop_witness(move |l| {
+                w_called.store(true, Ordering::SeqCst);
+                a_witness.store(l.allocated(), Ordering::SeqCst);
+            });
+
+            assert!(!witness_called.load(Ordering::SeqCst));
+            // arena goes out of scope here, invoking <PreallocatedStringArena as Drop>::drop
+        }
+
+        assert!(
+            witness_called.load(Ordering::SeqCst),
+            "ArenaDropWitness must be invoked on PreallocatedStringArena wrapper Drop"
+        );
+        assert_eq!(
+            allocated_at_witness.load(Ordering::SeqCst),
+            256,
+            "Ledger must remain charged when arena backing storage is dropped by wrapper Drop"
+        );
+        assert_eq!(
+            ledger.allocated(),
+            0,
+            "Ledger must return to zero after wrapper Drop completes"
+        );
+    }
+
+    // --- Sub-test E: Successful parsed-document destruction with ArenaDropWitness ---
+    {
+        let limits = LustJsonLimits {
+            max_depth: 4,
+            max_nodes: 8,
+            max_bridge_bytes: 100_000,
+            ..Default::default()
+        };
+        let ledger = CapacityLedger::new(limits.max_bridge_bytes);
+        let input = r#"["payload unescaped", "escaped \u0041"]"#;
+
+        let mut lexer = BoundedLexer::new(input, limits, ledger.clone())
+            .expect("Lexer pre-reservation should succeed");
+
+        let initial_reserved = ledger.allocated();
+        assert!(initial_reserved > 0);
+
+        let witness_called = Arc::new(AtomicBool::new(false));
+        let allocated_at_witness = Arc::new(AtomicUsize::new(0));
+        let w_called = witness_called.clone();
+        let a_witness = allocated_at_witness.clone();
+
+        // Arrange the arena witness on doc_arena BEFORE parsing/build_document transfers ownership:
+        lexer.set_arena_drop_witness(move |l| {
+            w_called.store(true, Ordering::SeqCst);
+            // Verify ledger charge is still nonzero when witness fires:
+            a_witness.store(l.allocated(), Ordering::SeqCst);
+        });
+
+        assert!(!witness_called.load(Ordering::SeqCst));
+
+        // Parse root arguments: transfers ownership of doc_nodes and doc_arena (with witness) to doc
+        let doc = lexer.parse_root_arguments().expect("Parse should succeed");
+        assert_eq!(doc.len(), 2);
+
+        // While document is live, ledger remains charged and witness must NOT have fired:
+        let doc_live_allocated = ledger.allocated();
+        assert!(
+            doc_live_allocated > 0,
+            "Ledger must remain charged while parsed document is live"
+        );
+        assert!(
+            !witness_called.load(Ordering::SeqCst),
+            "Witness must not fire while document is live"
+        );
+
+        // Drop the returned document:
+        drop(doc);
+
+        // Verify witness fired while ledger was still charged:
+        assert!(
+            witness_called.load(Ordering::SeqCst),
+            "ArenaDropWitness must fire during document destruction"
+        );
+        assert!(
+            allocated_at_witness.load(Ordering::SeqCst) > 0,
+            "Ledger must remain charged when arena backing storage is dropped during document destruction"
+        );
+        assert_eq!(
+            allocated_at_witness.load(Ordering::SeqCst),
+            input.len(),
+            "Arena charge must still be active when arena backing Vec is dropped"
+        );
+
+        // Verify ledger returns to exactly zero after drop returns:
+        assert_eq!(
+            ledger.allocated(),
+            0,
+            "Ledger must return to exactly zero after parsed document is dropped"
+        );
+    }
+
+    println!(
+        "PASS: DropProbe confirmed backing storage is physically dropped before ledger decrement."
+    );
+}
+
+#[test]
+fn test_parse_error_lifetime_and_ledger_cleanup() {
+    println!("\n=== 10. PARSE ERROR LIFETIME & LEDGER CLEANUP ===");
+
+    let limits = LustJsonLimits {
+        max_depth: 4,
+        max_nodes: 8,
+        max_bridge_bytes: 100_000,
+        ..Default::default()
+    };
+
+    let error_cases: [(&str, &str, LustJsonStatus); 7] = [
+        (
+            "syntax error (unclosed array)",
+            "[1, 2, ",
+            LustJsonStatus::InvalidJson,
+        ),
+        (
+            "trailing tokens after valid JSON",
+            "[1, 2] trailing",
+            LustJsonStatus::InvalidJson,
+        ),
+        (
+            "duplicate object keys",
+            r#"[{"k": 1, "k": 2}]"#,
+            LustJsonStatus::InvalidJson,
+        ),
+        ("depth limit exceeded", "[[[[[1]]]]]", LustJsonStatus::Limit),
+        (
+            "node ceiling exceeded",
+            "[1, 2, 3, 4, 5, 6, 7, 8, 9, 10]",
+            LustJsonStatus::Limit,
+        ),
+        (
+            "integer out of range (>i64::MAX)",
+            "[999999999999999999999999999999999999999999999999999999999999]",
+            LustJsonStatus::NumberRange,
+        ),
+        (
+            "invalid unicode escape surrogate",
+            r#"["\uD800"]"#,
+            LustJsonStatus::InvalidJson,
+        ),
+    ];
+
+    for (name, input, expected_status) in error_cases {
+        let ledger = CapacityLedger::new(limits.max_bridge_bytes);
+        let mut lexer = BoundedLexer::new(input, limits, ledger.clone())
+            .expect("Lexer pre-reservation should succeed");
+
+        let pre_reserved_bytes = ledger.allocated();
+        assert!(
+            pre_reserved_bytes > 0,
+            "[{}] Ledger must have pre-reserved capacity bytes before parse",
+            name
+        );
+
+        let parse_result = lexer.parse_root_arguments();
+        assert_eq!(
+            parse_result.unwrap_err(),
+            expected_status,
+            "[{}] Unexpected error status",
+            name
+        );
+
+        // INVARIANT 1: After parse error, while lexer is alive, ALL pre-allocated buffers
+        // remain held in memory and ledger charges remain strictly positive.
+        assert_eq!(
+            ledger.allocated(),
+            pre_reserved_bytes,
+            "[{}] Ledger charge must remain fully charged after parse error while lexer is alive",
+            name
+        );
+        assert!(
+            lexer.stack.capacity() > 0,
+            "[{}] Stack buffer must still be allocated",
+            name
+        );
+        assert!(
+            lexer.key_check_scratch.capacity() > 0,
+            "[{}] Scratch buffer must still be allocated",
+            name
+        );
+        assert!(
+            lexer.doc_nodes.capacity() > 0,
+            "[{}] Node buffer must still be allocated",
+            name
+        );
+        assert!(
+            lexer.doc_arena.capacity() > 0,
+            "[{}] Arena buffer must still be allocated",
+            name
+        );
+
+        // INVARIANT 2: Only after lexer and all its buffers are dropped does the ledger return to zero.
+        drop(lexer);
+        assert_eq!(
+            ledger.allocated(),
+            0,
+            "[{}] Ledger must return to exactly zero only after lexer and all owned buffers are dropped",
+            name
+        );
+    }
+
+    println!(
+        "PASS: Parse error cleanup and lifetime invariants verified across all error classes."
+    );
+}
+
+#[test]
+fn test_successful_parsed_document_destruction_witness() {
+    println!("\n=== 11. SUCCESSFUL PARSED DOCUMENT DESTRUCTION & ARENA DROP WITNESS ===");
+
+    let limits = LustJsonLimits {
+        max_depth: 8,
+        max_nodes: 64,
+        max_bridge_bytes: 100_000,
+        ..Default::default()
+    };
+
+    let test_inputs: [&str; 4] = [
+        r#"[]"#,
+        r#"["purely unescaped", 42, true, null]"#,
+        r#"["string with escapes: \n \t \u0041 \uD83D\uDE00"]"#,
+        r#"[{"key1": "value1", "key2": "value2 \u0066oo"}, [1, 2, "nested"]]"#,
+    ];
+
+    for input in test_inputs {
+        let ledger = CapacityLedger::new(limits.max_bridge_bytes);
+        let mut lexer = BoundedLexer::new(input, limits, ledger.clone())
+            .expect("Lexer pre-reservation should succeed");
+
+        let pre_reserved_bytes = ledger.allocated();
+        assert!(
+            pre_reserved_bytes > 0,
+            "Ledger must pre-reserve capacity before parse"
+        );
+
+        let witness_called = Arc::new(AtomicBool::new(false));
+        let allocated_at_witness = Arc::new(AtomicUsize::new(0));
+
+        let w_called = witness_called.clone();
+        let a_witness = allocated_at_witness.clone();
+
+        // 1. Arrange the arena witness on doc_arena BEFORE parsing/build_document transfers ownership
+        lexer.set_arena_drop_witness(move |l| {
+            w_called.store(true, Ordering::SeqCst);
+            a_witness.store(l.allocated(), Ordering::SeqCst);
+        });
+
+        assert!(!witness_called.load(Ordering::SeqCst));
+
+        // 2. Parse successfully and obtain returned document
+        let doc = lexer
+            .parse_root_arguments()
+            .expect("Parse should succeed for valid document");
+
+        // 3. Document is live: ledger remains charged, witness has not fired
+        let live_allocated = ledger.allocated();
+        assert!(
+            live_allocated > 0,
+            "Ledger must remain charged while document is live"
+        );
+        assert!(
+            !witness_called.load(Ordering::SeqCst),
+            "Arena witness must not fire while document is live"
+        );
+
+        // 4. Drop the returned document
+        drop(doc);
+
+        // 5. Verify witness fired while ledger was still charged
+        assert!(
+            witness_called.load(Ordering::SeqCst),
+            "Arena witness must fire when document and its arena are dropped"
+        );
+        let at_witness = allocated_at_witness.load(Ordering::SeqCst);
+        assert!(
+            at_witness > 0,
+            "Ledger charge must be nonzero when arena backing Vec is dropped"
+        );
+        assert_eq!(
+            at_witness,
+            input.len(),
+            "Arena charge must remain active until after backing Vec is dropped"
+        );
+
+        // 6. Verify ledger returns to exactly zero after drop returns
+        assert_eq!(
+            ledger.allocated(),
+            0,
+            "Ledger must return to exactly zero after document drop returns"
+        );
+    }
+
+    println!(
+        "PASS: Successful parsed-document destruction verified with per-instance arena drop witness."
+    );
 }
