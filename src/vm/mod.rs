@@ -223,6 +223,8 @@ pub struct VM {
     pub(super) export_prefix_stack: Vec<String>,
     #[cfg(feature = "std")]
     pub(super) exported_type_stubs: Vec<ModuleStub>,
+    pub(super) last_dispatched_target: Option<(usize, String)>,
+    pub(super) root_frame: Option<Box<CallFrame>>,
 }
 
 #[derive(Debug, Clone)]

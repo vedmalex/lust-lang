@@ -401,6 +401,17 @@ pub trait FromLustValue: Sized {
 pub trait FunctionArgs {
     fn into_values(self) -> Vec<Value>;
     fn validate_signature(function_name: &str, params: &[Type]) -> Result<()>;
+
+    /// OPT-07: Write arguments directly into destination slice without heap allocation.
+    fn write_args(self, dst: &mut [Value]) -> usize
+    where
+        Self: Sized,
+    {
+        let values = self.into_values();
+        let len = values.len();
+        dst[..len].clone_from_slice(&values);
+        len
+    }
 }
 
 impl IntoLustValue for Value {
@@ -1075,6 +1086,17 @@ where
         }
     }
 
+    fn write_args(self, dst: &mut [Value]) -> usize {
+        if T::is_unit() {
+            0
+        } else {
+            if !dst.is_empty() {
+                dst[0] = self.into_value();
+            }
+            1
+        }
+    }
+
     fn validate_signature(function_name: &str, params: &[Type]) -> Result<()> {
         if T::is_unit() {
             ensure_arity(function_name, params, 0)
@@ -1092,6 +1114,14 @@ where
 {
     fn into_values(self) -> Vec<Value> {
         vec![self.0.into_value(), self.1.into_value()]
+    }
+
+    fn write_args(self, dst: &mut [Value]) -> usize {
+        if dst.len() >= 2 {
+            dst[0] = self.0.into_value();
+            dst[1] = self.1.into_value();
+        }
+        2
     }
 
     fn validate_signature(function_name: &str, params: &[Type]) -> Result<()> {
@@ -1114,6 +1144,15 @@ where
             self.1.into_value(),
             self.2.into_value(),
         ]
+    }
+
+    fn write_args(self, dst: &mut [Value]) -> usize {
+        if dst.len() >= 3 {
+            dst[0] = self.0.into_value();
+            dst[1] = self.1.into_value();
+            dst[2] = self.2.into_value();
+        }
+        3
     }
 
     fn validate_signature(function_name: &str, params: &[Type]) -> Result<()> {
@@ -1139,6 +1178,16 @@ where
             self.2.into_value(),
             self.3.into_value(),
         ]
+    }
+
+    fn write_args(self, dst: &mut [Value]) -> usize {
+        if dst.len() >= 4 {
+            dst[0] = self.0.into_value();
+            dst[1] = self.1.into_value();
+            dst[2] = self.2.into_value();
+            dst[3] = self.3.into_value();
+        }
+        4
     }
 
     fn validate_signature(function_name: &str, params: &[Type]) -> Result<()> {
@@ -1167,6 +1216,17 @@ where
             self.3.into_value(),
             self.4.into_value(),
         ]
+    }
+
+    fn write_args(self, dst: &mut [Value]) -> usize {
+        if dst.len() >= 5 {
+            dst[0] = self.0.into_value();
+            dst[1] = self.1.into_value();
+            dst[2] = self.2.into_value();
+            dst[3] = self.3.into_value();
+            dst[4] = self.4.into_value();
+        }
+        5
     }
 
     fn validate_signature(function_name: &str, params: &[Type]) -> Result<()> {
