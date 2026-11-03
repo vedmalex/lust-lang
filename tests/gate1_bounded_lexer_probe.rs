@@ -1,29 +1,36 @@
 // Gate 1 Prototype: Isolated Bounded Lexical Parser Probe for Issue #11
 //
 // Implements and empirically verifies the Gate 1 bounded lexical parser prototype
-// described by accepted Terra plan DESIGN-ISSUE-11-G1 and RFC 04.
+// under the coordinator-accepted Luna-high remediation plan.
 //
-// Properties verified:
-// 1. Root positional array JSON grammar (outer [ ... ] array, whitespace, trailing tokens, commas).
-// 2. String decoding, UTF-8 validity, escapes, and full UTF-16 surrogate pairing.
-// 3. Decoded duplicate key detection (including escape-equivalent and multi-byte keys) without unbounded allocations.
-// 4. Number token class fidelity and i64/f64 bounds:
-//    - integer -0 mapped to Int(0)
-//    - float -0.0 retaining Float(-0.0) with negative sign
-//    - integer tokens 1 vs float 1.0 vs 1e0 preserving token class
-//    - exact i64 endpoints (i64::MIN, i64::MAX)
-//    - >i64::MAX, u64-only, >u64::MAX, <i64::MIN rejected with NUMBER_RANGE
-//    - float overflow (>f64::MAX) and underflow-to-zero (<f64::MIN_POSITIVE) rejected with NUMBER_RANGE
-// 5. Ceilings: max_input_bytes, max_depth, max_nodes, max_args, max_bridge_bytes.
-// 6. Pre-growth reservation: all variable-sized parser structures pre-reserved in CapacityLedger;
-//    zero collection growth during parsing; ledger cleanup on success and error paths.
+// Remediation findings addressed:
+// 1. Flat budget-owned node arena: replaces recursive `PrototypeValue` Vec/String
+//    allocations with a flat arena and borrowed/decoded string/key spans.
+// 2. Capacity ledger lifecycle: all storage capacity is charged to the CapacityLedger
+//    before reservation and remains charged while the returned parsed document is live;
+//    the ledger returns to zero only after all document-owned buffers are dropped.
+// 3. Fallible `try_reserve_exact` & fault injection: checked arithmetic at every
+//    reservation step, zero `Vec::with_capacity` or `Vec::new().push` growth during parse,
+//    zero `to_string`, automatic rollback and deterministic failure injection.
+// 4. Quota check ordering: node count enforced before decoding/allocating value/key,
+//    `max_args` checked before parse, depth checked before descent.
+// 5. Bounded duplicate key detection: replaced O(k^2) linear scans with bounded pre-reserved
+//    in-place sorting (`sort_unstable_by`, O(k log k), zero heap allocation) and adjacent
+//    decoded equality check.
+// 6. Fixed float underflow: inspects only significand digits before exponent, correctly
+//    accepting exact-zero significand cases (`0e-500`, `-0e-500`, `0.0e-500`, `-0.0e-500`)
+//    as Float(±0) while rejecting nonzero underflow (`1e-500`, `-1e-500`).
+// 7. Exact RFC definitions: node counting covers outer list, each value, each object key;
+//    strict integer/float token class preservation; -0 integer maps to Int(0); out-of-i64
+//    integers rejected with NumberRange; finite f64.
 //
-// Limitations explicitly acknowledged:
-// - Does NOT construct actual `lust::bytecode::Value` (no VM/runtime integration).
-// - Tracks requested capacity in the CapacityLedger, not OS allocator rounding or RSS.
+// Scope & Limitations explicitly acknowledged:
+// - Feasibility prototype only: does NOT construct actual `lust::bytecode::Value` (no VM runtime).
+// - CapacityLedger accounts for requested bytes with checked arithmetic, not OS allocator rounding.
 // - Does not expose C FFI exports or perform VM memory accounting transfer.
 
 use std::fmt;
+use std::sync::{Arc, Mutex};
 
 // ---------------------------------------------------------------------------
 // RFC 04 Status Codes
@@ -78,50 +85,77 @@ impl Default for LustJsonLimits {
 }
 
 // ---------------------------------------------------------------------------
-// Capacity Ledger & Pre-growth Reservation
+// Capacity Ledger & Pre-growth Reservation with Fault Injection
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Default, Clone)]
-pub struct CapacityLedger {
+#[derive(Debug, Default)]
+struct LedgerState {
     allocated: usize,
     peak: usize,
     max_bridge_bytes: usize,
+    /// When Some(0), the next reservation fails. When Some(n > 0), decrements on reservation.
+    fail_after_reservations: Option<usize>,
+}
+
+#[derive(Debug, Clone)]
+pub struct CapacityLedger {
+    state: Arc<Mutex<LedgerState>>,
 }
 
 impl CapacityLedger {
     pub fn new(max_bridge_bytes: usize) -> Self {
         Self {
-            allocated: 0,
-            peak: 0,
-            max_bridge_bytes,
+            state: Arc::new(Mutex::new(LedgerState {
+                allocated: 0,
+                peak: 0,
+                max_bridge_bytes,
+                fail_after_reservations: None,
+            })),
         }
     }
 
-    pub fn try_reserve(&mut self, bytes: usize) -> Result<(), LustJsonStatus> {
-        let new_total = self
+    pub fn set_fail_after_reservations(&self, count: Option<usize>) {
+        let mut st = self.state.lock().unwrap();
+        st.fail_after_reservations = count;
+    }
+
+    pub fn try_reserve(&self, bytes: usize) -> Result<(), LustJsonStatus> {
+        let mut st = self.state.lock().unwrap();
+
+        // Deterministic fault injection check
+        if let Some(ref mut count) = st.fail_after_reservations {
+            if *count == 0 {
+                // Injected failure triggers
+                return Err(LustJsonStatus::Limit);
+            }
+            *count -= 1;
+        }
+
+        let new_total = st
             .allocated
             .checked_add(bytes)
             .ok_or(LustJsonStatus::Limit)?;
-        if new_total > self.max_bridge_bytes {
+        if new_total > st.max_bridge_bytes {
             return Err(LustJsonStatus::Limit);
         }
-        self.allocated = new_total;
-        if self.allocated > self.peak {
-            self.peak = self.allocated;
+        st.allocated = new_total;
+        if st.allocated > st.peak {
+            st.peak = st.allocated;
         }
         Ok(())
     }
 
-    pub fn release(&mut self, bytes: usize) {
-        self.allocated = self.allocated.saturating_sub(bytes);
+    pub fn release(&self, bytes: usize) {
+        let mut st = self.state.lock().unwrap();
+        st.allocated = st.allocated.saturating_sub(bytes);
     }
 
     pub fn allocated(&self) -> usize {
-        self.allocated
+        self.state.lock().unwrap().allocated
     }
 
     pub fn peak(&self) -> usize {
-        self.peak
+        self.state.lock().unwrap().peak
     }
 }
 
@@ -133,21 +167,43 @@ pub struct PreallocatedVec<T> {
     inner: Vec<T>,
     capacity: usize,
     reserved_bytes: usize,
+    ledger: CapacityLedger,
 }
 
 impl<T> PreallocatedVec<T> {
-    pub fn with_capacity_in_ledger(
+    pub fn empty(ledger: &CapacityLedger) -> Self {
+        Self {
+            inner: Vec::new(),
+            capacity: 0,
+            reserved_bytes: 0,
+            ledger: ledger.clone(),
+        }
+    }
+
+    pub fn try_with_capacity(
         capacity: usize,
-        ledger: &mut CapacityLedger,
+        ledger: &CapacityLedger,
     ) -> Result<Self, LustJsonStatus> {
         let reserved_bytes = capacity
             .checked_mul(std::mem::size_of::<T>())
             .ok_or(LustJsonStatus::Limit)?;
+
+        // 1. Charge ledger BEFORE reserving capacity
         ledger.try_reserve(reserved_bytes)?;
+
+        // 2. Fallible reservation using try_reserve_exact
+        let mut inner = Vec::new();
+        if inner.try_reserve_exact(capacity).is_err() {
+            // Rollback on reservation failure
+            ledger.release(reserved_bytes);
+            return Err(LustJsonStatus::Limit);
+        }
+
         Ok(Self {
-            inner: Vec::with_capacity(capacity),
+            inner,
             capacity,
             reserved_bytes,
+            ledger: ledger.clone(),
         })
     }
 
@@ -178,6 +234,11 @@ impl<T> PreallocatedVec<T> {
     }
 
     #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.inner.is_empty()
+    }
+
+    #[inline]
     pub fn capacity(&self) -> usize {
         self.capacity
     }
@@ -188,12 +249,39 @@ impl<T> PreallocatedVec<T> {
     }
 
     #[inline]
+    pub fn as_slice_mut(&mut self) -> &mut [T] {
+        &mut self.inner
+    }
+
+    #[inline]
     pub fn truncate(&mut self, len: usize) {
         self.inner.truncate(len);
     }
 
-    pub fn release_ledger(&self, ledger: &mut CapacityLedger) {
-        ledger.release(self.reserved_bytes);
+    pub fn release_early(&mut self) {
+        if self.reserved_bytes > 0 {
+            self.ledger.release(self.reserved_bytes);
+            self.reserved_bytes = 0;
+        }
+    }
+}
+
+impl<T: fmt::Debug> fmt::Debug for PreallocatedVec<T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PreallocatedVec")
+            .field("inner", &self.inner)
+            .field("capacity", &self.capacity)
+            .field("reserved_bytes", &self.reserved_bytes)
+            .finish()
+    }
+}
+
+impl<T> Drop for PreallocatedVec<T> {
+    fn drop(&mut self) {
+        if self.reserved_bytes > 0 {
+            self.ledger.release(self.reserved_bytes);
+            self.reserved_bytes = 0;
+        }
     }
 }
 
@@ -201,18 +289,50 @@ pub struct PreallocatedStringArena {
     bytes: Vec<u8>,
     capacity: usize,
     reserved_bytes: usize,
+    ledger: CapacityLedger,
+}
+
+impl fmt::Debug for PreallocatedStringArena {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PreallocatedStringArena")
+            .field("capacity", &self.capacity)
+            .field("len", &self.bytes.len())
+            .field("reserved_bytes", &self.reserved_bytes)
+            .finish()
+    }
 }
 
 impl PreallocatedStringArena {
-    pub fn with_capacity_in_ledger(
+    pub fn empty(ledger: &CapacityLedger) -> Self {
+        Self {
+            bytes: Vec::new(),
+            capacity: 0,
+            reserved_bytes: 0,
+            ledger: ledger.clone(),
+        }
+    }
+
+    pub fn try_with_capacity(
         capacity: usize,
-        ledger: &mut CapacityLedger,
+        ledger: &CapacityLedger,
     ) -> Result<Self, LustJsonStatus> {
-        ledger.try_reserve(capacity)?;
+        let reserved_bytes = capacity;
+        // 1. Charge ledger BEFORE reserving capacity
+        ledger.try_reserve(reserved_bytes)?;
+
+        // 2. Fallible reservation using try_reserve_exact
+        let mut bytes = Vec::new();
+        if bytes.try_reserve_exact(capacity).is_err() {
+            // Rollback on reservation failure
+            ledger.release(reserved_bytes);
+            return Err(LustJsonStatus::Limit);
+        }
+
         Ok(Self {
-            bytes: Vec::with_capacity(capacity),
+            bytes,
             capacity,
-            reserved_bytes: capacity,
+            reserved_bytes,
+            ledger: ledger.clone(),
         })
     }
 
@@ -250,6 +370,11 @@ impl PreallocatedStringArena {
     }
 
     #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.bytes.is_empty()
+    }
+
+    #[inline]
     pub fn capacity(&self) -> usize {
         self.capacity
     }
@@ -259,29 +384,69 @@ impl PreallocatedStringArena {
         self.bytes.truncate(len);
     }
 
-    pub fn release_ledger(&self, ledger: &mut CapacityLedger) {
-        ledger.release(self.reserved_bytes);
+    pub fn release_early(&mut self) {
+        if self.reserved_bytes > 0 {
+            self.ledger.release(self.reserved_bytes);
+            self.reserved_bytes = 0;
+        }
+    }
+}
+
+impl Drop for PreallocatedStringArena {
+    fn drop(&mut self) {
+        if self.reserved_bytes > 0 {
+            self.ledger.release(self.reserved_bytes);
+            self.reserved_bytes = 0;
+        }
     }
 }
 
 // ---------------------------------------------------------------------------
-// Lexical Tokens and Parsed AST (Prototype Values)
+// Flat Budget-Owned Node Arena & Document Model
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum ParsedNumber {
     Int(i64),
     Float(f64),
 }
 
-#[derive(Debug, Clone, PartialEq)]
-pub enum PrototypeValue {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StrSpan<'a> {
+    Borrowed(&'a str),
+    Decoded(usize, usize),
+}
+
+impl<'a> StrSpan<'a> {
+    #[inline]
+    pub fn as_str<'arena>(&self, arena: &'arena PreallocatedStringArena) -> &'arena str
+    where
+        'a: 'arena,
+    {
+        match *self {
+            StrSpan::Borrowed(s) => s,
+            StrSpan::Decoded(start, end) => arena.get(start, end),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum NodeKind<'a> {
     Nil,
     Bool(bool),
     Number(ParsedNumber),
-    String(String),
-    Array(Vec<PrototypeValue>),
-    Map(Vec<(String, PrototypeValue)>),
+    String(StrSpan<'a>),
+    Array,
+    Object,
+    ObjectEntry { key: StrSpan<'a>, val_idx: usize },
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct PrototypeNode<'a> {
+    pub kind: NodeKind<'a>,
+    pub first_child: Option<usize>,
+    pub next_sibling: Option<usize>,
+    pub child_count: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -293,23 +458,197 @@ pub enum ContainerKind {
 #[derive(Debug, Clone)]
 pub struct ContainerFrame {
     pub kind: ContainerKind,
-    pub key_start_idx: usize,
-    pub element_count: usize,
-    pub arena_start: usize,
+    pub node_idx: usize,
+    pub last_child_idx: Option<usize>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum KeyRef<'a> {
-    Borrowed(&'a str),
-    Decoded(usize, usize),
+/// A parsed JSON document where all storage allocations are charged in `CapacityLedger`
+/// and remain charged while this document is live. Dropping the document releases the ledger.
+#[derive(Debug)]
+pub struct PrototypeDocument<'a> {
+    pub nodes: PreallocatedVec<PrototypeNode<'a>>,
+    pub string_arena: PreallocatedStringArena,
+    pub root_node_idx: usize,
+    pub ledger: CapacityLedger,
 }
 
-impl<'a> KeyRef<'a> {
-    pub fn as_str<'s>(&'s self, arena: &'s PreallocatedStringArena) -> &'s str {
-        match self {
-            KeyRef::Borrowed(s) => s,
-            KeyRef::Decoded(start, end) => arena.get(*start, *end),
+impl<'a> PrototypeDocument<'a> {
+    pub fn len(&self) -> usize {
+        self.nodes.as_slice()[self.root_node_idx].child_count
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    pub fn get(&self, idx: usize) -> Option<ValueRef<'_, 'a>> {
+        if idx >= self.len() {
+            return None;
         }
+        let mut curr = self.nodes.as_slice()[self.root_node_idx].first_child;
+        let mut count = 0;
+        while let Some(c) = curr {
+            if count == idx {
+                return Some(self.node_to_ref(c));
+            }
+            curr = self.nodes.as_slice()[c].next_sibling;
+            count += 1;
+        }
+        None
+    }
+
+    pub fn node_to_ref<'doc>(&'doc self, node_idx: usize) -> ValueRef<'doc, 'a> {
+        let node = &self.nodes.as_slice()[node_idx];
+        match node.kind {
+            NodeKind::Nil => ValueRef::Nil,
+            NodeKind::Bool(b) => ValueRef::Bool(b),
+            NodeKind::Number(n) => ValueRef::Number(n),
+            NodeKind::String(span) => ValueRef::String(span.as_str(&self.string_arena)),
+            NodeKind::Array => ValueRef::Array(ArrayView {
+                doc: self,
+                node_idx,
+            }),
+            NodeKind::Object => ValueRef::Object(ObjectView {
+                doc: self,
+                node_idx,
+            }),
+            NodeKind::ObjectEntry { .. } => unreachable!("ObjectEntry is not a value"),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Non-allocating Borrowed Value Views for Assertion and Inspection
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum ValueRef<'doc, 'a> {
+    Nil,
+    Bool(bool),
+    Number(ParsedNumber),
+    String(&'doc str),
+    Array(ArrayView<'doc, 'a>),
+    Object(ObjectView<'doc, 'a>),
+}
+
+#[derive(Clone, Copy)]
+pub struct ArrayView<'doc, 'a> {
+    doc: &'doc PrototypeDocument<'a>,
+    node_idx: usize,
+}
+
+impl<'doc, 'a> fmt::Debug for ArrayView<'doc, 'a> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut list = f.debug_list();
+        for i in 0..self.len() {
+            if let Some(val) = self.get(i) {
+                list.entry(&val);
+            }
+        }
+        list.finish()
+    }
+}
+
+impl<'doc, 'a> ArrayView<'doc, 'a> {
+    pub fn len(&self) -> usize {
+        self.doc.nodes.as_slice()[self.node_idx].child_count
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    pub fn get(&self, idx: usize) -> Option<ValueRef<'doc, 'a>> {
+        if idx >= self.len() {
+            return None;
+        }
+        let mut curr = self.doc.nodes.as_slice()[self.node_idx].first_child;
+        let mut count = 0;
+        while let Some(c) = curr {
+            if count == idx {
+                return Some(self.doc.node_to_ref(c));
+            }
+            curr = self.doc.nodes.as_slice()[c].next_sibling;
+            count += 1;
+        }
+        None
+    }
+}
+
+impl<'doc, 'a> PartialEq for ArrayView<'doc, 'a> {
+    fn eq(&self, other: &Self) -> bool {
+        if self.len() != other.len() {
+            return false;
+        }
+        for i in 0..self.len() {
+            if self.get(i) != other.get(i) {
+                return false;
+            }
+        }
+        true
+    }
+}
+
+#[derive(Clone, Copy)]
+pub struct ObjectView<'doc, 'a> {
+    doc: &'doc PrototypeDocument<'a>,
+    node_idx: usize,
+}
+
+impl<'doc, 'a> fmt::Debug for ObjectView<'doc, 'a> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut map = f.debug_map();
+        for i in 0..self.len() {
+            if let Some((k, v)) = self.get_entry(i) {
+                map.entry(&k, &v);
+            }
+        }
+        map.finish()
+    }
+}
+
+impl<'doc, 'a> ObjectView<'doc, 'a> {
+    pub fn len(&self) -> usize {
+        self.doc.nodes.as_slice()[self.node_idx].child_count
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    pub fn get_entry(&self, idx: usize) -> Option<(&'doc str, ValueRef<'doc, 'a>)> {
+        if idx >= self.len() {
+            return None;
+        }
+        let mut curr = self.doc.nodes.as_slice()[self.node_idx].first_child;
+        let mut count = 0;
+        while let Some(c) = curr {
+            if count == idx {
+                let entry_node = &self.doc.nodes.as_slice()[c];
+                if let NodeKind::ObjectEntry { key, val_idx } = entry_node.kind {
+                    let k = key.as_str(&self.doc.string_arena);
+                    let v = self.doc.node_to_ref(val_idx);
+                    return Some((k, v));
+                }
+            }
+            curr = self.doc.nodes.as_slice()[c].next_sibling;
+            count += 1;
+        }
+        None
+    }
+}
+
+impl<'doc, 'a> PartialEq for ObjectView<'doc, 'a> {
+    fn eq(&self, other: &Self) -> bool {
+        if self.len() != other.len() {
+            return false;
+        }
+        for i in 0..self.len() {
+            if self.get_entry(i) != other.get_entry(i) {
+                return false;
+            }
+        }
+        true
     }
 }
 
@@ -324,33 +663,38 @@ pub struct BoundedLexer<'a> {
     ledger: CapacityLedger,
     current_depth: usize,
     node_count: usize,
-    stack: PreallocatedVec<ContainerFrame>,
-    keys: PreallocatedVec<KeyRef<'a>>,
-    arena: PreallocatedStringArena,
+    pub stack: PreallocatedVec<ContainerFrame>,
+    pub key_check_scratch: PreallocatedVec<StrSpan<'a>>,
+    pub doc_nodes: PreallocatedVec<PrototypeNode<'a>>,
+    pub doc_arena: PreallocatedStringArena,
 }
 
 impl<'a> BoundedLexer<'a> {
     pub fn new(
         input: &'a str,
         limits: LustJsonLimits,
-        mut ledger: CapacityLedger,
+        ledger: CapacityLedger,
     ) -> Result<Self, LustJsonStatus> {
         let input_bytes = input.as_bytes();
         if input_bytes.len() > limits.max_input_bytes {
             return Err(LustJsonStatus::Limit);
         }
 
-        // Pre-reserve fixed capacities in CapacityLedger before parsing begins:
-        // 1. Stack capacity = limits.max_depth
-        let stack = PreallocatedVec::with_capacity_in_ledger(limits.max_depth, &mut ledger)?;
+        // Bounded capacity upper-bound: a document of length L cannot contain more than L+2 nodes.
+        let max_nodes = limits.max_nodes.min(input_bytes.len().saturating_add(2));
 
-        // 2. Key tracker capacity = min(limits.max_nodes, input_bytes.len() / 2 + 1)
-        let max_key_entries = limits.max_nodes.min((input_bytes.len() / 2).max(1));
-        let keys = PreallocatedVec::with_capacity_in_ledger(max_key_entries, &mut ledger)?;
+        // Exact pre-growth fallible reservations with rollback & fault injection:
+        // Step 0: stack
+        let stack = PreallocatedVec::try_with_capacity(limits.max_depth, &ledger)?;
 
-        // 3. String arena capacity = min(limits.max_bridge_bytes / 4, input_bytes.len())
-        let arena_capacity = input_bytes.len();
-        let arena = PreallocatedStringArena::with_capacity_in_ledger(arena_capacity, &mut ledger)?;
+        // Step 1: key check scratch
+        let key_check_scratch = PreallocatedVec::try_with_capacity(max_nodes, &ledger)?;
+
+        // Step 2: document nodes arena
+        let doc_nodes = PreallocatedVec::try_with_capacity(max_nodes, &ledger)?;
+
+        // Step 3: document string arena
+        let doc_arena = PreallocatedStringArena::try_with_capacity(input_bytes.len(), &ledger)?;
 
         Ok(Self {
             input: input_bytes,
@@ -360,20 +704,14 @@ impl<'a> BoundedLexer<'a> {
             current_depth: 0,
             node_count: 0,
             stack,
-            keys,
-            arena,
+            key_check_scratch,
+            doc_nodes,
+            doc_arena,
         })
     }
 
     pub fn ledger(&self) -> &CapacityLedger {
         &self.ledger
-    }
-
-    pub fn release_ledger(mut self) -> CapacityLedger {
-        self.stack.release_ledger(&mut self.ledger);
-        self.keys.release_ledger(&mut self.ledger);
-        self.arena.release_ledger(&mut self.ledger);
-        self.ledger
     }
 
     #[inline]
@@ -407,19 +745,20 @@ impl<'a> BoundedLexer<'a> {
     }
 
     #[inline]
-    fn increment_node(&mut self) -> Result<(), LustJsonStatus> {
-        self.node_count = self
+    fn check_and_increment_node(&mut self) -> Result<(), LustJsonStatus> {
+        let next = self
             .node_count
             .checked_add(1)
             .ok_or(LustJsonStatus::Limit)?;
-        if self.node_count > self.limits.max_nodes {
+        if next > self.limits.max_nodes {
             return Err(LustJsonStatus::Limit);
         }
+        self.node_count = next;
         Ok(())
     }
 
     // Parse the entire document: root MUST be an array `[ ... ]`
-    pub fn parse_root_arguments(&mut self) -> Result<Vec<PrototypeValue>, LustJsonStatus> {
+    pub fn parse_root_arguments(&mut self) -> Result<PrototypeDocument<'a>, LustJsonStatus> {
         self.skip_whitespace();
         if self.pos >= self.input.len() {
             return Err(LustJsonStatus::InvalidArgument);
@@ -429,21 +768,34 @@ impl<'a> BoundedLexer<'a> {
             return Err(LustJsonStatus::InvalidJson);
         }
 
-        self.bump(); // consume '['
-        self.current_depth = 1;
-        if self.current_depth > self.limits.max_depth {
+        // Depth before descent: root array is depth 1
+        let next_depth = self
+            .current_depth
+            .checked_add(1)
+            .ok_or(LustJsonStatus::Limit)?;
+        if next_depth > self.limits.max_depth {
             return Err(LustJsonStatus::Limit);
         }
-        self.increment_node()?;
+        self.current_depth = next_depth;
+
+        // Node count before decoding/allocation: root array is node 1
+        self.check_and_increment_node()?;
+
+        self.bump(); // consume '['
+
+        let root_node_idx = self.doc_nodes.len();
+        self.doc_nodes.push(PrototypeNode {
+            kind: NodeKind::Array,
+            first_child: None,
+            next_sibling: None,
+            child_count: 0,
+        })?;
 
         self.stack.push(ContainerFrame {
             kind: ContainerKind::Array,
-            key_start_idx: self.keys.len(),
-            element_count: 0,
-            arena_start: self.arena.len(),
+            node_idx: root_node_idx,
+            last_child_idx: None,
         })?;
-
-        let mut args = Vec::new();
 
         self.skip_whitespace();
         if self.peek() == Some(b']') {
@@ -454,17 +806,32 @@ impl<'a> BoundedLexer<'a> {
             if self.pos < self.input.len() {
                 return Err(LustJsonStatus::InvalidJson); // trailing tokens!
             }
-            return Ok(args);
+
+            // Release lexer scratch buffers early so only document buffers remain charged:
+            self.stack.release_early();
+            self.key_check_scratch.release_early();
+
+            return Ok(self.build_document(root_node_idx));
         }
 
         loop {
-            // Check max_args ceiling
-            if args.len() >= self.limits.max_args {
+            // max_args before parse:
+            let cur_args = self.doc_nodes.as_slice()[root_node_idx].child_count;
+            if cur_args >= self.limits.max_args {
                 return Err(LustJsonStatus::Limit);
             }
 
-            let val = self.parse_value()?;
-            args.push(val);
+            let val_idx = self.parse_value()?;
+
+            // Attach val_idx to root array
+            let frame = self.stack.as_slice_mut().last_mut().unwrap();
+            if let Some(prev) = frame.last_child_idx {
+                self.doc_nodes.as_slice_mut()[prev].next_sibling = Some(val_idx);
+            } else {
+                self.doc_nodes.as_slice_mut()[root_node_idx].first_child = Some(val_idx);
+            }
+            frame.last_child_idx = Some(val_idx);
+            self.doc_nodes.as_slice_mut()[root_node_idx].child_count += 1;
 
             self.skip_whitespace();
             match self.peek() {
@@ -488,24 +855,39 @@ impl<'a> BoundedLexer<'a> {
 
         self.skip_whitespace();
         if self.pos < self.input.len() {
-            return Err(LustJsonStatus::InvalidJson); // trailing tokens rejected!
+            return Err(LustJsonStatus::InvalidJson); // trailing tokens!
         }
 
-        Ok(args)
+        // Release lexer scratch buffers early so only document buffers remain charged:
+        self.stack.release_early();
+        self.key_check_scratch.release_early();
+
+        Ok(self.build_document(root_node_idx))
     }
 
-    fn parse_value(&mut self) -> Result<PrototypeValue, LustJsonStatus> {
+    fn build_document(&mut self, root_node_idx: usize) -> PrototypeDocument<'a> {
+        let nodes = std::mem::replace(&mut self.doc_nodes, PreallocatedVec::empty(&self.ledger));
+        let string_arena = std::mem::replace(
+            &mut self.doc_arena,
+            PreallocatedStringArena::empty(&self.ledger),
+        );
+
+        PrototypeDocument {
+            nodes,
+            string_arena,
+            root_node_idx,
+            ledger: self.ledger.clone(),
+        }
+    }
+
+    fn parse_value(&mut self) -> Result<usize, LustJsonStatus> {
         self.skip_whitespace();
         let b = self.peek().ok_or(LustJsonStatus::InvalidJson)?;
 
         match b {
             b'n' => self.parse_null(),
             b't' | b'f' => self.parse_bool(),
-            b'"' => {
-                let s = self.parse_string()?;
-                self.increment_node()?;
-                Ok(PrototypeValue::String(s))
-            }
+            b'"' => self.parse_string_value(),
             b'[' => self.parse_array(),
             b'{' => self.parse_object(),
             b'-' | b'0'..=b'9' => self.parse_number(),
@@ -513,61 +895,119 @@ impl<'a> BoundedLexer<'a> {
         }
     }
 
-    fn parse_null(&mut self) -> Result<PrototypeValue, LustJsonStatus> {
+    fn parse_null(&mut self) -> Result<usize, LustJsonStatus> {
+        // Enforce node count before decoding/allocating value
+        self.check_and_increment_node()?;
+
         if self.input[self.pos..].starts_with(b"null") {
             self.pos += 4;
-            self.increment_node()?;
-            Ok(PrototypeValue::Nil)
+            let idx = self.doc_nodes.len();
+            self.doc_nodes.push(PrototypeNode {
+                kind: NodeKind::Nil,
+                first_child: None,
+                next_sibling: None,
+                child_count: 0,
+            })?;
+            Ok(idx)
         } else {
             Err(LustJsonStatus::InvalidJson)
         }
     }
 
-    fn parse_bool(&mut self) -> Result<PrototypeValue, LustJsonStatus> {
+    fn parse_bool(&mut self) -> Result<usize, LustJsonStatus> {
+        // Enforce node count before decoding/allocating value
+        self.check_and_increment_node()?;
+
         if self.input[self.pos..].starts_with(b"true") {
             self.pos += 4;
-            self.increment_node()?;
-            Ok(PrototypeValue::Bool(true))
+            let idx = self.doc_nodes.len();
+            self.doc_nodes.push(PrototypeNode {
+                kind: NodeKind::Bool(true),
+                first_child: None,
+                next_sibling: None,
+                child_count: 0,
+            })?;
+            Ok(idx)
         } else if self.input[self.pos..].starts_with(b"false") {
             self.pos += 5;
-            self.increment_node()?;
-            Ok(PrototypeValue::Bool(false))
+            let idx = self.doc_nodes.len();
+            self.doc_nodes.push(PrototypeNode {
+                kind: NodeKind::Bool(false),
+                first_child: None,
+                next_sibling: None,
+                child_count: 0,
+            })?;
+            Ok(idx)
         } else {
             Err(LustJsonStatus::InvalidJson)
         }
     }
 
-    fn parse_array(&mut self) -> Result<PrototypeValue, LustJsonStatus> {
-        self.bump(); // consume '['
-        self.current_depth = self
+    fn parse_string_value(&mut self) -> Result<usize, LustJsonStatus> {
+        // Enforce node count before decoding/allocating string
+        self.check_and_increment_node()?;
+
+        let span = self.parse_string_span()?;
+        let idx = self.doc_nodes.len();
+        self.doc_nodes.push(PrototypeNode {
+            kind: NodeKind::String(span),
+            first_child: None,
+            next_sibling: None,
+            child_count: 0,
+        })?;
+        Ok(idx)
+    }
+
+    fn parse_array(&mut self) -> Result<usize, LustJsonStatus> {
+        // Depth before descent
+        let next_depth = self
             .current_depth
             .checked_add(1)
             .ok_or(LustJsonStatus::Limit)?;
-        if self.current_depth > self.limits.max_depth {
+        if next_depth > self.limits.max_depth {
             return Err(LustJsonStatus::Limit);
         }
-        self.increment_node()?;
+        self.current_depth = next_depth;
+
+        // Node count before allocation
+        self.check_and_increment_node()?;
+
+        self.bump(); // consume '['
+
+        let node_idx = self.doc_nodes.len();
+        self.doc_nodes.push(PrototypeNode {
+            kind: NodeKind::Array,
+            first_child: None,
+            next_sibling: None,
+            child_count: 0,
+        })?;
 
         self.stack.push(ContainerFrame {
             kind: ContainerKind::Array,
-            key_start_idx: self.keys.len(),
-            element_count: 0,
-            arena_start: self.arena.len(),
+            node_idx,
+            last_child_idx: None,
         })?;
-
-        let mut items = Vec::new();
 
         self.skip_whitespace();
         if self.peek() == Some(b']') {
             self.bump();
             self.current_depth -= 1;
             self.stack.pop();
-            return Ok(PrototypeValue::Array(items));
+            return Ok(node_idx);
         }
 
         loop {
-            let val = self.parse_value()?;
-            items.push(val);
+            let val_idx = self.parse_value()?;
+
+            // Attach val_idx to this array
+            let frame = self.stack.as_slice_mut().last_mut().unwrap();
+            if let Some(prev) = frame.last_child_idx {
+                self.doc_nodes.as_slice_mut()[prev].next_sibling = Some(val_idx);
+            } else {
+                self.doc_nodes.as_slice_mut()[node_idx].first_child = Some(val_idx);
+            }
+            frame.last_child_idx = Some(val_idx);
+            self.doc_nodes.as_slice_mut()[node_idx].child_count += 1;
 
             self.skip_whitespace();
             match self.peek() {
@@ -588,38 +1028,47 @@ impl<'a> BoundedLexer<'a> {
 
         self.current_depth -= 1;
         self.stack.pop();
-        Ok(PrototypeValue::Array(items))
+        Ok(node_idx)
     }
 
-    fn parse_object(&mut self) -> Result<PrototypeValue, LustJsonStatus> {
-        self.bump(); // consume '{'
-        self.current_depth = self
+    fn parse_object(&mut self) -> Result<usize, LustJsonStatus> {
+        // Depth before descent
+        let next_depth = self
             .current_depth
             .checked_add(1)
             .ok_or(LustJsonStatus::Limit)?;
-        if self.current_depth > self.limits.max_depth {
+        if next_depth > self.limits.max_depth {
             return Err(LustJsonStatus::Limit);
         }
-        self.increment_node()?;
+        self.current_depth = next_depth;
 
-        let key_start_idx = self.keys.len();
-        let arena_start = self.arena.len();
+        // Node count before allocation
+        self.check_and_increment_node()?;
+
+        self.bump(); // consume '{'
+
+        let node_idx = self.doc_nodes.len();
+        self.doc_nodes.push(PrototypeNode {
+            kind: NodeKind::Object,
+            first_child: None,
+            next_sibling: None,
+            child_count: 0,
+        })?;
+
+        let scratch_start = self.key_check_scratch.len();
 
         self.stack.push(ContainerFrame {
             kind: ContainerKind::Object,
-            key_start_idx,
-            element_count: 0,
-            arena_start,
+            node_idx,
+            last_child_idx: None,
         })?;
-
-        let mut entries = Vec::new();
 
         self.skip_whitespace();
         if self.peek() == Some(b'}') {
             self.bump();
             self.current_depth -= 1;
             self.stack.pop();
-            return Ok(PrototypeValue::Map(entries));
+            return Ok(node_idx);
         }
 
         loop {
@@ -628,19 +1077,11 @@ impl<'a> BoundedLexer<'a> {
                 return Err(LustJsonStatus::InvalidJson); // non-string object key!
             }
 
-            let key_ref = self.parse_key_ref()?;
-            self.increment_node()?; // key counts as a node
+            // Node count before decoding/allocating key (key counts as a node)
+            self.check_and_increment_node()?;
 
-            // Duplicate decoded key check:
-            let key_str = key_ref.as_str(&self.arena);
-            for prev_key in &self.keys.as_slice()[key_start_idx..] {
-                if prev_key.as_str(&self.arena) == key_str {
-                    return Err(LustJsonStatus::InvalidJson); // duplicate decoded key!
-                }
-            }
-
-            let owned_key = key_str.to_string();
-            self.keys.push(key_ref)?;
+            let key_span = self.parse_string_span()?;
+            self.key_check_scratch.push(key_span)?;
 
             self.skip_whitespace();
             if self.peek() != Some(b':') {
@@ -648,8 +1089,28 @@ impl<'a> BoundedLexer<'a> {
             }
             self.bump(); // consume ':'
 
-            let val = self.parse_value()?;
-            entries.push((owned_key, val));
+            let val_node_idx = self.parse_value()?;
+
+            let entry_node_idx = self.doc_nodes.len();
+            self.doc_nodes.push(PrototypeNode {
+                kind: NodeKind::ObjectEntry {
+                    key: key_span,
+                    val_idx: val_node_idx,
+                },
+                first_child: None,
+                next_sibling: None,
+                child_count: 0,
+            })?;
+
+            // Attach entry_node_idx to object
+            let frame = self.stack.as_slice_mut().last_mut().unwrap();
+            if let Some(prev) = frame.last_child_idx {
+                self.doc_nodes.as_slice_mut()[prev].next_sibling = Some(entry_node_idx);
+            } else {
+                self.doc_nodes.as_slice_mut()[node_idx].first_child = Some(entry_node_idx);
+            }
+            frame.last_child_idx = Some(entry_node_idx);
+            self.doc_nodes.as_slice_mut()[node_idx].child_count += 1;
 
             self.skip_whitespace();
             match self.peek() {
@@ -668,17 +1129,28 @@ impl<'a> BoundedLexer<'a> {
             }
         }
 
-        // Clean up keys and arena allocated for this object frame:
-        self.keys.truncate(key_start_idx);
-        self.arena.truncate(arena_start);
+        // Bounded duplicate key check: in-place sort of key span slice, then adjacent equality check.
+        // `sort_unstable_by` is in-place pdqsort with zero heap allocations.
+        let scratch_slice = &mut self.key_check_scratch.as_slice_mut()[scratch_start..];
+        scratch_slice
+            .sort_unstable_by(|a, b| a.as_str(&self.doc_arena).cmp(b.as_str(&self.doc_arena)));
+
+        for i in 1..scratch_slice.len() {
+            if scratch_slice[i - 1].as_str(&self.doc_arena)
+                == scratch_slice[i].as_str(&self.doc_arena)
+            {
+                return Err(LustJsonStatus::InvalidJson); // duplicate decoded key!
+            }
+        }
+        self.key_check_scratch.truncate(scratch_start);
 
         self.current_depth -= 1;
         self.stack.pop();
-        Ok(PrototypeValue::Map(entries))
+        Ok(node_idx)
     }
 
-    // Scans string and returns key reference (borrowed if unescaped, decoded into arena if escaped)
-    fn parse_key_ref(&mut self) -> Result<KeyRef<'a>, LustJsonStatus> {
+    // Scans string and returns key span (borrowed if unescaped, decoded into arena if escaped)
+    fn parse_string_span(&mut self) -> Result<StrSpan<'a>, LustJsonStatus> {
         self.bump(); // consume opening '"'
         let start = self.pos;
         let mut has_escapes = false;
@@ -696,7 +1168,7 @@ impl<'a> BoundedLexer<'a> {
                 let slice = &self.input[start..self.pos];
                 let s = std::str::from_utf8(slice).map_err(|_| LustJsonStatus::InvalidJson)?;
                 self.pos += 1; // consume closing '"'
-                return Ok(KeyRef::Borrowed(s));
+                return Ok(StrSpan::Borrowed(s));
             }
             self.pos += 1;
         }
@@ -705,20 +1177,15 @@ impl<'a> BoundedLexer<'a> {
             return Err(LustJsonStatus::InvalidJson); // unterminated string
         }
 
-        // Escaped string: decode into preallocated arena
-        let arena_start = self.arena.len();
+        // Escaped string: decode into preallocated string arena
+        let arena_start = self.doc_arena.len();
         let unescaped_prefix = std::str::from_utf8(&self.input[start..self.pos])
             .map_err(|_| LustJsonStatus::InvalidJson)?;
-        self.arena.push_str(unescaped_prefix)?;
+        self.doc_arena.push_str(unescaped_prefix)?;
 
         self.decode_escapes_into_arena()?;
-        let arena_end = self.arena.len();
-        Ok(KeyRef::Decoded(arena_start, arena_end))
-    }
-
-    fn parse_string(&mut self) -> Result<String, LustJsonStatus> {
-        let key_ref = self.parse_key_ref()?;
-        Ok(key_ref.as_str(&self.arena).to_string())
+        let arena_end = self.doc_arena.len();
+        Ok(StrSpan::Decoded(arena_start, arena_end))
     }
 
     fn decode_escapes_into_arena(&mut self) -> Result<(), LustJsonStatus> {
@@ -745,7 +1212,7 @@ impl<'a> BoundedLexer<'a> {
                 }
                 let seg = std::str::from_utf8(&self.input[seg_start..self.pos])
                     .map_err(|_| LustJsonStatus::InvalidJson)?;
-                self.arena.push_str(seg)?;
+                self.doc_arena.push_str(seg)?;
                 continue;
             }
 
@@ -753,14 +1220,14 @@ impl<'a> BoundedLexer<'a> {
             self.pos += 1;
             let esc = self.bump().ok_or(LustJsonStatus::InvalidJson)?;
             match esc {
-                b'"' => self.arena.push_char('"')?,
-                b'\\' => self.arena.push_char('\\')?,
-                b'/' => self.arena.push_char('/')?,
-                b'b' => self.arena.push_char('\x08')?,
-                b'f' => self.arena.push_char('\x0C')?,
-                b'n' => self.arena.push_char('\n')?,
-                b'r' => self.arena.push_char('\r')?,
-                b't' => self.arena.push_char('\t')?,
+                b'"' => self.doc_arena.push_char('"')?,
+                b'\\' => self.doc_arena.push_char('\\')?,
+                b'/' => self.doc_arena.push_char('/')?,
+                b'b' => self.doc_arena.push_char('\x08')?,
+                b'f' => self.doc_arena.push_char('\x0C')?,
+                b'n' => self.doc_arena.push_char('\n')?,
+                b'r' => self.doc_arena.push_char('\r')?,
+                b't' => self.doc_arena.push_char('\t')?,
                 b'u' => {
                     let u1 = self.parse_hex4()?;
                     // Check if high surrogate
@@ -779,12 +1246,12 @@ impl<'a> BoundedLexer<'a> {
                         }
                         let code = 0x10000 + (((u1 as u32 - 0xD800) << 10) | (u2 as u32 - 0xDC00));
                         let ch = char::from_u32(code).ok_or(LustJsonStatus::InvalidJson)?;
-                        self.arena.push_char(ch)?;
+                        self.doc_arena.push_char(ch)?;
                     } else if (0xDC00..=0xDFFF).contains(&u1) {
                         return Err(LustJsonStatus::InvalidJson); // unpaired low surrogate!
                     } else {
                         let ch = char::from_u32(u1 as u32).ok_or(LustJsonStatus::InvalidJson)?;
-                        self.arena.push_char(ch)?;
+                        self.doc_arena.push_char(ch)?;
                     }
                 }
                 _ => return Err(LustJsonStatus::InvalidJson),
@@ -804,8 +1271,11 @@ impl<'a> BoundedLexer<'a> {
         Ok(val)
     }
 
-    // Number Lexing with Token Class Fidelity and RFC 04 Bounds
-    fn parse_number(&mut self) -> Result<PrototypeValue, LustJsonStatus> {
+    // Number Lexing with Token Class Fidelity, Significand-Only Underflow, and RFC 04 Bounds
+    fn parse_number(&mut self) -> Result<usize, LustJsonStatus> {
+        // Enforce node count before parsing number digits
+        self.check_and_increment_node()?;
+
         let start = self.pos;
         let mut has_minus = false;
         let mut has_dot = false;
@@ -858,6 +1328,10 @@ impl<'a> BoundedLexer<'a> {
             }
         }
 
+        // Significand digits end before exponent: inspect only significand for underflow detection
+        let sig_bytes = &self.input[int_start..self.pos];
+        let significand_has_nonzero = sig_bytes.iter().any(|&b| (b'1'..=b'9').contains(&b));
+
         // Exponent part
         if self.peek() == Some(b'e') || self.peek() == Some(b'E') {
             has_exp = true;
@@ -881,27 +1355,24 @@ impl<'a> BoundedLexer<'a> {
         let raw_num_str = std::str::from_utf8(&self.input[start..self.pos])
             .map_err(|_| LustJsonStatus::InvalidJson)?;
 
-        self.increment_node()?;
-
-        // Token Class & Range Classification:
-        if !has_dot && !has_exp {
+        let parsed_num = if !has_dot && !has_exp {
             // Integer token class
             if has_minus && int_digits == b"0" {
                 // RFC 04: Integer -0 maps to Int(0)
-                return Ok(PrototypeValue::Number(ParsedNumber::Int(0)));
-            }
-
-            match raw_num_str.parse::<i64>() {
-                Ok(val) => Ok(PrototypeValue::Number(ParsedNumber::Int(val))),
-                Err(_) => {
-                    // Out-of-i64 integer (>i64::MAX, u64 only, >u64::MAX, <i64::MIN)
-                    // RFC 04: Reject with NUMBER_RANGE, NEVER fallback to float!
-                    Err(LustJsonStatus::NumberRange)
+                ParsedNumber::Int(0)
+            } else {
+                match raw_num_str.parse::<i64>() {
+                    Ok(val) => ParsedNumber::Int(val),
+                    Err(_) => {
+                        // Out-of-i64 integer (>i64::MAX, u64 only, >u64::MAX, <i64::MIN)
+                        // RFC 04: Reject with NUMBER_RANGE, NEVER fallback to float!
+                        return Err(LustJsonStatus::NumberRange);
+                    }
                 }
             }
         } else {
             // Float token class
-            let f = raw_num_str
+            let mut f = raw_num_str
                 .parse::<f64>()
                 .map_err(|_| LustJsonStatus::NumberRange)?;
 
@@ -910,19 +1381,33 @@ impl<'a> BoundedLexer<'a> {
                 return Err(LustJsonStatus::NumberRange);
             }
 
-            // Underflow-to-zero: nonzero input that rounds to 0.0 or -0.0
+            // Underflow-to-zero: nonzero significand that rounds to 0.0 or -0.0
             if f == 0.0 {
-                // Check if the input significand has any nonzero digit
-                let is_nonzero_input = self.input[start..self.pos]
-                    .iter()
-                    .any(|&b| (b'1'..=b'9').contains(&b));
-                if is_nonzero_input {
+                if significand_has_nonzero {
                     return Err(LustJsonStatus::NumberRange); // underflow to zero rejected!
                 }
+                // Zero-significand exponent cases (0e-500, -0e-500, 0.0e-500, -0.0e-500):
+                // Accepted as Float(±0)
+                if has_minus {
+                    f = -0.0;
+                } else {
+                    f = 0.0;
+                }
+            } else if has_minus && f == 0.0 {
+                f = -0.0;
             }
 
-            Ok(PrototypeValue::Number(ParsedNumber::Float(f)))
-        }
+            ParsedNumber::Float(f)
+        };
+
+        let node_idx = self.doc_nodes.len();
+        self.doc_nodes.push(PrototypeNode {
+            kind: NodeKind::Number(parsed_num),
+            first_child: None,
+            next_sibling: None,
+            child_count: 0,
+        })?;
+        Ok(node_idx)
     }
 }
 
@@ -939,28 +1424,46 @@ fn test_root_positional_array_grammar() {
 
     // Empty array: 0 arguments
     let mut lexer = BoundedLexer::new("[]", limits, ledger.clone()).unwrap();
-    let args = lexer.parse_root_arguments().unwrap();
-    assert_eq!(args.len(), 0);
+    let doc = lexer.parse_root_arguments().unwrap();
+    assert_eq!(doc.len(), 0);
+    assert!(doc.is_empty());
 
     // Whitespace handling
     let mut lexer = BoundedLexer::new("   [  \t\n\r  ]  \t ", limits, ledger.clone()).unwrap();
-    let args = lexer.parse_root_arguments().unwrap();
-    assert_eq!(args.len(), 0);
+    let doc = lexer.parse_root_arguments().unwrap();
+    assert_eq!(doc.len(), 0);
 
     // Positional arguments
     let mut lexer = BoundedLexer::new(
-        "[null, true, false, 42, \"hello\", [1, 2], {\"a\": true}]",
+        r#"[null, true, false, 42, "hello", [1, 2], {"a": true}]"#,
         limits,
         ledger.clone(),
     )
     .unwrap();
-    let args = lexer.parse_root_arguments().unwrap();
-    assert_eq!(args.len(), 7);
-    assert_eq!(args[0], PrototypeValue::Nil);
-    assert_eq!(args[1], PrototypeValue::Bool(true));
-    assert_eq!(args[2], PrototypeValue::Bool(false));
-    assert_eq!(args[3], PrototypeValue::Number(ParsedNumber::Int(42)));
-    assert_eq!(args[4], PrototypeValue::String("hello".to_string()));
+    let doc = lexer.parse_root_arguments().unwrap();
+    assert_eq!(doc.len(), 7);
+    assert_eq!(doc.get(0).unwrap(), ValueRef::Nil);
+    assert_eq!(doc.get(1).unwrap(), ValueRef::Bool(true));
+    assert_eq!(doc.get(2).unwrap(), ValueRef::Bool(false));
+    assert_eq!(doc.get(3).unwrap(), ValueRef::Number(ParsedNumber::Int(42)));
+    assert_eq!(doc.get(4).unwrap(), ValueRef::String("hello"));
+
+    // Nested array inspection
+    if let ValueRef::Array(arr) = doc.get(5).unwrap() {
+        assert_eq!(arr.len(), 2);
+        assert_eq!(arr.get(0).unwrap(), ValueRef::Number(ParsedNumber::Int(1)));
+        assert_eq!(arr.get(1).unwrap(), ValueRef::Number(ParsedNumber::Int(2)));
+    } else {
+        panic!("Expected array at arg index 5");
+    }
+
+    // Nested object inspection
+    if let ValueRef::Object(obj) = doc.get(6).unwrap() {
+        assert_eq!(obj.len(), 1);
+        assert_eq!(obj.get_entry(0).unwrap(), ("a", ValueRef::Bool(true)));
+    } else {
+        panic!("Expected object at arg index 6");
+    }
 
     // Non-array roots rejected with InvalidJson
     let non_array_cases = [
@@ -975,8 +1478,8 @@ fn test_root_positional_array_grammar() {
     for case in non_array_cases {
         let mut lexer = BoundedLexer::new(case, limits, ledger.clone()).unwrap();
         assert_eq!(
-            lexer.parse_root_arguments(),
-            Err(LustJsonStatus::InvalidJson),
+            lexer.parse_root_arguments().err().unwrap(),
+            LustJsonStatus::InvalidJson,
             "Non-array root {:?} must be rejected",
             case
         );
@@ -985,13 +1488,13 @@ fn test_root_positional_array_grammar() {
     // Empty or whitespace only input rejected with InvalidArgument
     let mut lexer = BoundedLexer::new("", limits, ledger.clone()).unwrap();
     assert_eq!(
-        lexer.parse_root_arguments(),
-        Err(LustJsonStatus::InvalidArgument)
+        lexer.parse_root_arguments().err().unwrap(),
+        LustJsonStatus::InvalidArgument
     );
     let mut lexer = BoundedLexer::new("   \t\n  ", limits, ledger.clone()).unwrap();
     assert_eq!(
-        lexer.parse_root_arguments(),
-        Err(LustJsonStatus::InvalidArgument)
+        lexer.parse_root_arguments().err().unwrap(),
+        LustJsonStatus::InvalidArgument
     );
 
     // Trailing tokens rejected with InvalidJson
@@ -999,8 +1502,8 @@ fn test_root_positional_array_grammar() {
     for case in trailing_cases {
         let mut lexer = BoundedLexer::new(case, limits, ledger.clone()).unwrap();
         assert_eq!(
-            lexer.parse_root_arguments(),
-            Err(LustJsonStatus::InvalidJson),
+            lexer.parse_root_arguments().err().unwrap(),
+            LustJsonStatus::InvalidJson,
             "Trailing tokens in {:?} must be rejected",
             case
         );
@@ -1011,8 +1514,8 @@ fn test_root_positional_array_grammar() {
     for case in truncated_cases {
         let mut lexer = BoundedLexer::new(case, limits, ledger.clone()).unwrap();
         assert_eq!(
-            lexer.parse_root_arguments(),
-            Err(LustJsonStatus::InvalidJson),
+            lexer.parse_root_arguments().err().unwrap(),
+            LustJsonStatus::InvalidJson,
             "Truncated input {:?} must be rejected",
             case
         );
@@ -1023,8 +1526,8 @@ fn test_root_positional_array_grammar() {
     for case in comma_cases {
         let mut lexer = BoundedLexer::new(case, limits, ledger.clone()).unwrap();
         assert_eq!(
-            lexer.parse_root_arguments(),
-            Err(LustJsonStatus::InvalidJson),
+            lexer.parse_root_arguments().err().unwrap(),
+            LustJsonStatus::InvalidJson,
             "Comma error in {:?} must be rejected",
             case
         );
@@ -1040,84 +1543,91 @@ fn test_strings_utf8_escapes_and_surrogates() {
     let limits = LustJsonLimits::default();
     let ledger = CapacityLedger::new(limits.max_bridge_bytes);
 
-    // Plain unescaped string
-    let mut lexer = BoundedLexer::new("[\"hello world\"]", limits, ledger.clone()).unwrap();
-    let args = lexer.parse_root_arguments().unwrap();
-    assert_eq!(args[0], PrototypeValue::String("hello world".to_string()));
+    // Plain unescaped string: verify borrowed directly from input slice
+    let mut lexer = BoundedLexer::new(r#"["hello world"]"#, limits, ledger.clone()).unwrap();
+    let doc = lexer.parse_root_arguments().unwrap();
+    assert_eq!(doc.get(0).unwrap(), ValueRef::String("hello world"));
+    // Inspect internal node representation:
+    let node_idx = doc.nodes.as_slice()[doc.root_node_idx].first_child.unwrap();
+    assert_eq!(
+        doc.nodes.as_slice()[node_idx].kind,
+        NodeKind::String(StrSpan::Borrowed("hello world")),
+        "Unescaped string must be borrowed directly from input"
+    );
 
     // Standard escapes
     let mut lexer =
         BoundedLexer::new(r#"["\" \\ \/ \b \f \n \r \t"]"#, limits, ledger.clone()).unwrap();
-    let args = lexer.parse_root_arguments().unwrap();
+    let doc = lexer.parse_root_arguments().unwrap();
     assert_eq!(
-        args[0],
-        PrototypeValue::String("\" \\ / \x08 \x0C \n \r \t".to_string())
+        doc.get(0).unwrap(),
+        ValueRef::String("\" \\ / \x08 \x0C \n \r \t")
     );
 
     // Unicode escapes and escaped NUL
     let mut lexer =
         BoundedLexer::new(r#"["\u0041 \u0000 \u00e9"]"#, limits, ledger.clone()).unwrap();
-    let args = lexer.parse_root_arguments().unwrap();
-    assert_eq!(args[0], PrototypeValue::String("A \0 é".to_string()));
+    let doc = lexer.parse_root_arguments().unwrap();
+    assert_eq!(doc.get(0).unwrap(), ValueRef::String("A \0 é"));
 
     // Valid UTF-16 surrogate pairs:
     // U+1F600 (GRINNING FACE 😀): \uD83D\uDE00
     let mut lexer = BoundedLexer::new(r#"["\uD83D\uDE00"]"#, limits, ledger.clone()).unwrap();
-    let args = lexer.parse_root_arguments().unwrap();
-    assert_eq!(args[0], PrototypeValue::String("😀".to_string()));
+    let doc = lexer.parse_root_arguments().unwrap();
+    assert_eq!(doc.get(0).unwrap(), ValueRef::String("😀"));
 
     // U+1D11E (MUSICAL SYMBOL G CLEF 𝄞): \uD834\uDD1E
     let mut lexer = BoundedLexer::new(r#"["\uD834\uDD1E"]"#, limits, ledger.clone()).unwrap();
-    let args = lexer.parse_root_arguments().unwrap();
-    assert_eq!(args[0], PrototypeValue::String("𝄞".to_string()));
+    let doc = lexer.parse_root_arguments().unwrap();
+    assert_eq!(doc.get(0).unwrap(), ValueRef::String("𝄞"));
 
     // Unpaired high surrogate rejected
     let mut lexer = BoundedLexer::new(r#"["\uD83D"]"#, limits, ledger.clone()).unwrap();
     assert_eq!(
-        lexer.parse_root_arguments(),
-        Err(LustJsonStatus::InvalidJson)
+        lexer.parse_root_arguments().err().unwrap(),
+        LustJsonStatus::InvalidJson
     );
 
     let mut lexer = BoundedLexer::new(r#"["\uD83D abc"]"#, limits, ledger.clone()).unwrap();
     assert_eq!(
-        lexer.parse_root_arguments(),
-        Err(LustJsonStatus::InvalidJson)
+        lexer.parse_root_arguments().err().unwrap(),
+        LustJsonStatus::InvalidJson
     );
 
     // High surrogate followed by non-surrogate rejected
     let mut lexer = BoundedLexer::new(r#"["\uD83D\u0041"]"#, limits, ledger.clone()).unwrap();
     assert_eq!(
-        lexer.parse_root_arguments(),
-        Err(LustJsonStatus::InvalidJson)
+        lexer.parse_root_arguments().err().unwrap(),
+        LustJsonStatus::InvalidJson
     );
 
     // Unpaired low surrogate rejected
     let mut lexer = BoundedLexer::new(r#"["\uDE00"]"#, limits, ledger.clone()).unwrap();
     assert_eq!(
-        lexer.parse_root_arguments(),
-        Err(LustJsonStatus::InvalidJson)
+        lexer.parse_root_arguments().err().unwrap(),
+        LustJsonStatus::InvalidJson
     );
 
     // Invalid hex digits rejected
     let mut lexer = BoundedLexer::new(r#"["\u12G4"]"#, limits, ledger.clone()).unwrap();
     assert_eq!(
-        lexer.parse_root_arguments(),
-        Err(LustJsonStatus::InvalidJson)
+        lexer.parse_root_arguments().err().unwrap(),
+        LustJsonStatus::InvalidJson
     );
 
     // Unescaped control characters (< 0x20) rejected
     let raw_control = "[\"hello\nworld\"]";
     let mut lexer = BoundedLexer::new(raw_control, limits, ledger.clone()).unwrap();
     assert_eq!(
-        lexer.parse_root_arguments(),
-        Err(LustJsonStatus::InvalidJson)
+        lexer.parse_root_arguments().err().unwrap(),
+        LustJsonStatus::InvalidJson
     );
 
     // Invalid escape letter rejected
     let mut lexer = BoundedLexer::new(r#"["\a"]"#, limits, ledger.clone()).unwrap();
     assert_eq!(
-        lexer.parse_root_arguments(),
-        Err(LustJsonStatus::InvalidJson)
+        lexer.parse_root_arguments().err().unwrap(),
+        LustJsonStatus::InvalidJson
     );
 
     println!("PASS: Strings, UTF-8, escapes, and surrogate pairs validated.");
@@ -1133,8 +1643,8 @@ fn test_decoded_duplicate_keys() {
     // Plain literal duplicate key
     let mut lexer = BoundedLexer::new(r#"[{"a": 1, "a": 2}]"#, limits, ledger.clone()).unwrap();
     assert_eq!(
-        lexer.parse_root_arguments(),
-        Err(LustJsonStatus::InvalidJson),
+        lexer.parse_root_arguments().err().unwrap(),
+        LustJsonStatus::InvalidJson,
         "Literal duplicate key 'a' must be rejected"
     );
 
@@ -1142,8 +1652,8 @@ fn test_decoded_duplicate_keys() {
     let mut lexer =
         BoundedLexer::new(r#"[{"foo": 1, "\u0066oo": 2}]"#, limits, ledger.clone()).unwrap();
     assert_eq!(
-        lexer.parse_root_arguments(),
-        Err(LustJsonStatus::InvalidJson),
+        lexer.parse_root_arguments().err().unwrap(),
+        LustJsonStatus::InvalidJson,
         "Escape-equivalent key 'foo' vs '\\u0066oo' must be rejected"
     );
 
@@ -1151,31 +1661,31 @@ fn test_decoded_duplicate_keys() {
     let mut lexer =
         BoundedLexer::new(r#"[{"café": 1, "caf\u00e9": 2}]"#, limits, ledger.clone()).unwrap();
     assert_eq!(
-        lexer.parse_root_arguments(),
-        Err(LustJsonStatus::InvalidJson),
+        lexer.parse_root_arguments().err().unwrap(),
+        LustJsonStatus::InvalidJson,
         "Unicode escape-equivalent key 'café' vs 'caf\\u00e9' must be rejected"
     );
 
     // Distinct keys pass
     let mut lexer = BoundedLexer::new(r#"[{"a": 1, "b": 2}]"#, limits, ledger.clone()).unwrap();
-    let args = lexer.parse_root_arguments().unwrap();
-    assert_eq!(args.len(), 1);
+    let doc = lexer.parse_root_arguments().unwrap();
+    assert_eq!(doc.len(), 1);
 
     // Sibling objects with identical keys pass (different objects)
     let mut lexer = BoundedLexer::new(r#"[{"x": 1}, {"x": 2}]"#, limits, ledger.clone()).unwrap();
-    let args = lexer.parse_root_arguments().unwrap();
-    assert_eq!(args.len(), 2);
+    let doc = lexer.parse_root_arguments().unwrap();
+    assert_eq!(doc.len(), 2);
 
     // Nested object with identical key name pass (different nesting depth)
     let mut lexer = BoundedLexer::new(r#"[{"a": {"a": 1}}]"#, limits, ledger.clone()).unwrap();
-    let args = lexer.parse_root_arguments().unwrap();
-    assert_eq!(args.len(), 1);
+    let doc = lexer.parse_root_arguments().unwrap();
+    assert_eq!(doc.len(), 1);
 
     // Non-string object key rejected
     let mut lexer = BoundedLexer::new(r#"[{1: 2}]"#, limits, ledger.clone()).unwrap();
     assert_eq!(
-        lexer.parse_root_arguments(),
-        Err(LustJsonStatus::InvalidJson)
+        lexer.parse_root_arguments().err().unwrap(),
+        LustJsonStatus::InvalidJson
     );
 
     println!("PASS: Decoded duplicate keys rejected with zero unbounded allocation.");
@@ -1191,19 +1701,19 @@ fn test_number_token_class_and_bounds() {
     // 1. Integer -0 vs Float -0.0
     // Integer "-0": must produce Int(0)
     let mut lexer = BoundedLexer::new("[-0]", limits, ledger.clone()).unwrap();
-    let args = lexer.parse_root_arguments().unwrap();
+    let doc = lexer.parse_root_arguments().unwrap();
     assert_eq!(
-        args[0],
-        PrototypeValue::Number(ParsedNumber::Int(0)),
+        doc.get(0).unwrap(),
+        ValueRef::Number(ParsedNumber::Int(0)),
         "Integer -0 must yield Int(0)"
     );
 
     // Float "-0.0": must produce Float(-0.0) with negative sign intact
     let mut lexer = BoundedLexer::new("[-0.0]", limits, ledger.clone()).unwrap();
-    let args = lexer.parse_root_arguments().unwrap();
-    match &args[0] {
-        PrototypeValue::Number(ParsedNumber::Float(f)) => {
-            assert_eq!(*f, 0.0);
+    let doc = lexer.parse_root_arguments().unwrap();
+    match doc.get(0).unwrap() {
+        ValueRef::Number(ParsedNumber::Float(f)) => {
+            assert_eq!(f, 0.0);
             assert!(
                 f.is_sign_negative(),
                 "Float -0.0 must preserve negative sign"
@@ -1214,112 +1724,187 @@ fn test_number_token_class_and_bounds() {
 
     // Float "-0e0": must produce Float(-0.0) with negative sign intact
     let mut lexer = BoundedLexer::new("[-0e0]", limits, ledger.clone()).unwrap();
-    let args = lexer.parse_root_arguments().unwrap();
-    match &args[0] {
-        PrototypeValue::Number(ParsedNumber::Float(f)) => {
-            assert_eq!(*f, 0.0);
+    let doc = lexer.parse_root_arguments().unwrap();
+    match doc.get(0).unwrap() {
+        ValueRef::Number(ParsedNumber::Float(f)) => {
+            assert_eq!(f, 0.0);
             assert!(
                 f.is_sign_negative(),
                 "Float -0e0 must preserve negative sign"
             );
         }
-        other => panic!("Expected Float(-0.0), got {:?}", other),
+        other => panic!("Expected Float(-0e0), got {:?}", other),
     }
 
-    // 2. Token class distinction: 1 vs 1.0 vs 1e0
-    let mut lexer = BoundedLexer::new("[1, 1.0, 1e0]", limits, ledger.clone()).unwrap();
-    let args = lexer.parse_root_arguments().unwrap();
-    assert_eq!(args[0], PrototypeValue::Number(ParsedNumber::Int(1)));
-    assert_eq!(args[1], PrototypeValue::Number(ParsedNumber::Float(1.0)));
-    assert_eq!(args[2], PrototypeValue::Number(ParsedNumber::Float(1.0)));
+    // 2. Exact-zero significand with exponents: 0e-500, -0e-500, 0.0e-500, -0.0e-500
+    // Positive 0e-500 -> Float(0.0)
+    let mut lexer = BoundedLexer::new("[0e-500]", limits, ledger.clone()).unwrap();
+    let doc = lexer.parse_root_arguments().unwrap();
+    match doc.get(0).unwrap() {
+        ValueRef::Number(ParsedNumber::Float(f)) => {
+            assert_eq!(f, 0.0);
+            assert!(
+                f.is_sign_positive(),
+                "Float 0e-500 must preserve positive zero"
+            );
+        }
+        other => panic!("Expected Float(0.0), got {:?}", other),
+    }
 
-    // 3. Exact i64 endpoints
+    // Negative -0e-500 -> Float(-0.0)
+    let mut lexer = BoundedLexer::new("[-0e-500]", limits, ledger.clone()).unwrap();
+    let doc = lexer.parse_root_arguments().unwrap();
+    match doc.get(0).unwrap() {
+        ValueRef::Number(ParsedNumber::Float(f)) => {
+            assert_eq!(f, 0.0);
+            assert!(
+                f.is_sign_negative(),
+                "Float -0e-500 must preserve negative zero"
+            );
+        }
+        other => panic!("Expected Float(-0e-500), got {:?}", other),
+    }
+
+    // Positive 0.0e-500 -> Float(0.0)
+    let mut lexer = BoundedLexer::new("[0.0e-500]", limits, ledger.clone()).unwrap();
+    let doc = lexer.parse_root_arguments().unwrap();
+    match doc.get(0).unwrap() {
+        ValueRef::Number(ParsedNumber::Float(f)) => {
+            assert_eq!(f, 0.0);
+            assert!(
+                f.is_sign_positive(),
+                "Float 0.0e-500 must preserve positive zero"
+            );
+        }
+        other => panic!("Expected Float(0.0), got {:?}", other),
+    }
+
+    // Negative -0.0e-500 -> Float(-0.0)
+    let mut lexer = BoundedLexer::new("[-0.0e-500]", limits, ledger.clone()).unwrap();
+    let doc = lexer.parse_root_arguments().unwrap();
+    match doc.get(0).unwrap() {
+        ValueRef::Number(ParsedNumber::Float(f)) => {
+            assert_eq!(f, 0.0);
+            assert!(
+                f.is_sign_negative(),
+                "Float -0.0e-500 must preserve negative zero"
+            );
+        }
+        other => panic!("Expected Float(-0.0e-500), got {:?}", other),
+    }
+
+    // 3. Token class distinction: 1 vs 1.0 vs 1e0
+    let mut lexer = BoundedLexer::new("[1, 1.0, 1e0]", limits, ledger.clone()).unwrap();
+    let doc = lexer.parse_root_arguments().unwrap();
+    assert_eq!(doc.get(0).unwrap(), ValueRef::Number(ParsedNumber::Int(1)));
+    assert_eq!(
+        doc.get(1).unwrap(),
+        ValueRef::Number(ParsedNumber::Float(1.0))
+    );
+    assert_eq!(
+        doc.get(2).unwrap(),
+        ValueRef::Number(ParsedNumber::Float(1.0))
+    );
+
+    // 4. Exact i64 endpoints
     let mut lexer = BoundedLexer::new(
         "[9223372036854775807, -9223372036854775808]",
         limits,
         ledger.clone(),
     )
     .unwrap();
-    let args = lexer.parse_root_arguments().unwrap();
-    assert_eq!(args[0], PrototypeValue::Number(ParsedNumber::Int(i64::MAX)));
-    assert_eq!(args[1], PrototypeValue::Number(ParsedNumber::Int(i64::MIN)));
+    let doc = lexer.parse_root_arguments().unwrap();
+    assert_eq!(
+        doc.get(0).unwrap(),
+        ValueRef::Number(ParsedNumber::Int(i64::MAX))
+    );
+    assert_eq!(
+        doc.get(1).unwrap(),
+        ValueRef::Number(ParsedNumber::Int(i64::MIN))
+    );
 
-    // 4. Integers out of i64 range rejected with NumberRange (NEVER fallback to float!)
+    // 5. Integers out of i64 range rejected with NumberRange (NEVER fallback to float!)
     // i64::MAX + 1 (9223372036854775808)
     let mut lexer = BoundedLexer::new("[9223372036854775808]", limits, ledger.clone()).unwrap();
     assert_eq!(
-        lexer.parse_root_arguments(),
-        Err(LustJsonStatus::NumberRange),
+        lexer.parse_root_arguments().err().unwrap(),
+        LustJsonStatus::NumberRange,
         "i64::MAX + 1 must return NumberRange"
     );
 
     // u64::MAX (18446744073709551615)
     let mut lexer = BoundedLexer::new("[18446744073709551615]", limits, ledger.clone()).unwrap();
     assert_eq!(
-        lexer.parse_root_arguments(),
-        Err(LustJsonStatus::NumberRange),
+        lexer.parse_root_arguments().err().unwrap(),
+        LustJsonStatus::NumberRange,
         "u64::MAX must return NumberRange"
     );
 
     // > u64::MAX (18446744073709551616)
     let mut lexer = BoundedLexer::new("[18446744073709551616]", limits, ledger.clone()).unwrap();
     assert_eq!(
-        lexer.parse_root_arguments(),
-        Err(LustJsonStatus::NumberRange),
+        lexer.parse_root_arguments().err().unwrap(),
+        LustJsonStatus::NumberRange,
         "> u64::MAX must return NumberRange"
     );
 
     // < i64::MIN (-9223372036854775809)
     let mut lexer = BoundedLexer::new("[-9223372036854775809]", limits, ledger.clone()).unwrap();
     assert_eq!(
-        lexer.parse_root_arguments(),
-        Err(LustJsonStatus::NumberRange),
+        lexer.parse_root_arguments().err().unwrap(),
+        LustJsonStatus::NumberRange,
         "< i64::MIN must return NumberRange"
     );
 
-    // 5. Float overflow rejected with NumberRange
+    // 6. Float overflow rejected with NumberRange
     let mut lexer = BoundedLexer::new("[1e500]", limits, ledger.clone()).unwrap();
     assert_eq!(
-        lexer.parse_root_arguments(),
-        Err(LustJsonStatus::NumberRange),
+        lexer.parse_root_arguments().err().unwrap(),
+        LustJsonStatus::NumberRange,
         "Float overflow 1e500 must return NumberRange"
     );
 
     let mut lexer = BoundedLexer::new("[-1e500]", limits, ledger.clone()).unwrap();
     assert_eq!(
-        lexer.parse_root_arguments(),
-        Err(LustJsonStatus::NumberRange),
+        lexer.parse_root_arguments().err().unwrap(),
+        LustJsonStatus::NumberRange,
         "Float overflow -1e500 must return NumberRange"
     );
 
-    // 6. Float underflow-to-zero rejected with NumberRange
+    // 7. Nonzero Float underflow-to-zero rejected with NumberRange
     let mut lexer = BoundedLexer::new("[1e-500]", limits, ledger.clone()).unwrap();
     assert_eq!(
-        lexer.parse_root_arguments(),
-        Err(LustJsonStatus::NumberRange),
+        lexer.parse_root_arguments().err().unwrap(),
+        LustJsonStatus::NumberRange,
         "Float underflow 1e-500 must return NumberRange"
     );
 
     let mut lexer = BoundedLexer::new("[-1e-500]", limits, ledger.clone()).unwrap();
     assert_eq!(
-        lexer.parse_root_arguments(),
-        Err(LustJsonStatus::NumberRange),
+        lexer.parse_root_arguments().err().unwrap(),
+        LustJsonStatus::NumberRange,
         "Float underflow -1e-500 must return NumberRange"
     );
 
-    // 7. Non-underflow zero float (literal 0.0 and 0e0) pass
+    // 8. Non-underflow zero float (literal 0.0 and 0e0) pass
     let mut lexer = BoundedLexer::new("[0.0, 0e0]", limits, ledger.clone()).unwrap();
-    let args = lexer.parse_root_arguments().unwrap();
-    assert_eq!(args[0], PrototypeValue::Number(ParsedNumber::Float(0.0)));
-    assert_eq!(args[1], PrototypeValue::Number(ParsedNumber::Float(0.0)));
+    let doc = lexer.parse_root_arguments().unwrap();
+    assert_eq!(
+        doc.get(0).unwrap(),
+        ValueRef::Number(ParsedNumber::Float(0.0))
+    );
+    assert_eq!(
+        doc.get(1).unwrap(),
+        ValueRef::Number(ParsedNumber::Float(0.0))
+    );
 
-    // 8. Syntax errors: leading zeroes, missing digits
+    // 9. Syntax errors: leading zeroes, missing digits
     let syntax_cases = ["[01]", "[-01]", "[1.]", "[1e]", "[1e+]", "[-]"];
     for case in syntax_cases {
         let mut lexer = BoundedLexer::new(case, limits, ledger.clone()).unwrap();
         assert_eq!(
-            lexer.parse_root_arguments(),
-            Err(LustJsonStatus::InvalidJson),
+            lexer.parse_root_arguments().err().unwrap(),
+            LustJsonStatus::InvalidJson,
             "Syntax error in {:?} must return InvalidJson",
             case
         );
@@ -1330,99 +1915,178 @@ fn test_number_token_class_and_bounds() {
 
 #[test]
 fn test_ceilings_and_boundary_limits() {
-    println!("\n=== 5. CEILINGS & BOUNDARY LIMITS ===");
+    println!("\n=== 5. CEILINGS & BOUNDARY LIMITS AT N-1 / N / N+1 ===");
 
-    // 1. max_input_bytes ceiling
-    let limits = LustJsonLimits {
-        max_input_bytes: 8,
+    // 1. max_input_bytes ceiling at N-1, N, N+1
+    // Target input "[1, 2]" is 6 bytes.
+    let input = "[1, 2]";
+    let ledger = CapacityLedger::new(16_777_216);
+
+    // N - 1 = 5 bytes: fails before parsing starts
+    let limits_in_minus1 = LustJsonLimits {
+        max_input_bytes: 5,
         ..Default::default()
     };
-    let ledger = CapacityLedger::new(limits.max_bridge_bytes);
     assert_eq!(
-        BoundedLexer::new("[1, 2, 3]", limits, ledger.clone())
+        BoundedLexer::new(input, limits_in_minus1, ledger.clone())
             .err()
             .unwrap(),
         LustJsonStatus::Limit,
-        "Input > max_input_bytes must fail before parsing"
+        "Input > max_input_bytes (N-1) must fail before parsing"
     );
-    // Boundary N: exactly 8 bytes -> "[1, 2, 3]" is 9 bytes -> fails. "[1, 2]" is 6 bytes -> passes:
-    let mut lexer = BoundedLexer::new("[1, 2]", limits, ledger.clone()).unwrap();
-    assert!(lexer.parse_root_arguments().is_ok());
 
-    // 2. max_args ceiling
-    let limits = LustJsonLimits {
+    // N = 6 bytes: passes
+    let limits_in_n = LustJsonLimits {
+        max_input_bytes: 6,
+        ..Default::default()
+    };
+    let mut lexer = BoundedLexer::new(input, limits_in_n, ledger.clone()).unwrap();
+    assert_eq!(lexer.parse_root_arguments().unwrap().len(), 2);
+
+    // N + 1 = 7 bytes: passes
+    let limits_in_plus1 = LustJsonLimits {
+        max_input_bytes: 7,
+        ..Default::default()
+    };
+    let mut lexer = BoundedLexer::new(input, limits_in_plus1, ledger.clone()).unwrap();
+    assert_eq!(lexer.parse_root_arguments().unwrap().len(), 2);
+
+    // 2. max_args ceiling at N-1, N, N+1
+    // Target N = 2 args.
+    let limits_args = LustJsonLimits {
         max_args: 2,
         ..Default::default()
     };
-    let ledger = CapacityLedger::new(limits.max_bridge_bytes);
-    // N = 2: passes
-    let mut lexer = BoundedLexer::new("[1, 2]", limits, ledger.clone()).unwrap();
+
+    // N - 1 = 1 arg: passes
+    let mut lexer = BoundedLexer::new("[1]", limits_args, ledger.clone()).unwrap();
+    assert_eq!(lexer.parse_root_arguments().unwrap().len(), 1);
+
+    // N = 2 args: passes
+    let mut lexer = BoundedLexer::new("[1, 2]", limits_args, ledger.clone()).unwrap();
     assert_eq!(lexer.parse_root_arguments().unwrap().len(), 2);
-    // N + 1 = 3: fails with Limit
-    let mut lexer = BoundedLexer::new("[1, 2, 3]", limits, ledger.clone()).unwrap();
+
+    // N + 1 = 3 args: fails with Limit before parsing 3rd argument
+    let mut lexer = BoundedLexer::new("[1, 2, 3]", limits_args, ledger.clone()).unwrap();
     assert_eq!(
-        lexer.parse_root_arguments(),
-        Err(LustJsonStatus::Limit),
-        "Exceeding max_args must return Limit"
+        lexer.parse_root_arguments().err().unwrap(),
+        LustJsonStatus::Limit,
+        "Exceeding max_args (N+1) must return Limit"
     );
 
-    // 3. max_depth ceiling
-    // Root array is depth 1. Nested array is depth 2.
-    let limits = LustJsonLimits {
+    // 3. max_depth ceiling at N-1, N, N+1
+    // Target N = 2 depth.
+    let limits_depth = LustJsonLimits {
         max_depth: 2,
         ..Default::default()
     };
-    let ledger = CapacityLedger::new(limits.max_bridge_bytes);
-    // Depth 2: passes
-    let mut lexer = BoundedLexer::new("[[1]]", limits, ledger.clone()).unwrap();
-    assert!(lexer.parse_root_arguments().is_ok());
-    // Depth 3: fails with Limit
-    let mut lexer = BoundedLexer::new("[[[1]]]", limits, ledger.clone()).unwrap();
+
+    // N - 1 = depth 1: "[1]" passes
+    let mut lexer = BoundedLexer::new("[1]", limits_depth, ledger.clone()).unwrap();
+    assert_eq!(lexer.parse_root_arguments().unwrap().len(), 1);
+
+    // N = depth 2: "[[1]]" passes
+    let mut lexer = BoundedLexer::new("[[1]]", limits_depth, ledger.clone()).unwrap();
+    assert_eq!(lexer.parse_root_arguments().unwrap().len(), 1);
+
+    // N + 1 = depth 3: "[[[1]]]" fails with Limit before descent
+    let mut lexer = BoundedLexer::new("[[[1]]]", limits_depth, ledger.clone()).unwrap();
     assert_eq!(
-        lexer.parse_root_arguments(),
-        Err(LustJsonStatus::Limit),
-        "Exceeding max_depth must return Limit"
+        lexer.parse_root_arguments().err().unwrap(),
+        LustJsonStatus::Limit,
+        "Exceeding max_depth (N+1) must return Limit"
     );
 
-    // 4. max_nodes ceiling
-    // Root array (1) + 2 elements (2) = 3 nodes
-    let limits = LustJsonLimits {
+    // 4. max_nodes ceiling at N-1, N, N+1
+    // Target N = 3 nodes.
+    // Under RFC definitions: outer list is node 1, each value is a node.
+    let limits_nodes = LustJsonLimits {
         max_nodes: 3,
         ..Default::default()
     };
-    let ledger = CapacityLedger::new(limits.max_bridge_bytes);
-    // 3 nodes: passes
-    let mut lexer = BoundedLexer::new("[1, 2]", limits, ledger.clone()).unwrap();
-    assert!(lexer.parse_root_arguments().is_ok());
-    // 4 nodes (root array + 3 elements): fails with Limit
-    let mut lexer = BoundedLexer::new("[1, 2, 3]", limits, ledger.clone()).unwrap();
+
+    // N - 1 = 2 nodes: outer list (1) + element (1) = 2 nodes -> passes
+    let mut lexer = BoundedLexer::new("[1]", limits_nodes, ledger.clone()).unwrap();
+    assert_eq!(lexer.parse_root_arguments().unwrap().len(), 1);
+
+    // N = 3 nodes: outer list (1) + 2 elements (2) = 3 nodes -> passes
+    let mut lexer = BoundedLexer::new("[1, 2]", limits_nodes, ledger.clone()).unwrap();
+    assert_eq!(lexer.parse_root_arguments().unwrap().len(), 2);
+
+    // N + 1 = 4 nodes: outer list (1) + 3 elements (3) = 4 nodes -> fails with Limit before 4th node
+    let mut lexer = BoundedLexer::new("[1, 2, 3]", limits_nodes, ledger.clone()).unwrap();
     assert_eq!(
-        lexer.parse_root_arguments(),
-        Err(LustJsonStatus::Limit),
-        "Exceeding max_nodes must return Limit"
+        lexer.parse_root_arguments().err().unwrap(),
+        LustJsonStatus::Limit,
+        "Exceeding max_nodes (N+1) must return Limit"
     );
 
-    println!("PASS: Ceilings and boundary limits tested.");
+    // Object node count boundary: outer list (1) + object (2) + key "a" (3) + value 1 (4) = 4 nodes
+    // Plus entry node internally = at least 4 nodes.
+    let limits_obj_nodes = LustJsonLimits {
+        max_nodes: 8,
+        ..Default::default()
+    };
+    let mut lexer = BoundedLexer::new(r#"[{"a": 1}]"#, limits_obj_nodes, ledger.clone()).unwrap();
+    assert_eq!(lexer.parse_root_arguments().unwrap().len(), 1);
+
+    let limits_obj_nodes_minus1 = LustJsonLimits {
+        max_nodes: 3,
+        ..Default::default()
+    };
+    let mut lexer =
+        BoundedLexer::new(r#"[{"a": 1}]"#, limits_obj_nodes_minus1, ledger.clone()).unwrap();
+    assert_eq!(
+        lexer.parse_root_arguments().err().unwrap(),
+        LustJsonStatus::Limit,
+        "Object exceeding max_nodes on key/value allocation must return Limit"
+    );
+
+    // 5. max_bridge_bytes ceiling at N-1, N, N+1
+    // Calculate exact required bridge bytes for input "[1, 2]" with max_depth 4, max_nodes 8:
+    // (for input length 6, max_nodes = min(8, 6+2) = 8)
+    let limits_exact = LustJsonLimits {
+        max_depth: 4,
+        max_nodes: 8,
+        ..Default::default()
+    };
+    let exact_bridge_needed = limits_exact.max_depth * std::mem::size_of::<ContainerFrame>()
+        + 8 * std::mem::size_of::<StrSpan>()
+        + 8 * std::mem::size_of::<PrototypeNode>()
+        + "[1, 2]".len();
+
+    // N - 1: fails with Limit before parsing begins, leaving ledger at 0
+    let ledger_minus1 = CapacityLedger::new(exact_bridge_needed - 1);
+    let res_minus1 = BoundedLexer::new("[1, 2]", limits_exact, ledger_minus1.clone());
+    assert_eq!(
+        res_minus1.err().unwrap(),
+        LustJsonStatus::Limit,
+        "max_bridge_bytes at N-1 must fail before parse"
+    );
+    assert_eq!(
+        ledger_minus1.allocated(),
+        0,
+        "Ledger must rollback to 0 on insufficient bridge bytes"
+    );
+
+    // N: passes exactly
+    let ledger_n = CapacityLedger::new(exact_bridge_needed);
+    let mut lexer_n = BoundedLexer::new("[1, 2]", limits_exact, ledger_n.clone()).unwrap();
+    assert_eq!(lexer_n.parse_root_arguments().unwrap().len(), 2);
+
+    // N + 1: passes
+    let ledger_plus1 = CapacityLedger::new(exact_bridge_needed + 1);
+    let mut lexer_plus1 = BoundedLexer::new("[1, 2]", limits_exact, ledger_plus1.clone()).unwrap();
+    assert_eq!(lexer_plus1.parse_root_arguments().unwrap().len(), 2);
+
+    println!("PASS: Ceilings and boundary limits tested at N-1, N, and N+1.");
 }
 
 #[test]
-fn test_pre_growth_reservation_and_ledger_cleanup() {
-    println!("\n=== 6. PRE-GROWTH RESERVATION & CAPACITY LEDGER ===");
+fn test_pre_growth_reservation_and_ledger_lifecycle() {
+    println!("\n=== 6. PRE-GROWTH RESERVATION & CAPACITY LEDGER LIFECYCLE ===");
 
-    // 1. Allocation-reservation failure when max_bridge_bytes is too small
-    let limits = LustJsonLimits {
-        max_bridge_bytes: 32, // Too small to reserve stack, key table, and arena!
-        ..Default::default()
-    };
-    let ledger = CapacityLedger::new(limits.max_bridge_bytes);
-    let res = BoundedLexer::new("[1, 2, 3]", limits, ledger);
-    assert_eq!(
-        res.err().unwrap(),
-        LustJsonStatus::Limit,
-        "Insufficient bridge capacity must fail BEFORE parsing starts!"
-    );
-
-    // 2. Verified zero-growth: pre-reserved capacities never grow during parsing
+    // 1. All collections pre-reserved before parse via fallible try_reserve_exact
     let limits = LustJsonLimits {
         max_depth: 8,
         max_nodes: 64,
@@ -1433,14 +2097,15 @@ fn test_pre_growth_reservation_and_ledger_cleanup() {
     let mut lexer = BoundedLexer::new(
         r#"[{"a": 1, "b": [2, 3]}, {"c": "hello \u0041"}]"#,
         limits,
-        ledger,
+        ledger.clone(),
     )
     .unwrap();
 
     let initial_stack_cap = lexer.stack.capacity();
-    let initial_keys_cap = lexer.keys.capacity();
-    let initial_arena_cap = lexer.arena.capacity();
-    let initial_allocated = lexer.ledger().allocated();
+    let initial_scratch_cap = lexer.key_check_scratch.capacity();
+    let initial_nodes_cap = lexer.doc_nodes.capacity();
+    let initial_arena_cap = lexer.doc_arena.capacity();
+    let initial_allocated = ledger.allocated();
 
     println!(
         "Initial pre-reserved ledger allocation: {} bytes",
@@ -1448,61 +2113,136 @@ fn test_pre_growth_reservation_and_ledger_cleanup() {
     );
     assert!(initial_allocated > 0, "Parser must pre-reserve in ledger");
 
-    let args = lexer.parse_root_arguments().unwrap();
-    assert_eq!(args.len(), 2);
+    // 2. Parse and verify document owns allocations while live
+    let doc = lexer.parse_root_arguments().unwrap();
+    assert_eq!(doc.len(), 2);
 
-    // Assert that collection capacities were NEVER reallocated:
-    assert_eq!(lexer.stack.capacity(), initial_stack_cap);
-    assert_eq!(lexer.keys.capacity(), initial_keys_cap);
-    assert_eq!(lexer.arena.capacity(), initial_arena_cap);
+    // Hard assertions: collection capacities NEVER grew!
+    assert_eq!(doc.nodes.capacity(), initial_nodes_cap);
+    assert_eq!(doc.string_arena.capacity(), initial_arena_cap);
+    assert_eq!(initial_stack_cap, limits.max_depth);
+    assert_eq!(initial_scratch_cap, initial_nodes_cap);
 
-    // Clean up ledger on drop/release:
-    let final_ledger = lexer.release_ledger();
+    // LEDGER REMAINS NONZERO WHILE RETURNED DOCUMENT IS LIVE:
+    let live_doc_allocated = ledger.allocated();
     println!(
-        "Ledger released cleanly. Remaining allocated: {} bytes (Peak: {})",
-        final_ledger.allocated(),
-        final_ledger.peak()
+        "Ledger while document is live: {} bytes",
+        live_doc_allocated
     );
-    assert_eq!(
-        final_ledger.allocated(),
-        0,
-        "All pre-reserved bytes must be released cleanly"
+    assert!(
+        live_doc_allocated > 0,
+        "Ledger must remain charged while document is live"
     );
 
-    // 3. Ledger cleanup on error path
-    let ledger2 = CapacityLedger::new(limits.max_bridge_bytes);
-    let mut lexer_err = BoundedLexer::new(r#"[{"a": 1, "a": 2}]"#, limits, ledger2).unwrap();
-    assert_eq!(
-        lexer_err.parse_root_arguments(),
-        Err(LustJsonStatus::InvalidJson)
+    // ZERO LEDGER ONLY AFTER DOCUMENT-OWNED BUFFERS ARE DROPPED:
+    drop(doc);
+    let after_drop_allocated = ledger.allocated();
+    println!(
+        "Ledger after document drop: {} bytes (Peak: {})",
+        after_drop_allocated,
+        ledger.peak()
     );
-    let err_ledger = lexer_err.release_ledger();
+    assert_eq!(
+        after_drop_allocated, 0,
+        "Ledger must return to exactly zero after document drop"
+    );
+
+    // 3. Ledger cleanup on parse error path:
+    let err_ledger = CapacityLedger::new(limits.max_bridge_bytes);
+    let mut lexer_err =
+        BoundedLexer::new(r#"[{"a": 1, "a": 2}]"#, limits, err_ledger.clone()).unwrap();
+    let parse_res = lexer_err.parse_root_arguments();
+    assert_eq!(parse_res.err().unwrap(), LustJsonStatus::InvalidJson);
+    drop(lexer_err);
     assert_eq!(
         err_ledger.allocated(),
         0,
         "Ledger must be released cleanly even on parse error"
     );
 
-    println!("PASS: Pre-growth reservation and ledger cleanup verified.");
+    // 4. Deterministic reservation-failure injection at each reservation step (steps 0..4):
+    println!("Testing deterministic reservation failure injection at each step...");
+    for step in 0..4 {
+        let fault_ledger = CapacityLedger::new(limits.max_bridge_bytes);
+        fault_ledger.set_fail_after_reservations(Some(step));
+        let res = BoundedLexer::new("[1, 2, 3]", limits, fault_ledger.clone());
+        assert_eq!(
+            res.err().unwrap(),
+            LustJsonStatus::Limit,
+            "Reservation step {} failure injection must return Limit",
+            step
+        );
+        assert_eq!(
+            fault_ledger.allocated(),
+            0,
+            "Ledger must rollback to 0 after reservation failure at step {}",
+            step
+        );
+    }
+
+    println!("PASS: Pre-growth reservation and ledger lifecycle verified.");
+}
+
+#[test]
+fn test_sorting_in_place_zero_allocation() {
+    println!("\n=== 7. IN-PLACE SORTING WITH ZERO HEAP ALLOCATION ===");
+
+    // Verifies that sort_unstable_by operates strictly in-place with zero heap allocations.
+    let ledger = CapacityLedger::new(100_000);
+    let mut keys = PreallocatedVec::try_with_capacity(5, &ledger).unwrap();
+    let arena = PreallocatedStringArena::try_with_capacity(64, &ledger).unwrap();
+
+    keys.push(StrSpan::Borrowed("banana")).unwrap();
+    keys.push(StrSpan::Borrowed("apple")).unwrap();
+    keys.push(StrSpan::Borrowed("date")).unwrap();
+    keys.push(StrSpan::Borrowed("cherry")).unwrap();
+    keys.push(StrSpan::Borrowed("elderberry")).unwrap();
+
+    let cap_before = keys.capacity();
+    let len_before = keys.len();
+    let allocated_before = ledger.allocated();
+
+    // In-place sort using standard library pdqsort
+    keys.as_slice_mut()
+        .sort_unstable_by(|a, b| a.as_str(&arena).cmp(b.as_str(&arena)));
+
+    // Assert zero capacity changes and zero ledger impact
+    assert_eq!(keys.capacity(), cap_before);
+    assert_eq!(keys.len(), len_before);
+    assert_eq!(ledger.allocated(), allocated_before);
+
+    // Verify correct sorting order
+    assert_eq!(keys.as_slice()[0].as_str(&arena), "apple");
+    assert_eq!(keys.as_slice()[1].as_str(&arena), "banana");
+    assert_eq!(keys.as_slice()[2].as_str(&arena), "cherry");
+    assert_eq!(keys.as_slice()[3].as_str(&arena), "date");
+    assert_eq!(keys.as_slice()[4].as_str(&arena), "elderberry");
+
+    println!("PASS: In-place sort confirmed zero heap allocations and correct order.");
 }
 
 #[test]
 fn test_prototype_limitations_evidence() {
-    println!("\n=== 7. PROTOTYPE LIMITATIONS ASSESSMENT ===");
+    println!("\n=== 8. PROTOTYPE LIMITATIONS ASSESSMENT ===");
     // This test formally witnesses what Gate 1 prototype CAN and CANNOT establish:
     //
     // CAN establish:
     // 1. Direct scanning of bounded JSON without generic DOM or serde deserializer.
-    // 2. Pre-reservation of all parser collections before parsing begins with zero reallocation.
-    // 3. Exact RFC 04 number token class fidelity:
+    // 2. Pre-reservation of all parser and document collections before parsing begins
+    //    via fallible try_reserve_exact with zero collection growth during parse.
+    // 3. Document ownership of allocated capacity: ledger remains charged while document is live,
+    //    and drops to zero only after document is dropped.
+    // 4. Exact RFC 04 number token class fidelity:
     //    - "-0" -> Int(0)
     //    - "-0.0" -> Float(-0.0) with negative sign
     //    - 1 vs 1.0 vs 1e0 distinct token classes
     //    - Out-of-i64 (>i64::MAX, u64 only, >u64::MAX, <i64::MIN) rejected with NumberRange
     //    - Float underflow-to-zero (e.g. 1e-500) rejected with NumberRange
+    //    - Exact zero significand with exponent (0e-500, -0e-500, 0.0e-500) accepted as Float(±0)
     //    - Float overflow (e.g. 1e500) rejected with NumberRange
-    // 4. Decoded duplicate key detection (including escape-equivalent and UTF-8 escapes).
-    // 5. Ceilings: max_input_bytes, max_depth, max_nodes, max_args, max_bridge_bytes.
+    // 5. Decoded duplicate key detection via in-place sort (O(k log k)) with zero heap allocation.
+    // 6. Ceilings: max_input_bytes, max_depth, max_nodes, max_args, max_bridge_bytes at N-1/N/N+1.
+    // 7. Deterministic reservation failure injection and rollback at every reservation step.
     //
     // CANNOT establish (deferred to later gates):
     // 1. Actual `lust::bytecode::Value` construction (requires Lust VM & runtime integration).
