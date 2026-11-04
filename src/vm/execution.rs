@@ -2181,10 +2181,6 @@ impl VM {
         if !self.effective_jit_enabled() {
             return;
         }
-        if self.jit.root_traces.keys().any(|(f, _)| *f == func_idx) {
-            self.jit.function_not_compilable(func_idx);
-            return;
-        }
         use crate::jit::function::{Context, FunctionSig, translate};
         let sig_of = |meta: &CallMeta, function: &Function| FunctionSig {
             params: meta.params.iter().map(|kind| kind.value_type()).collect(),

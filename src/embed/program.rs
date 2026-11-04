@@ -1074,7 +1074,7 @@ impl EmbeddedProgram {
         Args: FunctionArgs,
         Ret: FromLustValue,
     {
-        let mut stack_args = [const { Value::Nil }; 8];
+        let mut stack_args = [const { Value::Nil }; 16];
         let arg_count = args.write_args(&mut stack_args);
         let value = self.vm.call_retained_target_slice(
             handle.func_idx,
@@ -1089,23 +1089,23 @@ impl EmbeddedProgram {
         Args: FunctionArgs,
         R: FromLustValue,
     {
+        let signature = self
+            .signatures
+            .get(function_name)
+            .ok_or_else(|| LustError::TypeError {
+                message: format!(
+                    "No type information available for function '{}'; \
+                     use call_raw if the function is dynamically typed",
+                    function_name
+                ),
+            })?;
+        Args::validate_signature(function_name, &signature.params)?;
+        ensure_return_type::<R>(function_name, &signature.return_type)?;
         let func_idx = if let Some((cached_name, cached_idx)) = &self.last_typed_target
             && cached_name == function_name
         {
             *cached_idx
         } else {
-            let signature = self
-                .signatures
-                .get(function_name)
-                .ok_or_else(|| LustError::TypeError {
-                    message: format!(
-                        "No type information available for function '{}'; \
-                         use call_raw if the function is dynamically typed",
-                        function_name
-                    ),
-                })?;
-            Args::validate_signature(function_name, &signature.params)?;
-            ensure_return_type::<R>(function_name, &signature.return_type)?;
             let idx = self
                 .vm
                 .functions()
@@ -1118,7 +1118,7 @@ impl EmbeddedProgram {
             idx
         };
 
-        let mut stack_args = [const { Value::Nil }; 8];
+        let mut stack_args = [const { Value::Nil }; 16];
         let arg_count = args.write_args(&mut stack_args);
         let value = self.vm.call_retained_target_slice(
             func_idx,
