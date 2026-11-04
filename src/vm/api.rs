@@ -94,6 +94,22 @@ pub(crate) fn format_doc_comment(doc: &str, indent: &str) -> String {
     out
 }
 
+#[cfg(feature = "std")]
+#[derive(Clone)]
+struct VmBuiltinsCache {
+    trait_impls: HashMap<(String, String), bool>,
+    struct_metadata: HashMap<String, super::RuntimeStructInfo>,
+    natives: HashMap<String, Value>,
+    globals: HashMap<String, Value>,
+    intrinsics: HashMap<usize, crate::jit::Intrinsic>,
+}
+
+#[cfg(feature = "std")]
+thread_local! {
+    static BUILTINS_CACHE: core::cell::RefCell<HashMap<u64, VmBuiltinsCache>> =
+        core::cell::RefCell::new(HashMap::new());
+}
+
 impl VM {
     pub fn new() -> Self {
         Self::with_config(&LustConfig::default())
@@ -140,6 +156,31 @@ impl VM {
             root_frame: Some(CallFrame::new(0, None, 255)),
         };
         vm.jit.enabled = vm.jit.enabled && config.jit_enabled();
+
+        #[cfg(feature = "std")]
+        let cache_key = {
+            use std::hash::{Hash, Hasher};
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            config.jit_enabled().hash(&mut hasher);
+            for m in config.enabled_modules() {
+                m.hash(&mut hasher);
+            }
+            hasher.finish()
+        };
+
+        #[cfg(feature = "std")]
+        let cached = BUILTINS_CACHE.with(|c| c.borrow().get(&cache_key).cloned());
+
+        #[cfg(feature = "std")]
+        if let Some(cached) = cached {
+            vm.trait_impls = cached.trait_impls;
+            vm.struct_metadata = cached.struct_metadata;
+            vm.natives = cached.natives;
+            vm.globals = cached.globals;
+            vm.jit.intrinsics = cached.intrinsics;
+            return vm;
+        }
+
         vm.trait_impls
             .insert(("int".to_string(), "ToString".to_string()), true);
         vm.trait_impls
@@ -155,6 +196,20 @@ impl VM {
             vm.register_native(name, func);
         }
         vm.register_jit_intrinsics();
+
+        #[cfg(feature = "std")]
+        BUILTINS_CACHE.with(|c| {
+            c.borrow_mut().insert(
+                cache_key,
+                VmBuiltinsCache {
+                    trait_impls: vm.trait_impls.clone(),
+                    struct_metadata: vm.struct_metadata.clone(),
+                    natives: vm.natives.clone(),
+                    globals: vm.globals.clone(),
+                    intrinsics: vm.jit.intrinsics.clone(),
+                },
+            );
+        });
 
         vm
     }

@@ -36,7 +36,7 @@ pub use bytecode::{Chunk, Compiler, Function, Instruction, Value};
 pub use config::{ConfigError, DependencyKind, DependencySpec, LustConfig};
 #[cfg(feature = "std")]
 pub use embed::{
-    ArrayHandle, AsyncDriver, AsyncTaskQueue, EmbeddedBuilder, EmbeddedProgram, EnumInstance,
+    ArrayHandle, AsyncDriver, AsyncTaskQueue, CompiledBytecode, EmbeddedBuilder, EmbeddedProgram, EnumInstance,
     ExternRegistry, FromLustValue, FromStructField, FunctionArgs, FunctionBuilder, FunctionHandle,
     ImplBuilder, IntoLustValue, MapHandle, ModuleStub, StringRef, StructBuilder, StructField,
     StructHandle, StructInstance, TraitBuilder, TraitMethodBuilder, TypedHandle, ValueRef, enum_variant,
