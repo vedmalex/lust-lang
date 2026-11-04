@@ -154,6 +154,8 @@ impl VM {
             exported_type_stubs: Vec::new(),
             last_dispatched_target: None,
             root_frame: Some(CallFrame::new(0, None, 255)),
+            active_native_depth: 0,
+            active_jit_depth: 0,
         };
         vm.jit.enabled = vm.jit.enabled && config.jit_enabled();
 
