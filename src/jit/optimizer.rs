@@ -17,6 +17,7 @@ impl TraceOptimizer {
     pub fn optimize(&mut self, trace: &mut Trace) -> Vec<(Register, Value)> {
         jit::log(|| "🔧 JIT Optimizer: Starting optimization...".to_string());
         let original_ops = trace.ops.len();
+        self.inline_leaf_functions(trace);
         self.fuse_try_get_index_patterns(trace);
         self.fuse_try_cast_patterns(trace);
         self.eliminate_dead_stores_before_select(trace);
@@ -886,6 +887,372 @@ impl TraceOptimizer {
             },
             TraceOp::ModImm { .. } => Some(ValueType::Int),
             _ => None,
+        }
+    }
+
+    fn is_leaf_inline_trace(trace: &crate::jit::trace::InlineTrace) -> bool {
+        if trace.is_closure
+            || trace.return_register.is_none()
+            || trace.register_count > 32
+            || trace.body.len() > 64
+        {
+            return false;
+        }
+        for op in &trace.body {
+            match op {
+                TraceOp::LoadConst { .. }
+                | TraceOp::Move { .. }
+                | TraceOp::Add { .. }
+                | TraceOp::Sub { .. }
+                | TraceOp::Mul { .. }
+                | TraceOp::Div { .. }
+                | TraceOp::Mod { .. }
+                | TraceOp::ModImm { .. }
+                | TraceOp::Neg { .. }
+                | TraceOp::Eq { .. }
+                | TraceOp::Ne { .. }
+                | TraceOp::Lt { .. }
+                | TraceOp::Le { .. }
+                | TraceOp::Gt { .. }
+                | TraceOp::Ge { .. }
+                | TraceOp::And { .. }
+                | TraceOp::Or { .. }
+                | TraceOp::Not { .. }
+                | TraceOp::Select { .. }
+                | TraceOp::SelectBitZero { .. }
+                | TraceOp::Guard { .. }
+                | TraceOp::At { .. } => {}
+                _ => return false,
+            }
+        }
+        true
+    }
+
+    fn remap_leaf_op(op: &TraceOp, map: &HashMap<Register, Register>) -> TraceOp {
+        let r = |reg: &Register| -> Register { *map.get(reg).unwrap_or(reg) };
+        match op {
+            TraceOp::LoadConst { dest, value } => TraceOp::LoadConst {
+                dest: r(dest),
+                value: value.clone(),
+            },
+            TraceOp::Move { dest, src } => TraceOp::Move {
+                dest: r(dest),
+                src: r(src),
+            },
+            TraceOp::Add {
+                dest,
+                lhs,
+                rhs,
+                lhs_type,
+                rhs_type,
+            } => TraceOp::Add {
+                dest: r(dest),
+                lhs: r(lhs),
+                rhs: r(rhs),
+                lhs_type: *lhs_type,
+                rhs_type: *rhs_type,
+            },
+            TraceOp::Sub {
+                dest,
+                lhs,
+                rhs,
+                lhs_type,
+                rhs_type,
+            } => TraceOp::Sub {
+                dest: r(dest),
+                lhs: r(lhs),
+                rhs: r(rhs),
+                lhs_type: *lhs_type,
+                rhs_type: *rhs_type,
+            },
+            TraceOp::Mul {
+                dest,
+                lhs,
+                rhs,
+                lhs_type,
+                rhs_type,
+            } => TraceOp::Mul {
+                dest: r(dest),
+                lhs: r(lhs),
+                rhs: r(rhs),
+                lhs_type: *lhs_type,
+                rhs_type: *rhs_type,
+            },
+            TraceOp::Div {
+                dest,
+                lhs,
+                rhs,
+                lhs_type,
+                rhs_type,
+            } => TraceOp::Div {
+                dest: r(dest),
+                lhs: r(lhs),
+                rhs: r(rhs),
+                lhs_type: *lhs_type,
+                rhs_type: *rhs_type,
+            },
+            TraceOp::Mod {
+                dest,
+                lhs,
+                rhs,
+                lhs_type,
+                rhs_type,
+            } => TraceOp::Mod {
+                dest: r(dest),
+                lhs: r(lhs),
+                rhs: r(rhs),
+                lhs_type: *lhs_type,
+                rhs_type: *rhs_type,
+            },
+            TraceOp::ModImm { dest, src, divisor } => TraceOp::ModImm {
+                dest: r(dest),
+                src: r(src),
+                divisor: *divisor,
+            },
+            TraceOp::Neg { dest, src } => TraceOp::Neg {
+                dest: r(dest),
+                src: r(src),
+            },
+            TraceOp::Eq {
+                dest,
+                lhs,
+                rhs,
+                lhs_type,
+                rhs_type,
+            } => TraceOp::Eq {
+                dest: r(dest),
+                lhs: r(lhs),
+                rhs: r(rhs),
+                lhs_type: *lhs_type,
+                rhs_type: *rhs_type,
+            },
+            TraceOp::Ne {
+                dest,
+                lhs,
+                rhs,
+                lhs_type,
+                rhs_type,
+            } => TraceOp::Ne {
+                dest: r(dest),
+                lhs: r(lhs),
+                rhs: r(rhs),
+                lhs_type: *lhs_type,
+                rhs_type: *rhs_type,
+            },
+            TraceOp::Lt {
+                dest,
+                lhs,
+                rhs,
+                lhs_type,
+                rhs_type,
+            } => TraceOp::Lt {
+                dest: r(dest),
+                lhs: r(lhs),
+                rhs: r(rhs),
+                lhs_type: *lhs_type,
+                rhs_type: *rhs_type,
+            },
+            TraceOp::Le {
+                dest,
+                lhs,
+                rhs,
+                lhs_type,
+                rhs_type,
+            } => TraceOp::Le {
+                dest: r(dest),
+                lhs: r(lhs),
+                rhs: r(rhs),
+                lhs_type: *lhs_type,
+                rhs_type: *rhs_type,
+            },
+            TraceOp::Gt {
+                dest,
+                lhs,
+                rhs,
+                lhs_type,
+                rhs_type,
+            } => TraceOp::Gt {
+                dest: r(dest),
+                lhs: r(lhs),
+                rhs: r(rhs),
+                lhs_type: *lhs_type,
+                rhs_type: *rhs_type,
+            },
+            TraceOp::Ge {
+                dest,
+                lhs,
+                rhs,
+                lhs_type,
+                rhs_type,
+            } => TraceOp::Ge {
+                dest: r(dest),
+                lhs: r(lhs),
+                rhs: r(rhs),
+                lhs_type: *lhs_type,
+                rhs_type: *rhs_type,
+            },
+            TraceOp::And { dest, lhs, rhs } => TraceOp::And {
+                dest: r(dest),
+                lhs: r(lhs),
+                rhs: r(rhs),
+            },
+            TraceOp::Or { dest, lhs, rhs } => TraceOp::Or {
+                dest: r(dest),
+                lhs: r(lhs),
+                rhs: r(rhs),
+            },
+            TraceOp::Not { dest, src } => TraceOp::Not {
+                dest: r(dest),
+                src: r(src),
+            },
+            TraceOp::Select {
+                dest,
+                cond,
+                on_true,
+                on_false,
+            } => TraceOp::Select {
+                dest: r(dest),
+                cond: r(cond),
+                on_true: on_true.clone(),
+                on_false: on_false.clone(),
+            },
+            TraceOp::SelectBitZero {
+                dest,
+                src,
+                mask,
+                on_zero,
+                on_nonzero,
+            } => TraceOp::SelectBitZero {
+                dest: r(dest),
+                src: r(src),
+                mask: *mask,
+                on_zero: on_zero.clone(),
+                on_nonzero: on_nonzero.clone(),
+            },
+            TraceOp::Guard {
+                register,
+                expected_type,
+            } => TraceOp::Guard {
+                register: r(register),
+                expected_type: *expected_type,
+            },
+            TraceOp::At { ip } => TraceOp::At { ip: *ip },
+            other => other.clone(),
+        }
+    }
+
+    fn inline_leaf_functions(&mut self, trace: &mut Trace) {
+        if !trace
+            .ops
+            .iter()
+            .any(|op| matches!(op, TraceOp::InlineCall { .. }))
+        {
+            return;
+        }
+
+        let mut max_reg = 0u8;
+        for op in trace
+            .preamble
+            .iter()
+            .chain(&trace.ops)
+            .chain(&trace.postamble)
+        {
+            if let Some(d) = Self::dest_of(op) {
+                max_reg = max_reg.max(d);
+            }
+            for r in Self::reads_of(op) {
+                max_reg = max_reg.max(r);
+            }
+            for w in Self::other_writes(op) {
+                max_reg = max_reg.max(w);
+            }
+        }
+
+        let mut new_ops = Vec::with_capacity(trace.ops.len() * 2);
+        let mut inlined_any = false;
+
+        for op in trace.ops.drain(..) {
+            if let TraceOp::InlineCall {
+                dest: inline_dest,
+                callee,
+                trace: inline_trace,
+            } = op
+            {
+                if Self::is_leaf_inline_trace(&inline_trace)
+                    && (max_reg as usize + inline_trace.register_count as usize) < 240
+                {
+                    inlined_any = true;
+                    let mut reg_map: HashMap<Register, Register> = HashMap::new();
+                    let mut prelude_moves = Vec::new();
+
+                    for i in 0..inline_trace.arg_count {
+                        let writes_param = inline_trace.body.iter().any(|callee_op| {
+                            Self::dest_of(callee_op) == Some(i)
+                                || Self::other_writes(callee_op).contains(&i)
+                        });
+                        let caller_arg_reg = inline_trace.arg_registers[i as usize];
+                        if writes_param {
+                            max_reg = max_reg.saturating_add(1);
+                            let fresh_reg = max_reg;
+                            prelude_moves.push(TraceOp::Move {
+                                dest: fresh_reg,
+                                src: caller_arg_reg,
+                            });
+                            reg_map.insert(i, fresh_reg);
+                        } else {
+                            reg_map.insert(i, caller_arg_reg);
+                        }
+                    }
+
+                    let ret_reg = inline_trace.return_register.unwrap();
+                    let can_direct_return = ret_reg >= inline_trace.arg_count
+                        && !inline_trace.arg_registers.contains(&inline_dest);
+
+                    for r in inline_trace.arg_count..inline_trace.register_count {
+                        if r == ret_reg && can_direct_return {
+                            reg_map.insert(r, inline_dest);
+                        } else {
+                            max_reg = max_reg.saturating_add(1);
+                            reg_map.insert(r, max_reg);
+                        }
+                    }
+
+                    new_ops.extend(prelude_moves);
+
+                    for callee_op in &inline_trace.body {
+                        if matches!(callee_op, TraceOp::At { .. }) {
+                            continue;
+                        }
+                        let remapped = Self::remap_leaf_op(callee_op, &reg_map);
+                        new_ops.push(remapped);
+                    }
+
+                    let mapped_ret = reg_map.get(&ret_reg).copied().unwrap_or(ret_reg);
+                    if mapped_ret != inline_dest {
+                        new_ops.push(TraceOp::Move {
+                            dest: inline_dest,
+                            src: mapped_ret,
+                        });
+                    }
+                    continue;
+                } else {
+                    new_ops.push(TraceOp::InlineCall {
+                        dest: inline_dest,
+                        callee,
+                        trace: inline_trace,
+                    });
+                }
+            } else {
+                new_ops.push(op);
+            }
+        }
+
+        trace.ops = new_ops;
+
+        if inlined_any {
+            crate::jit::log(|| {
+                "🌿 JIT Optimizer: Inlined leaf functions into caller trace".to_string()
+            });
         }
     }
 

@@ -375,7 +375,7 @@ impl CallFrame {
             function_idx,
             ip: 0,
             #[cfg(feature = "std")]
-            registers: core::array::from_fn(|_| Value::Nil),
+            registers: [const { Value::Nil }; 256],
             #[cfg(not(feature = "std"))]
             registers: alloc::vec![Value::Nil; register_count as usize],
             base_register: 0,
