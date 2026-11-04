@@ -176,8 +176,6 @@ impl VM {
             if should_check_jit && JIT_ENABLED {
                 let count = self.jit.profiler.record_backedge(func_idx, loop_start_ip);
                 let backedge_ip = ip_before_execution.saturating_sub(1);
-                let loop_in_hierarchy =
-                    self.is_loop_in_hierarchy(func_idx, loop_start_ip, backedge_ip);
                 if self
                     .trace_recorder
                     .as_ref()
@@ -434,13 +432,33 @@ impl VM {
                             .jit
                             .root_traces
                             .contains_key(&(func_idx, loop_start_ip))
-                        && self.jit.should_record_root(
+                    {
+                        let loop_in_hierarchy = match self
+                            .jit
+                            .profiler
+                            .get_cached_loop_hierarchy(func_idx, loop_start_ip)
+                        {
+                            Some(cached) => cached,
+                            None => {
+                                let calculated = self.is_loop_in_hierarchy(
+                                    func_idx,
+                                    loop_start_ip,
+                                    backedge_ip,
+                                );
+                                self.jit.profiler.set_cached_loop_hierarchy(
+                                    func_idx,
+                                    loop_start_ip,
+                                    calculated,
+                                );
+                                calculated
+                            }
+                        };
+                        if self.jit.should_record_root(
                             func_idx,
                             loop_start_ip,
                             count,
                             crate::jit::HOT_THRESHOLD + u32::from(loop_in_hierarchy),
-                        )
-                    {
+                        ) {
                         crate::jit::log(|| {
                             format!(
                                 "🔥 JIT: Hot loop detected at func {} ip {} - starting trace recording!",
@@ -464,6 +482,7 @@ impl VM {
                         self.trace_recorder = Some(recorder);
                         self.jit.recording_started();
                         self.skip_next_trace_record = true;
+                        }
                     }
                 }
             }
@@ -2150,6 +2169,10 @@ impl VM {
     /// as not compilable.
     #[cfg(all(feature = "std", any(target_arch = "x86_64", target_arch = "aarch64")))]
     fn compile_function(&mut self, func_idx: usize) {
+        if self.jit.root_traces.keys().any(|(f, _)| *f == func_idx) {
+            self.jit.function_not_compilable(func_idx);
+            return;
+        }
         use crate::jit::function::{Context, FunctionSig, translate};
         let sig_of = |meta: &CallMeta, function: &Function| FunctionSig {
             params: meta.params.iter().map(|kind| kind.value_type()).collect(),
