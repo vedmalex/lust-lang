@@ -170,8 +170,23 @@ impl<'a> MirVerifier<'a> {
                 match stmt {
                     Statement::Assign(place, rvalue, span) => {
                         self.check_rvalue_reads(rvalue, &current_inits, block.id, *span);
-                        if let Place::Local(loc) = place {
-                            current_inits.insert(*loc);
+                        match place {
+                            Place::Local(loc) => {
+                                current_inits.insert(*loc);
+                            }
+                            Place::Field(base, _) => {
+                                self.check_place_read(base, &current_inits, block.id, *span);
+                            }
+                            Place::Index(base, idx) => {
+                                self.check_place_read(base, &current_inits, block.id, *span);
+                                if !current_inits.contains(idx) {
+                                    self.error(
+                                        alloc::format!("Use of uninitialized local {idx}"),
+                                        Some(block.id),
+                                        Some(*span),
+                                    );
+                                }
+                            }
                         }
                     }
                     Statement::StorageDead(loc, _) => {
@@ -252,6 +267,39 @@ impl<'a> MirVerifier<'a> {
         }
     }
 
+    fn check_place_read(
+        &mut self,
+        place: &Place,
+        inits: &HashSet<LocalId>,
+        block: BlockId,
+        span: Span,
+    ) {
+        match place {
+            Place::Local(loc) => {
+                if !inits.contains(loc) {
+                    self.error(
+                        alloc::format!("Use of uninitialized local {loc}"),
+                        Some(block),
+                        Some(span),
+                    );
+                }
+            }
+            Place::Field(base, _) => {
+                self.check_place_read(base, inits, block, span);
+            }
+            Place::Index(base, idx) => {
+                self.check_place_read(base, inits, block, span);
+                if !inits.contains(idx) {
+                    self.error(
+                        alloc::format!("Use of uninitialized local {idx}"),
+                        Some(block),
+                        Some(span),
+                    );
+                }
+            }
+        }
+    }
+
     fn check_operand_read(
         &mut self,
         op: &Operand,
@@ -260,14 +308,8 @@ impl<'a> MirVerifier<'a> {
         span: Span,
     ) {
         match op {
-            Operand::Copy(Place::Local(loc)) | Operand::Move(Place::Local(loc)) => {
-                if !inits.contains(loc) {
-                    self.error(
-                        alloc::format!("Use of uninitialized local {loc}"),
-                        Some(block),
-                        Some(span),
-                    );
-                }
+            Operand::Copy(place) | Operand::Move(place) => {
+                self.check_place_read(place, inits, block, span);
             }
             _ => {}
         }

@@ -295,7 +295,9 @@ impl ZigCodegen {
             TypeKind::String => Ok("[]const u8".to_string()),
             TypeKind::Unit => Ok("void".to_string()),
             TypeKind::Named(name) => {
-                if self.known_structs.contains(name) {
+                if name == "Table" {
+                    Ok("LustArray(i64)".to_string())
+                } else if self.known_structs.contains(name) {
                     if is_field {
                         Ok(format!("*{}", name))
                     } else if self.runtime_opts.is_library {
@@ -308,6 +310,23 @@ impl ZigCodegen {
                 } else {
                     Ok(name.clone())
                 }
+            }
+            TypeKind::GenericInstance { name, type_args } => {
+                if name == "Table" {
+                    match type_args.len() {
+                        1 => {
+                            let inner_ty = self.map_type(&type_args[0], false)?;
+                            return Ok(format!("LustArray({})", inner_ty));
+                        }
+                        2 => {
+                            let k_ty = self.map_type(&type_args[0], false)?;
+                            let v_ty = self.map_type(&type_args[1], false)?;
+                            return Ok(format!("LustMap({}, {})", k_ty, v_ty));
+                        }
+                        _ => {}
+                    }
+                }
+                Ok(format!("{}_{}", name, type_args.len()))
             }
             TypeKind::Option(inner) => {
                 let inner_ty = self.map_type(inner, false)?;
@@ -533,16 +552,45 @@ impl ZigCodegen {
                 }
             }
             StmtKind::CompoundAssign { target, op, value } => {
-                let target_str = self.emit_expr_to_string(target)?;
                 let val_str = self.emit_expr_to_string(value)?;
-                match op {
-                    BinaryOp::Add => self.emit_line(&format!("{} += {};", target_str, val_str)),
-                    BinaryOp::Sub => self.emit_line(&format!("{} -= {};", target_str, val_str)),
-                    BinaryOp::Mul => self.emit_line(&format!("{} *= {};", target_str, val_str)),
-                    BinaryOp::Div => self.emit_line(&format!("{} = __lust_div({}, {});", target_str, target_str, val_str)),
-                    BinaryOp::Mod => self.emit_line(&format!("{} = @mod({}, {});", target_str, target_str, val_str)),
-                    BinaryOp::Concat => self.emit_line(&format!("{} = try __lust_str_concat({}, {});", target_str, target_str, val_str)),
-                    _ => self.emit_line(&format!("{} = {};", target_str, val_str)),
+                if let ExprKind::Index { object, index } = &target.kind {
+                    let obj_str = self.emit_expr_to_string(object)?;
+                    let idx_str = self.emit_expr_to_string(index)?;
+                    let cur_str = format!("{}.get_direct({})", obj_str, idx_str);
+                    match op {
+                        BinaryOp::Add => self.emit_line(&format!("{}.set({}, {} + {});", obj_str, idx_str, cur_str, val_str)),
+                        BinaryOp::Sub => self.emit_line(&format!("{}.set({}, {} - {});", obj_str, idx_str, cur_str, val_str)),
+                        BinaryOp::Mul => self.emit_line(&format!("{}.set({}, {} * {});", obj_str, idx_str, cur_str, val_str)),
+                        BinaryOp::Div => self.emit_line(&format!("{}.set({}, __lust_div({}, {}));", obj_str, idx_str, cur_str, val_str)),
+                        BinaryOp::FloorDiv => self.emit_line(&format!("{}.set({}, __lust_floordiv({}, {}));", obj_str, idx_str, cur_str, val_str)),
+                        BinaryOp::Mod => self.emit_line(&format!("{}.set({}, __lust_mod({}, {}));", obj_str, idx_str, cur_str, val_str)),
+                        BinaryOp::Pow => self.emit_line(&format!("{}.set({}, __lust_pow({}, {}));", obj_str, idx_str, cur_str, val_str)),
+                        BinaryOp::BitAnd => self.emit_line(&format!("{}.set({}, {} & {});", obj_str, idx_str, cur_str, val_str)),
+                        BinaryOp::BitOr => self.emit_line(&format!("{}.set({}, {} | {});", obj_str, idx_str, cur_str, val_str)),
+                        BinaryOp::BitXor => self.emit_line(&format!("{}.set({}, {} ^ {});", obj_str, idx_str, cur_str, val_str)),
+                        BinaryOp::Shl => self.emit_line(&format!("{}.set({}, {} << @as(u6, @intCast({} & 63)));", obj_str, idx_str, cur_str, val_str)),
+                        BinaryOp::Shr => self.emit_line(&format!("{}.set({}, {} >> @as(u6, @intCast({} & 63)));", obj_str, idx_str, cur_str, val_str)),
+                        BinaryOp::Concat => self.emit_line(&format!("{}.set({}, try __lust_str_concat({}, {}));", obj_str, idx_str, cur_str, val_str)),
+                        _ => self.emit_line(&format!("{}.set({}, {});", obj_str, idx_str, val_str)),
+                    }
+                } else {
+                    let target_str = self.emit_expr_to_string(target)?;
+                    match op {
+                        BinaryOp::Add => self.emit_line(&format!("{} += {};", target_str, val_str)),
+                        BinaryOp::Sub => self.emit_line(&format!("{} -= {};", target_str, val_str)),
+                        BinaryOp::Mul => self.emit_line(&format!("{} *= {};", target_str, val_str)),
+                        BinaryOp::Div => self.emit_line(&format!("{} = __lust_div({}, {});", target_str, target_str, val_str)),
+                        BinaryOp::FloorDiv => self.emit_line(&format!("{} = __lust_floordiv({}, {});", target_str, target_str, val_str)),
+                        BinaryOp::Mod => self.emit_line(&format!("{} = __lust_mod({}, {});", target_str, target_str, val_str)),
+                        BinaryOp::Pow => self.emit_line(&format!("{} = __lust_pow({}, {});", target_str, target_str, val_str)),
+                        BinaryOp::BitAnd => self.emit_line(&format!("{} = {} & {};", target_str, target_str, val_str)),
+                        BinaryOp::BitOr => self.emit_line(&format!("{} = {} | {};", target_str, target_str, val_str)),
+                        BinaryOp::BitXor => self.emit_line(&format!("{} = {} ^ {};", target_str, target_str, val_str)),
+                        BinaryOp::Shl => self.emit_line(&format!("{} = {} << @as(u6, @intCast({} & 63));", target_str, target_str, val_str)),
+                        BinaryOp::Shr => self.emit_line(&format!("{} = {} >> @as(u6, @intCast({} & 63));", target_str, target_str, val_str)),
+                        BinaryOp::Concat => self.emit_line(&format!("{} = try __lust_str_concat({}, {});", target_str, target_str, val_str)),
+                        _ => self.emit_line(&format!("{} = {};", target_str, val_str)),
+                    }
                 }
             }
             StmtKind::While { condition, body } => {
@@ -837,8 +885,14 @@ impl ZigCodegen {
                     BinaryOp::Sub => Ok(format!("({} - {})", l_str, r_str)),
                     BinaryOp::Mul => Ok(format!("({} * {})", l_str, r_str)),
                     BinaryOp::Div => Ok(format!("__lust_div({}, {})", l_str, r_str)),
-                    BinaryOp::Mod => Ok(format!("@mod({}, {})", l_str, r_str)),
+                    BinaryOp::FloorDiv => Ok(format!("__lust_floordiv({}, {})", l_str, r_str)),
+                    BinaryOp::Mod => Ok(format!("__lust_mod({}, {})", l_str, r_str)),
                     BinaryOp::Pow => Ok(format!("__lust_pow({}, {})", l_str, r_str)),
+                    BinaryOp::BitAnd => Ok(format!("({} & {})", l_str, r_str)),
+                    BinaryOp::BitOr => Ok(format!("({} | {})", l_str, r_str)),
+                    BinaryOp::BitXor => Ok(format!("({} ^ {})", l_str, r_str)),
+                    BinaryOp::Shl => Ok(format!("({} << @as(u6, @intCast({} & 63)))", l_str, r_str)),
+                    BinaryOp::Shr => Ok(format!("({} >> @as(u6, @intCast({} & 63)))", l_str, r_str)),
                     BinaryOp::Eq => Ok(format!("({} == {})", l_str, r_str)),
                     BinaryOp::Ne => Ok(format!("({} != {})", l_str, r_str)),
                     BinaryOp::Lt => Ok(format!("({} < {})", l_str, r_str)),
@@ -856,6 +910,7 @@ impl ZigCodegen {
                 match op {
                     UnaryOp::Neg => Ok(format!("(-{})", op_str)),
                     UnaryOp::Not => Ok(format!("(!{})", op_str)),
+                    UnaryOp::BitNot => Ok(format!("(~@as(i64, {}))", op_str)),
                 }
             }
             ExprKind::FieldAccess { object, field } => {
@@ -901,11 +956,21 @@ impl ZigCodegen {
                         Ok(format!("{}.contains({})", rec_str, val))
                     }
                     "reverse" if args.is_empty() => Ok(format!("{}.reverse()", rec_str)),
+                    "concat" if args.is_empty() => Ok(format!("try {}.concat(\"\")", rec_str)),
+                    "concat" if args.len() == 1 => {
+                        let sep = self.emit_expr_to_string(&args[0])?;
+                        Ok(format!("try {}.concat({})", rec_str, sep))
+                    }
+                    "insert" if args.len() == 1 => {
+                        let val = self.emit_expr_to_string(&args[0])?;
+                        Ok(format!("try {}.push({})", rec_str, val))
+                    }
                     "insert" if args.len() == 2 => {
                         let idx = self.emit_expr_to_string(&args[0])?;
                         let val = self.emit_expr_to_string(&args[1])?;
                         Ok(format!("try {}.insert({}, {})", rec_str, idx, val))
                     }
+                    "remove" if args.is_empty() => Ok(format!("{}.pop()", rec_str)),
                     "remove" if args.len() == 1 => {
                         let idx = self.emit_expr_to_string(&args[0])?;
                         Ok(format!("{}.remove({})", rec_str, idx))
@@ -1008,7 +1073,7 @@ impl ZigCodegen {
                                     }
                                 }
                             }
-                            "array" => match field.as_str() {
+                            "array" | "table" => match field.as_str() {
                                 "push" if args.len() == 2 => {
                                     let arr_str = self.emit_expr_to_string(&args[0])?;
                                     let val_str = self.emit_expr_to_string(&args[1])?;
@@ -1047,16 +1112,34 @@ impl ZigCodegen {
                                     let arr_str = self.emit_expr_to_string(&args[0])?;
                                     return Ok(format!("{}.reverse()", arr_str));
                                 }
+                                "insert" if args.len() == 2 => {
+                                    let arr_str = self.emit_expr_to_string(&args[0])?;
+                                    let val_str = self.emit_expr_to_string(&args[1])?;
+                                    return Ok(format!("try {}.push({})", arr_str, val_str));
+                                }
                                 "insert" if args.len() == 3 => {
                                     let arr_str = self.emit_expr_to_string(&args[0])?;
                                     let idx_str = self.emit_expr_to_string(&args[1])?;
                                     let val_str = self.emit_expr_to_string(&args[2])?;
                                     return Ok(format!("try {}.insert({}, {})", arr_str, idx_str, val_str));
                                 }
+                                "remove" if args.len() == 1 => {
+                                    let arr_str = self.emit_expr_to_string(&args[0])?;
+                                    return Ok(format!("{}.pop()", arr_str));
+                                }
                                 "remove" if args.len() == 2 => {
                                     let arr_str = self.emit_expr_to_string(&args[0])?;
                                     let idx_str = self.emit_expr_to_string(&args[1])?;
                                     return Ok(format!("{}.remove({})", arr_str, idx_str));
+                                }
+                                "concat" if args.len() == 1 => {
+                                    let arr_str = self.emit_expr_to_string(&args[0])?;
+                                    return Ok(format!("try {}.concat(\"\")", arr_str));
+                                }
+                                "concat" if args.len() == 2 => {
+                                    let arr_str = self.emit_expr_to_string(&args[0])?;
+                                    let sep_str = self.emit_expr_to_string(&args[1])?;
+                                    return Ok(format!("try {}.concat({})", arr_str, sep_str));
                                 }
                                 "sort" if args.len() == 1 => {
                                     let arr_str = self.emit_expr_to_string(&args[0])?;
@@ -1226,9 +1309,25 @@ impl ZigCodegen {
                                     let d_str = self.emit_expr_to_string(&args[1])?;
                                     return Ok(format!("try __lust_string_split({}, {})", s_str, d_str));
                                 }
+                                "slice" if args.len() == 3 => {
+                                    let s_str = self.emit_expr_to_string(&args[0])?;
+                                    let start_str = self.emit_expr_to_string(&args[1])?;
+                                    let end_str = self.emit_expr_to_string(&args[2])?;
+                                    return Ok(format!("__lust_string_slice({}, {}, {})", s_str, start_str, end_str));
+                                }
+                                "index_of" if args.len() == 2 => {
+                                    let s_str = self.emit_expr_to_string(&args[0])?;
+                                    let needle_str = self.emit_expr_to_string(&args[1])?;
+                                    return Ok(format!("__lust_string_index_of({}, {})", s_str, needle_str));
+                                }
                                 _ => {}
                             },
                             "math" => match field.as_str() {
+                                "mod" if args.len() == 2 => {
+                                    let a = self.emit_expr_to_string(&args[0])?;
+                                    let b = self.emit_expr_to_string(&args[1])?;
+                                    return Ok(format!("__lust_math_mod({}, {})", a, b));
+                                }
                                 "abs" if args.len() == 1 => {
                                     let x = self.emit_expr_to_string(&args[0])?;
                                     return Ok(format!("__lust_math_abs({})", x));
@@ -1913,6 +2012,9 @@ pub fn analyze_runtime_requirements(
     if opts.needs_string {
         opts.needs_array = true;
     }
+    if opts.needs_array {
+        opts.needs_string = true;
+    }
 
     opts
 }
@@ -1927,6 +2029,21 @@ fn scan_type(ty: &Type, opts: &mut RuntimeOptions) {
             opts.needs_map = true;
             scan_type(k, opts);
             scan_type(v, opts);
+        }
+        TypeKind::GenericInstance { name, type_args } => {
+            if name == "Table" {
+                if type_args.len() == 1 {
+                    opts.needs_array = true;
+                    scan_type(&type_args[0], opts);
+                } else if type_args.len() == 2 {
+                    opts.needs_map = true;
+                    scan_type(&type_args[0], opts);
+                    scan_type(&type_args[1], opts);
+                }
+            }
+        }
+        TypeKind::Named(name) if name == "Table" => {
+            opts.needs_array = true;
         }
         TypeKind::String => {
             opts.needs_string = true;
@@ -1957,7 +2074,7 @@ fn scan_stmt(stmt: &Stmt, opts: &mut RuntimeOptions) {
             scan_expr(value, opts);
             match op {
                 BinaryOp::Pow => opts.needs_pow = true,
-                BinaryOp::Div | BinaryOp::Mod => opts.needs_math = true,
+                BinaryOp::Div | BinaryOp::FloorDiv | BinaryOp::Mod => opts.needs_math = true,
                 BinaryOp::Concat => opts.needs_string = true,
                 _ => {}
             }
@@ -2026,7 +2143,7 @@ fn scan_expr(expr: &Expr, opts: &mut RuntimeOptions) {
             scan_expr(right, opts);
             match op {
                 BinaryOp::Pow => opts.needs_pow = true,
-                BinaryOp::Div | BinaryOp::Mod => opts.needs_math = true,
+                BinaryOp::Div | BinaryOp::FloorDiv | BinaryOp::Mod => opts.needs_math = true,
                 BinaryOp::Concat => opts.needs_string = true,
                 _ => {}
             }
@@ -2057,7 +2174,7 @@ fn scan_expr(expr: &Expr, opts: &mut RuntimeOptions) {
                     "os" => opts.needs_os = true,
                     "math" => opts.needs_math = true,
                     "string" => opts.needs_string = true,
-                    "array" => opts.needs_array = true,
+                    "array" | "table" => opts.needs_array = true,
                     "map" => opts.needs_map = true,
                     _ => {}
                 }
@@ -2085,8 +2202,11 @@ fn scan_expr(expr: &Expr, opts: &mut RuntimeOptions) {
                 scan_expr(a, opts);
             }
             match method.as_str() {
-                "push" | "pop" | "insert" | "remove" | "sort" | "slice" | "contains" | "reverse" => {
+                "push" | "pop" | "insert" | "remove" | "sort" | "slice" | "contains" | "reverse" | "concat" => {
                     opts.needs_array = true;
+                    if method == "concat" {
+                        opts.needs_string = true;
+                    }
                 }
                 "set" | "get" | "has" | "delete" => {
                     opts.needs_map = true;

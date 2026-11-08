@@ -343,6 +343,10 @@ pub enum TraceOp {
         first_element: Register,
         count: u8,
     },
+    StoreGlobal {
+        name: String,
+        src: Register,
+    },
     NewStruct {
         dest: Register,
         struct_name: String,
@@ -393,6 +397,15 @@ pub enum TraceOp {
         dest: Register,
         object: Register,
         field_index: usize,
+    },
+    /// Whole-function pattern fusion: read field `field_index` of `object`,
+    /// test if it is `Option::Some`. If not, branch to `label`. If so,
+    /// borrow payload 0 into `dest`.
+    BorrowFieldSome {
+        dest: Register,
+        object: Register,
+        field_index: usize,
+        label: usize,
     },
     /// Function code only: `dest` becomes a borrow of payload value
     /// `index` of the enum in `enum_reg`, itself a borrow (an enum's
@@ -464,6 +477,22 @@ pub enum TraceOp {
         src: Register,
         divisor: i64,
     },
+    /// Conditional hammock / bypass executed when condition_register != expect_truthy.
+    /// If condition matches expect_truthy, skips the block.
+    /// If condition does NOT match expect_truthy:
+    /// - If inner_loop_bypass is Some: evaluates (mul_lhs * mul_rhs) <= bound_reg.
+    ///   If <=, bails out to bailout_ip.
+    ///   If >, updates acc_dest = acc_src + acc_imm and rejoins.
+    /// - If inner_loop_bypass is None: updates acc_dest = acc_src + acc_imm and rejoins.
+    ConditionalHammock {
+        condition_register: Register,
+        expect_truthy: bool,
+        bailout_ip: usize,
+        acc_dest: Register,
+        acc_src: Register,
+        acc_imm: i64,
+        inner_loop_bypass: Option<InnerLoopBypass>,
+    },
     /// A call from compiled function code to a bytecode function whose
     /// identity is known at compile time. Runs the callee's compiled code
     /// natively when it has some, otherwise exits to the interpreter at
@@ -518,6 +547,13 @@ pub enum TraceOp {
     },
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InnerLoopBypass {
+    pub mul_lhs: Register,
+    pub mul_rhs: Register,
+    pub bound_reg: Register,
+}
+
 /// Operand for specialized operations
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Operand {
@@ -535,6 +571,7 @@ pub enum SpecializedOpKind {
     VecGet,
     VecSet,
     VecLen,
+    VecIndexOk,
 
     // Map operations
     MapInsert,
@@ -606,6 +643,7 @@ impl TraceOp {
             | TraceOp::GetEnumValue { dest, .. }
             | TraceOp::BorrowField { dest, .. }
             | TraceOp::BorrowEnumValue { dest, .. }
+            | TraceOp::BorrowFieldSome { dest, .. }
             | TraceOp::Select { dest, .. } => Some(*dest),
             _ => None,
         }
@@ -636,6 +674,7 @@ impl TraceOp {
             | TraceOp::GetEnumValue { dest, .. }
             | TraceOp::BorrowField { dest, .. }
             | TraceOp::BorrowEnumValue { dest, .. }
+            | TraceOp::BorrowFieldSome { dest, .. }
             | TraceOp::Select { dest, .. } => *dest = register,
             _ => {}
         }
@@ -854,20 +893,24 @@ impl TraceRecorder {
                 }
                 // Selection is speculative; the generated unbox helper validates
                 // every element before the specialized representation is used.
-                // Only `Array<int>` may be specialized: the unbox/rebox helpers
-                // (`jit_unbox_array_int` / `jit_rebox_array_int`) are the only
-                // ones that exist, and the layout alone cannot distinguish an
-                // int array from a float or bool one — every scalar element is
-                // 8 bytes wide.  Claiming a float array is specializable made
-                // codegen emit the *int* helpers for float data; the unbox then
-                // correctly refused the elements and bailed out, but the trace
-                // made no progress and was re-entered forever.
-                //
-                // Widen this only together with element-typed helpers.
-                let element_type = arr_rc.borrow().first().and_then(|value| match value {
-                    Value::Int(_) => Some(crate::ast::TypeKind::Int),
-                    _ => None,
-                });
+                let element_type = arr_rc
+                    .borrow()
+                    .first()
+                    .and_then(|value| match value {
+                        Value::Int(_) => Some(crate::ast::TypeKind::Int),
+                        Value::Bool(_) => Some(crate::ast::TypeKind::Bool),
+                        Value::Float(_) => Some(crate::ast::TypeKind::Float),
+                        _ => None,
+                    })
+                    .or_else(|| match function.register_types.get(&reg) {
+                        Some(crate::ast::TypeKind::Array(elem_type)) => match &elem_type.kind {
+                            crate::ast::TypeKind::Int => Some(crate::ast::TypeKind::Int),
+                            crate::ast::TypeKind::Bool => Some(crate::ast::TypeKind::Bool),
+                            crate::ast::TypeKind::Float => Some(crate::ast::TypeKind::Float),
+                            _ => None,
+                        },
+                        _ => None,
+                    });
 
                 if let Some(elem_type) = element_type {
                     use crate::ast::{Span, Type};
@@ -1054,6 +1097,144 @@ impl TraceRecorder {
         // Pattern 2: if-then (no else block) - disabled for safety:
         // TraceOp::Select writes a constant on_false into dest, which clobbers
         // dynamic loop variables or accumulators (e.g. c = c + 1).
+
+        None
+    }
+
+    fn try_detect_conditional_hammock(
+        &mut self,
+        cond: Register,
+        current_ip: usize,
+        target_ip: usize,
+        function: &crate::bytecode::Function,
+        registers: &[Value],
+    ) -> Option<TraceOp> {
+        let instructions = &function.chunk.instructions;
+        if current_ip >= target_ip || target_ip > instructions.len() {
+            return None;
+        }
+
+        let slice = &instructions[current_ip..target_ip];
+        if slice.len() < 2 {
+            return None;
+        }
+
+        // We check if slice begins with accumulator increment:
+        // Instruction 0: LoadConst(c_reg, K)
+        // Instruction 1: AddInt(acc_dest, acc_src, c_reg) or Add(acc_dest, acc_src, c_reg)
+        let (acc_dest, acc_src, acc_imm, after_acc_idx) = match (&slice[0], &slice[1]) {
+            (Instruction::LoadConst(c_reg, k), Instruction::AddInt(dest, src, rhs))
+            | (Instruction::LoadConst(c_reg, k), Instruction::Add(dest, src, rhs))
+                if rhs == c_reg =>
+            {
+                let imm = match function.chunk.constants.get(*k as usize) {
+                    Some(Value::Int(i)) => *i,
+                    _ => return None,
+                };
+                if !matches!(registers.get(*src as usize), Some(Value::Int(_))) {
+                    return None;
+                }
+                (*dest, *src, imm, 2)
+            }
+            _ => return None,
+        };
+
+        // Case A: Pure accumulator hammock (no inner loop)
+        let is_pure_hammock = slice[after_acc_idx..].iter().all(|instr| match instr {
+            Instruction::Jump(0) => true,
+            _ => false,
+        });
+
+        if is_pure_hammock {
+            for reg in [cond, acc_src] {
+                if !self.is_guarded(reg) {
+                    if let Some(ty) = Self::get_value_type(&registers[reg as usize]) {
+                        self.push_op(TraceOp::Guard {
+                            register: reg,
+                            expected_type: ty,
+                        });
+                        self.mark_guarded(reg);
+                    }
+                }
+            }
+            return Some(TraceOp::ConditionalHammock {
+                condition_register: cond,
+                expect_truthy: false,
+                bailout_ip: current_ip,
+                acc_dest,
+                acc_src,
+                acc_imm,
+                inner_loop_bypass: None,
+            });
+        }
+
+        // Case B: Inner loop with early bypass (like sieve.lust)
+        if slice.len() >= 5 {
+            let (mul_lhs, mul_rhs, j_reg) = match &slice[2] {
+                Instruction::MulInt(j, lhs, rhs) | Instruction::Mul(j, lhs, rhs) => (*lhs, *rhs, *j),
+                _ => return None,
+            };
+
+            let (cond_reg, bound_reg) = match &slice[3] {
+                Instruction::LeInt(c, j, b)
+                | Instruction::LtInt(c, j, b)
+                | Instruction::Le(c, j, b)
+                | Instruction::Lt(c, j, b)
+                    if *j == j_reg =>
+                {
+                    (*c, *b)
+                }
+                _ => return None,
+            };
+
+            let inner_target = match &slice[4] {
+                Instruction::JumpIfNot(c, offset) if *c == cond_reg => {
+                    let ip_of_jump = current_ip + 4;
+                    ((ip_of_jump + 1) as isize + *offset as isize) as usize
+                }
+                _ => return None,
+            };
+
+            // Does inner_target reach near target_ip? (within 2 instructions, allowing for Jump 0)
+            if inner_target < target_ip.saturating_sub(2) || inner_target > target_ip + 2 {
+                return None;
+            }
+
+            // Verify types:
+            if !matches!(registers.get(mul_lhs as usize), Some(Value::Int(_)))
+                || !matches!(registers.get(mul_rhs as usize), Some(Value::Int(_)))
+                || !matches!(registers.get(bound_reg as usize), Some(Value::Int(_)))
+            {
+                return None;
+            }
+
+            // Guard registers
+            for reg in [cond, acc_src, mul_lhs, mul_rhs, bound_reg] {
+                if !self.is_guarded(reg) {
+                    if let Some(ty) = Self::get_value_type(&registers[reg as usize]) {
+                        self.push_op(TraceOp::Guard {
+                            register: reg,
+                            expected_type: ty,
+                        });
+                        self.mark_guarded(reg);
+                    }
+                }
+            }
+
+            return Some(TraceOp::ConditionalHammock {
+                condition_register: cond,
+                expect_truthy: false,
+                bailout_ip: current_ip,
+                acc_dest,
+                acc_src,
+                acc_imm,
+                inner_loop_bypass: Some(InnerLoopBypass {
+                    mul_lhs,
+                    mul_rhs,
+                    bound_reg,
+                }),
+            });
+        }
 
         None
     }
@@ -1300,10 +1481,13 @@ impl TraceRecorder {
             | TraceOp::GetEnumValue { dest, .. }
             | TraceOp::BorrowField { dest, .. }
             | TraceOp::BorrowEnumValue { dest, .. }
+            | TraceOp::BorrowFieldSome { dest, .. }
             | TraceOp::Select { dest, .. }
             | TraceOp::SelectBitZero { dest, .. }
-            | TraceOp::ModImm { dest, .. } => Some(*dest),
+            | TraceOp::ModImm { dest, .. }
+            | TraceOp::ConditionalHammock { acc_dest: dest, .. } => Some(*dest),
             TraceOp::SetField { .. }
+            | TraceOp::StoreGlobal { .. }
             | TraceOp::RestoreField { .. }
             | TraceOp::SetIndex { .. }
             | TraceOp::ArrayIndexOk { .. }
@@ -1556,9 +1740,9 @@ impl TraceRecorder {
     /// wrong array: the recording is abandoned, and the site recorded again
     /// without specializing.
     fn remove_specialization_tracking(&mut self, register: Register) {
-        if !self.specialized_registers.contains_key(&register) {
+        let Some((specialized_id, _)) = self.specialized_registers.get(&register).cloned() else {
             return;
-        }
+        };
         if self.disable_unused_specialization(register) {
             crate::jit::log(|| {
                 format!(
@@ -1569,6 +1753,22 @@ impl TraceRecorder {
             return;
         }
         self.specialized_registers.remove(&register);
+        // If another register still tracks this same specialized_id,
+        // then only an alias was overwritten; the primary owner still
+        // reboxes the specialized value at trace exit.
+        if self
+            .specialized_registers
+            .values()
+            .any(|(id, _)| *id == specialized_id)
+        {
+            crate::jit::log(|| {
+                format!(
+                    "📦 JIT: Dropping alias reg {} for specialized #{} (other register still tracks it)",
+                    register, specialized_id
+                )
+            });
+            return;
+        }
         self.overwritten_specialization = true;
     }
 
@@ -1596,22 +1796,41 @@ impl TraceRecorder {
         let Some((specialized_id, _)) = self.specialized_registers.get(&register).cloned() else {
             return true;
         };
-        let uses_specialization = |op: &TraceOp| {
+        let is_mutating_or_read_specialization = |op: &TraceOp| {
             matches!(
                 op,
-                TraceOp::SpecializedOp { operands, .. }
+                TraceOp::SpecializedOp { op, operands }
                     if operands.iter().any(
                         |operand| matches!(operand, Operand::Specialized(id) if *id == specialized_id)
-                    )
+                    ) && !matches!(op, SpecializedOpKind::VecLen)
             )
         };
-        if self.trace.ops.iter().any(&uses_specialization)
+        if self.trace.ops.iter().any(&is_mutating_or_read_specialization)
             || self
                 .inline_stack
                 .iter()
-                .any(|context| context.ops.iter().any(&uses_specialization))
+                .any(|context| context.ops.iter().any(&is_mutating_or_read_specialization))
         {
             return false;
+        }
+
+        let rewrite_vec_len = |op: &mut TraceOp| {
+            if let TraceOp::SpecializedOp { op: SpecializedOpKind::VecLen, operands } = op {
+                if operands.len() >= 2
+                    && matches!(operands[0], Operand::Specialized(id) if id == specialized_id)
+                    && let Operand::Register(dest) = operands[1]
+                {
+                    *op = TraceOp::ArrayLen { dest, array: register };
+                }
+            }
+        };
+        for op in &mut self.trace.ops {
+            rewrite_vec_len(op);
+        }
+        for context in &mut self.inline_stack {
+            for op in &mut context.ops {
+                rewrite_vec_len(op);
+            }
         }
 
         self.specialized_registers
@@ -1722,13 +1941,33 @@ impl TraceRecorder {
         use crate::jit::Intrinsic;
         let intrinsic = *self.intrinsics.get(&native_ptr)?;
         let owner = self.specialized_owner(first_arg, registers)?;
-        let specialized_id = self.specialized_registers.get(&owner)?.0;
+        let (specialized_id, ref layout) = self.specialized_registers.get(&owner)?.clone();
         match intrinsic {
             Intrinsic::ArrayPush if arg_count == 2 => {
                 let value_reg = first_arg + 1;
-                if !matches!(registers[value_reg as usize], Value::Int(_)) {
-                    return None;
-                }
+                use crate::jit::specialization::SpecializedLayout;
+                let expected_type = match layout {
+                    SpecializedLayout::Vec { element_size: 1, .. } => {
+                        if !matches!(registers[value_reg as usize], Value::Bool(_)) {
+                            return None;
+                        }
+                        ValueType::Bool
+                    }
+                    SpecializedLayout::Vec { element_layout, .. }
+                        if matches!(**element_layout, SpecializedLayout::Scalar { is_float: true, .. }) =>
+                    {
+                        if !matches!(registers[value_reg as usize], Value::Float(_)) {
+                            return None;
+                        }
+                        ValueType::Float
+                    }
+                    _ => {
+                        if !matches!(registers[value_reg as usize], Value::Int(_)) {
+                            return None;
+                        }
+                        ValueType::Int
+                    }
+                };
                 crate::jit::log(|| {
                     format!(
                         "⚡ JIT: array.push on reg {} (specialized #{})",
@@ -1738,7 +1977,7 @@ impl TraceRecorder {
                 if !self.is_guarded(value_reg) {
                     self.push_op(TraceOp::Guard {
                         register: value_reg,
-                        expected_type: ValueType::Int,
+                        expected_type,
                     });
                     self.mark_guarded(value_reg);
                 }
@@ -2335,6 +2574,30 @@ impl TraceRecorder {
             }
 
             Instruction::GetIndex(dest, array, index) => {
+                if let Some(owner) = self.specialized_owner(array, registers)
+                    && let Some((specialized_id, _)) =
+                        self.specialized_registers.get(&owner).cloned()
+                {
+                    if let Some(ty) = Self::get_value_type(&registers[index as usize])
+                        && !self.is_guarded(index)
+                    {
+                        self.push_op(TraceOp::Guard {
+                            register: index,
+                            expected_type: ty,
+                        });
+                        self.mark_guarded(index);
+                    }
+                    self.push_op(TraceOp::SpecializedOp {
+                        op: SpecializedOpKind::VecGet,
+                        operands: vec![
+                            Operand::Register(dest),
+                            Operand::Specialized(specialized_id),
+                            Operand::Register(index),
+                        ],
+                    });
+                    self.mark_guarded(dest);
+                    return Ok(());
+                }
                 if !self.disable_unused_array_specialization(array, registers) {
                     self.specialization_escaped = true;
                     self.stop_recording();
@@ -2408,7 +2671,97 @@ impl TraceRecorder {
                 Ok(())
             }
 
+            Instruction::ArrayIndexOk(value_dest, condition_dest, array, index) => {
+                if let Some(owner) = self.specialized_owner(array, registers)
+                    && let Some((specialized_id, _)) =
+                        self.specialized_registers.get(&owner).cloned()
+                {
+                    if let Some(ty) = Self::get_value_type(&registers[index as usize])
+                        && !self.is_guarded(index)
+                    {
+                        self.push_op(TraceOp::Guard {
+                            register: index,
+                            expected_type: ty,
+                        });
+                        self.mark_guarded(index);
+                    }
+                    self.push_op(TraceOp::SpecializedOp {
+                        op: SpecializedOpKind::VecIndexOk,
+                        operands: vec![
+                            Operand::Register(value_dest),
+                            Operand::Register(condition_dest),
+                            Operand::Specialized(specialized_id),
+                            Operand::Register(index),
+                        ],
+                    });
+                    self.mark_guarded(condition_dest);
+                    return Ok(());
+                }
+
+                let Value::Array(arr) = &registers[array as usize] else {
+                    self.stop_recording();
+                    return Err(LustError::RuntimeError {
+                        message: "Trace aborted: checked indexing currently supports arrays only"
+                            .to_string(),
+                    });
+                };
+                crate::bytecode::value::sync_specialized_array(arr);
+                if !self.disable_unused_array_specialization(array, registers) {
+                    self.specialization_escaped = true;
+                    self.stop_recording();
+                    return Err(LustError::RuntimeError {
+                        message: "Trace aborted: checked read follows a specialized array mutation"
+                            .to_string(),
+                    });
+                }
+                if let Some(ty) = Self::get_value_type(&registers[array as usize])
+                    && !self.is_guarded(array)
+                {
+                    self.push_op(TraceOp::Guard {
+                        register: array,
+                        expected_type: ty,
+                    });
+                    self.mark_guarded(array);
+                }
+                if let Some(ty) = Self::get_value_type(&registers[index as usize])
+                    && !self.is_guarded(index)
+                {
+                    self.push_op(TraceOp::Guard {
+                        register: index,
+                        expected_type: ty,
+                    });
+                    self.mark_guarded(index);
+                }
+                let value_type = registers
+                    .get(value_dest as usize)
+                    .and_then(Self::get_value_type)
+                    .or_else(|| arr.borrow().first().and_then(Self::get_value_type));
+                self.push_op(TraceOp::ArrayIndexOk {
+                    value_dest,
+                    condition_dest,
+                    array,
+                    index,
+                    value_type,
+                });
+                self.mark_guarded(condition_dest);
+                Ok(())
+            }
+
             Instruction::ArrayLen(dest, array) => {
+                if let Some(owner) = self.specialized_owner(array, registers) {
+                    if let Some(&(specialized_id, _)) = self.specialized_registers.get(&owner) {
+                        self.push_op(TraceOp::SpecializedOp {
+                            op: SpecializedOpKind::VecLen,
+                            operands: vec![
+                                Operand::Specialized(specialized_id),
+                                Operand::Register(dest),
+                            ],
+                        });
+                        self.mark_guarded(dest);
+                        return Ok(());
+                    }
+                }
+
                 if let Some(ty) = Self::get_value_type(&registers[array as usize])
                     && !self.is_guarded(array)
                 {
@@ -3132,6 +3485,46 @@ impl TraceRecorder {
                             .to_string(),
                     });
                 }
+                if let Some(owner) = self.specialized_owner(array, registers)
+                    && let Some((specialized_id, ref layout)) =
+                        self.specialized_registers.get(&owner).cloned()
+                {
+                    if let Some(ty) = Self::get_value_type(&registers[index as usize])
+                        && !self.is_guarded(index)
+                    {
+                        self.push_op(TraceOp::Guard {
+                            register: index,
+                            expected_type: ty,
+                        });
+                        self.mark_guarded(index);
+                    }
+                    use crate::jit::specialization::SpecializedLayout;
+                    let expected_type = match layout {
+                        SpecializedLayout::Vec { element_size: 1, .. } => ValueType::Bool,
+                        SpecializedLayout::Vec { element_layout, .. }
+                            if matches!(**element_layout, SpecializedLayout::Scalar { is_float: true, .. }) =>
+                        {
+                            ValueType::Float
+                        }
+                        _ => ValueType::Int,
+                    };
+                    if !self.is_guarded(value) {
+                        self.push_op(TraceOp::Guard {
+                            register: value,
+                            expected_type,
+                        });
+                        self.mark_guarded(value);
+                    }
+                    self.push_op(TraceOp::SpecializedOp {
+                        op: SpecializedOpKind::VecSet,
+                        operands: vec![
+                            Operand::Specialized(specialized_id),
+                            Operand::Register(index),
+                            Operand::Register(value),
+                        ],
+                    });
+                    return Ok(());
+                }
                 if !self.disable_unused_array_specialization(array, registers) {
                     self.specialization_escaped = true;
                     self.stop_recording();
@@ -3407,6 +3800,20 @@ impl TraceRecorder {
                 let condition = &registers[cond as usize];
                 let is_truthy = condition.is_truthy();
                 let bailout_ip = if !is_truthy { current_ip } else { target };
+
+                if !is_truthy {
+                    if let Some(op) = self.try_detect_conditional_hammock(
+                        cond,
+                        current_ip,
+                        target,
+                        function,
+                        registers,
+                    ) {
+                        self.push_op(op);
+                        return Ok(());
+                    }
+                }
+
                 self.push_op(TraceOp::GuardLoopContinue {
                     condition_register: cond,
                     expect_truthy: is_truthy,

@@ -1,6 +1,6 @@
 mod budget;
 mod corelib;
-mod cycle;
+pub(crate) mod cycle;
 #[cfg(feature = "std")]
 pub mod stdlib;
 mod task;
@@ -524,6 +524,8 @@ impl Drop for VM {
         self.nested_loop_exit_ip = None;
         self.task_manager = TaskManager::new();
 
-        collector.collect(self);
+        if collector.is_enabled() && collector.has_live_containers() {
+            collector.collect(self);
+        }
     }
 }

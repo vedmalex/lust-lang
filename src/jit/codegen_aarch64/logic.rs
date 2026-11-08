@@ -225,6 +225,7 @@ impl JitCompiler {
                     self.emit_mov_imm64(14, *t as u64);
                     self.emit_mov_imm64(15, *f as u64);
                     self.cached_select_imms = Some((*t, *f));
+                    self.cached_specialized_vec = None;
                 }
                 match self.direct_dest_x(dest) {
                     Some(d) => {
@@ -319,6 +320,7 @@ impl JitCompiler {
                     self.emit_mov_imm64(14, *t as u64);
                     self.emit_mov_imm64(15, *f as u64);
                     self.cached_select_imms = Some((*t, *f));
+                    self.cached_specialized_vec = None;
                 }
                 if mask == 1 {
                     dynasm!(self.ops

@@ -498,6 +498,7 @@ fn build_base_functions() -> Vec<BuiltinFunction> {
 }
 
 static ARRAY_FUNCTIONS: StaticOnceCell<Vec<BuiltinFunction>> = StaticOnceCell::new();
+static TABLE_FUNCTIONS: StaticOnceCell<Vec<BuiltinFunction>> = StaticOnceCell::new();
 static MAP_FUNCTIONS: StaticOnceCell<Vec<BuiltinFunction>> = StaticOnceCell::new();
 static MATH_FUNCTIONS: StaticOnceCell<Vec<BuiltinFunction>> = StaticOnceCell::new();
 static STRING_FUNCTIONS: StaticOnceCell<Vec<BuiltinFunction>> = StaticOnceCell::new();
@@ -680,6 +681,133 @@ fn build_array_functions() -> Vec<BuiltinFunction> {
             &["arr"],
             vec![arr_t.clone()],
             TypeExpr::Named("Iterator"),
+        ),
+    ]
+}
+
+fn build_table_functions() -> Vec<BuiltinFunction> {
+    let t = TypeExpr::Generic("T");
+    let arr_t = TypeExpr::Array(Box::new(t.clone()));
+    vec![
+        generic_func(
+            "table.len",
+            "Return the number of elements in the array/table",
+            &["T"],
+            &["arr"],
+            vec![arr_t.clone()],
+            TypeExpr::Int,
+        ),
+        generic_func(
+            "table.is_empty",
+            "Check if the array/table contains no elements",
+            &["T"],
+            &["arr"],
+            vec![arr_t.clone()],
+            TypeExpr::Bool,
+        ),
+        generic_func(
+            "table.get",
+            "Return the element at the given index, if any",
+            &["T"],
+            &["arr", "index"],
+            vec![arr_t.clone(), TypeExpr::Int],
+            TypeExpr::Option(Box::new(t.clone())),
+        ),
+        generic_func(
+            "table.first",
+            "Return the first element, if any",
+            &["T"],
+            &["arr"],
+            vec![arr_t.clone()],
+            TypeExpr::Option(Box::new(t.clone())),
+        ),
+        generic_func(
+            "table.last",
+            "Return the last element, if any",
+            &["T"],
+            &["arr"],
+            vec![arr_t.clone()],
+            TypeExpr::Option(Box::new(t.clone())),
+        ),
+        generic_func(
+            "table.push",
+            "Append a value to the array/table",
+            &["T"],
+            &["arr", "value"],
+            vec![arr_t.clone(), t.clone()],
+            TypeExpr::Unit,
+        ),
+        generic_func(
+            "table.pop",
+            "Remove and return the last element, if any",
+            &["T"],
+            &["arr"],
+            vec![arr_t.clone()],
+            TypeExpr::Option(Box::new(t.clone())),
+        ),
+        generic_func(
+            "table.insert",
+            "Insert a value at index or push if 2 arguments are provided",
+            &["T"],
+            &["arr", "index_or_val", "value"],
+            vec![arr_t.clone(), TypeExpr::Unknown, TypeExpr::Unknown],
+            TypeExpr::Unit,
+        ),
+        generic_func(
+            "table.remove",
+            "Remove element at index, or remove last element if 1 argument",
+            &["T"],
+            &["arr", "index"],
+            vec![arr_t.clone(), TypeExpr::Unknown],
+            TypeExpr::Option(Box::new(t.clone())),
+        ),
+        generic_func(
+            "table.concat",
+            "Concatenate array/table elements into a string with an optional separator",
+            &["T"],
+            &["arr", "sep"],
+            vec![arr_t.clone(), TypeExpr::Unknown],
+            TypeExpr::String,
+        ),
+        generic_func(
+            "table.sort",
+            "Sort elements in the array/table in-place",
+            &["T"],
+            &["arr", "comp"],
+            vec![arr_t.clone(), TypeExpr::Unknown],
+            TypeExpr::Unit,
+        ),
+        generic_func(
+            "table.reverse",
+            "Reverse elements in the array/table in-place",
+            &["T"],
+            &["arr"],
+            vec![arr_t.clone()],
+            TypeExpr::Unit,
+        ),
+        generic_func(
+            "table.clear",
+            "Remove all elements from the array/table",
+            &["T"],
+            &["arr"],
+            vec![arr_t.clone()],
+            TypeExpr::Unit,
+        ),
+        generic_func(
+            "table.contains",
+            "Check if the array/table contains a given value",
+            &["T"],
+            &["arr", "value"],
+            vec![arr_t.clone(), t.clone()],
+            TypeExpr::Bool,
+        ),
+        generic_func(
+            "table.slice",
+            "Return a slice of the array/table between two indices",
+            &["T"],
+            &["arr", "start", "end"],
+            vec![arr_t.clone(), TypeExpr::Int, TypeExpr::Int],
+            arr_t.clone(),
         ),
     ]
 }
@@ -935,6 +1063,13 @@ fn build_math_functions() -> Vec<BuiltinFunction> {
             vec![TypeExpr::Unknown],
             TypeExpr::Option(Box::new(TypeExpr::Float)),
         ),
+        func(
+            "math.mod",
+            "Floored modulo with divisor sign",
+            &["a", "b"],
+            vec![TypeExpr::Int, TypeExpr::Int],
+            TypeExpr::Int,
+        ),
     ]
 }
 
@@ -1110,6 +1245,20 @@ fn build_string_functions() -> Vec<BuiltinFunction> {
             &["s"],
             vec![TypeExpr::String],
             TypeExpr::Array(Box::new(TypeExpr::String)),
+        ),
+        func(
+            "string.slice",
+            "Return a 0-based slice of string [start..end)",
+            &["s", "start", "end"],
+            vec![TypeExpr::String, TypeExpr::Int, TypeExpr::Int],
+            TypeExpr::String,
+        ),
+        func(
+            "string.index_of",
+            "Return 0-based index of substring, or None",
+            &["s", "substr"],
+            vec![TypeExpr::String, TypeExpr::String],
+            TypeExpr::Option(Box::new(TypeExpr::Int)),
         ),
     ]
 }
@@ -1372,6 +1521,12 @@ pub fn array_functions() -> &'static [BuiltinFunction] {
         .as_slice()
 }
 
+pub fn table_functions() -> &'static [BuiltinFunction] {
+    TABLE_FUNCTIONS
+        .get_or_init(build_table_functions)
+        .as_slice()
+}
+
 pub fn map_functions() -> &'static [BuiltinFunction] {
     MAP_FUNCTIONS.get_or_init(build_map_functions).as_slice()
 }
@@ -1477,11 +1632,12 @@ static BUILTINS_DATABASE: StaticOnceCell<BuiltinsDatabase> = StaticOnceCell::new
 
 fn build_builtins_database() -> BuiltinsDatabase {
     let mut modules: BTreeMap<&'static str, BuiltinModule> = BTreeMap::new();
-    let module_specs: [(&'static str, &'static str, &'static [BuiltinFunction]); 7] = [
+    let module_specs: [(&'static str, &'static str, &'static [BuiltinFunction]); 8] = [
         ("array", "array collection module", array_functions()),
         ("map", "map collection module", map_functions()),
         ("math", "math module", math_functions()),
         ("string", "string module", string_functions()),
+        ("table", "table collection module", table_functions()),
         ("task", "task runtime module", task_functions()),
         ("io", "io file & console module", io_functions()),
         ("os", "os filesystem module", os_functions()),
@@ -1535,4 +1691,59 @@ pub fn lookup_builtin_method(
         }
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_table_functions_registered() {
+        let funcs = table_functions();
+        assert_eq!(funcs.len(), 15);
+        let names: Vec<&str> = funcs.iter().map(|f| f.name).collect();
+        assert!(names.contains(&"table.len"));
+        assert!(names.contains(&"table.is_empty"));
+        assert!(names.contains(&"table.get"));
+        assert!(names.contains(&"table.first"));
+        assert!(names.contains(&"table.last"));
+        assert!(names.contains(&"table.push"));
+        assert!(names.contains(&"table.pop"));
+        assert!(names.contains(&"table.insert"));
+        assert!(names.contains(&"table.remove"));
+        assert!(names.contains(&"table.concat"));
+        assert!(names.contains(&"table.sort"));
+        assert!(names.contains(&"table.reverse"));
+        assert!(names.contains(&"table.clear"));
+        assert!(names.contains(&"table.contains"));
+        assert!(names.contains(&"table.slice"));
+    }
+
+    #[test]
+    fn test_table_module_in_database() {
+        let db = builtins();
+        let table_mod = db.module("table").expect("table module must exist in builtins");
+        assert_eq!(table_mod.functions().len(), 15);
+    }
+
+    #[test]
+    fn test_math_mod_registered() {
+        let funcs = math_functions();
+        let math_mod = funcs.iter().find(|f| f.name == "math.mod");
+        assert!(math_mod.is_some(), "math.mod must be registered");
+        let sig = &math_mod.unwrap().signature;
+        assert_eq!(sig.params.len(), 2);
+    }
+
+    #[test]
+    fn test_string_slice_and_index_of_registered() {
+        let funcs = string_functions();
+        let slice_fn = funcs.iter().find(|f| f.name == "string.slice");
+        assert!(slice_fn.is_some(), "string.slice must be registered");
+        assert_eq!(slice_fn.unwrap().signature.params.len(), 3);
+
+        let index_of_fn = funcs.iter().find(|f| f.name == "string.index_of");
+        assert!(index_of_fn.is_some(), "string.index_of must be registered");
+        assert_eq!(index_of_fn.unwrap().signature.params.len(), 2);
+    }
 }

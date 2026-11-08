@@ -1,4 +1,5 @@
 use super::*;
+use crate::jit::trace::{Operand, SpecializedOpKind};
 use crate::VM;
 use hashbrown::HashMap;
 
@@ -128,6 +129,7 @@ impl JitCompiler {
             specialized_values: HashMap::new(),
             scalar_registers: HashMap::new(),
             array_registers: hashbrown::HashSet::new(),
+            guarded_structs: hashbrown::HashSet::new(),
             pins: HashMap::new(),
             pin_active: false,
             hot_x0: None,
@@ -163,8 +165,13 @@ impl JitCompiler {
             fail_sites: Vec::new(),
             next_specialized_id: 0,
             cached_select_imms: None,
+            cached_specialized_vec: None,
             hoisted_array: None,
             const_registers: HashMap::new(),
+            specialized_bounded_indices: hashbrown::HashSet::new(),
+            specialized_stride_loops: hashbrown::HashMap::new(),
+            in_stride_batch_fallback: false,
+            cached_bool_const: None,
         }
     }
 
@@ -225,6 +232,7 @@ impl JitCompiler {
         result
     }
 
+    #[allow(dead_code)]
     pub(super) fn retain_string_pointers(&mut self, pointers: Vec<*const u8>) -> *const *const u8 {
         let pointers = pointers.into_boxed_slice();
         let ptr = pointers.as_ptr();
@@ -232,10 +240,26 @@ impl JitCompiler {
         ptr
     }
 
+    #[allow(dead_code)]
     pub(super) fn retain_string_lengths(&mut self, lengths: Vec<usize>) -> *const usize {
         let lengths = lengths.into_boxed_slice();
         let ptr = lengths.as_ptr();
         self.data.push(JitData::StringLengths(lengths));
+        ptr
+    }
+
+    pub(super) fn retain_struct_site(
+        &mut self,
+        name: &str,
+        field_names: &[String],
+    ) -> *mut crate::jit::JitStructSite {
+        let site = Box::new(crate::jit::JitStructSite {
+            layout: None,
+            name: name.to_string(),
+            field_names: field_names.to_vec(),
+        });
+        let ptr = site.as_ref() as *const crate::jit::JitStructSite as *mut crate::jit::JitStructSite;
+        self.data.push(JitData::StructSite(site));
         ptr
     }
 
@@ -255,6 +279,7 @@ impl JitCompiler {
         register_count: u8,
         entry_table: usize,
         result_type: Option<ValueType>,
+        hoisted_constants: Vec<(u8, Value)>,
     ) -> Result<CompiledTrace> {
         self.function_mode = true;
         self.function_frame = (register_count, trace.frame_may_own);
@@ -273,7 +298,7 @@ impl JitCompiler {
         self.scalar_regfile = false;
         self.spill_off.clear();
         self.scalar_saved.clear();
-        let result = self.compile_trace(trace, trace_id, Vec::new());
+        let result = self.compile_trace(trace, trace_id, hoisted_constants);
         self.function_mode = false;
         self.scalar_fast = false;
         self.payload_slots = false;
@@ -387,6 +412,8 @@ impl JitCompiler {
     ) -> Result<CompiledTrace> {
         self.const_registers = hoisted_constants.iter().cloned().collect();
         self.scalar_registers = trace.entry_scalars.iter().copied().collect();
+        self.guarded_structs.clear();
+        self.array_registers.clear();
         self.trace_start_ip = trace.start_ip;
         self.last_fail_island = self.ops.offset().0;
         self.pins = if self.function_mode {
@@ -400,8 +427,6 @@ impl JitCompiler {
                 self.scalar_saved = plan.saved;
                 self.pins = plan.pins;
                 self.scalar_regfile = true;
-            } else {
-                self.pins.clear();
             }
         }
         crate::jit::log(|| {
@@ -422,6 +447,11 @@ impl JitCompiler {
         self.current_fail_ip = None;
         self.fail_sites.clear();
         self.cached_select_imms = None;
+        self.cached_specialized_vec = None;
+        self.cached_bool_const = None;
+        self.specialized_bounded_indices.clear();
+        self.specialized_stride_loops.clear();
+        self.in_stride_batch_fallback = false;
         let stack_size = self.compute_stack_size(trace);
         let mut guards = Vec::new();
         let mut guard_index = 0i32;
@@ -518,22 +548,52 @@ impl JitCompiler {
                 ; stp x21, x22, [sp, -16]!
             );
         }
-        // Function code without pins leaves x23..x28 and d8..d15 untouched
+        // Function code without pins or hoisted arrays leaves x23..x28 and d8..d15 untouched
         // and need not save them. The scalar-fast prologue already saved
         // only x19/x20.
-        if self.scalar_fast || (self.function_mode && self.pins.is_empty()) {
-        } else {
-            dynasm!(self.ops
-                ; .arch aarch64
-                ; stp x23, x24, [sp, -16]!
-                ; stp x25, x26, [sp, -16]!
-                ; stp x27, x28, [sp, -16]!
-                ; stp d8, d9, [sp, -16]!
-                ; stp d10, d11, [sp, -16]!
-                ; stp d12, d13, [sp, -16]!
-                ; stp d14, d15, [sp, -16]!
-            );
-        }
+        let hoist_candidate = Self::find_hoistable_array(trace, &self.pins);
+        let has_array_indexing = trace.ops.iter().any(|op| {
+            matches!(
+                op,
+                TraceOp::SetIndex { .. }
+                    | TraceOp::ArrayIndexOk { .. }
+                    | TraceOp::GetIndex { .. }
+                    | TraceOp::ArrayLen { .. }
+                    | TraceOp::ArrayPush { .. }
+            )
+        });
+        let (save_x23_24, save_x25_26, save_x27_28, save_d8_9, save_d10_11, save_d12_13, save_d14_15) =
+            if self.scalar_fast {
+                (false, false, false, false, false, false, false)
+            } else if self.function_mode {
+                let uses_int = |r: u8| -> bool {
+                    self.pins.values().any(|p| p.ty != ValueType::Float && p.reg == r)
+                        || hoist_candidate.as_ref().is_some_and(|h| h.1 == r || h.2 == r || h.3 == Some(r))
+                };
+                let uses_float = |r: u8| -> bool {
+                    self.pins.values().any(|p| p.ty == ValueType::Float && p.reg == r)
+                };
+                (
+                    uses_int(23) || uses_int(24),
+                    uses_int(25) || uses_int(26),
+                    uses_int(27) || uses_int(28) || has_array_indexing,
+                    uses_float(8) || uses_float(9),
+                    uses_float(10) || uses_float(11),
+                    uses_float(12) || uses_float(13),
+                    uses_float(14) || uses_float(15),
+                )
+            } else {
+                let any_saved = !self.pins.is_empty() || hoist_candidate.is_some() || has_array_indexing;
+                (any_saved, any_saved, any_saved, any_saved, any_saved, any_saved, any_saved)
+            };
+        let mut fn_saved_pairs: u32 = 0;
+        if save_x23_24 { dynasm!(self.ops ; .arch aarch64 ; stp x23, x24, [sp, -16]!); fn_saved_pairs += 1; }
+        if save_x25_26 { dynasm!(self.ops ; .arch aarch64 ; stp x25, x26, [sp, -16]!); fn_saved_pairs += 1; }
+        if save_x27_28 { dynasm!(self.ops ; .arch aarch64 ; stp x27, x28, [sp, -16]!); fn_saved_pairs += 1; }
+        if save_d8_9 { dynasm!(self.ops ; .arch aarch64 ; stp d8, d9, [sp, -16]!); fn_saved_pairs += 1; }
+        if save_d10_11 { dynasm!(self.ops ; .arch aarch64 ; stp d10, d11, [sp, -16]!); fn_saved_pairs += 1; }
+        if save_d12_13 { dynasm!(self.ops ; .arch aarch64 ; stp d12, d13, [sp, -16]!); fn_saved_pairs += 1; }
+        if save_d14_15 { dynasm!(self.ops ; .arch aarch64 ; stp d14, d15, [sp, -16]!); fn_saved_pairs += 1; }
         if !self.scalar_fast {
             self.emit_sub_sp(stack_size);
             // Entry: x0 = registers, x1 = VM, x2 = the inline record a native
@@ -572,6 +632,60 @@ impl JitCompiler {
         jit::log(|| format!("🔧 JIT: Compiling preamble ({} ops)", trace.preamble.len()));
         self.compile_ops(&trace.preamble, &mut guard_index, &mut guards)?;
 
+        // Proven bounded indexing on specialized vecs: verify in preamble, omit in loop
+        for (&vec_id, specialized) in &self.specialized_values.clone() {
+            if let Some((idx_reg, bound_reg, is_le, maybe_step_reg)) =
+                Self::find_bounded_index_for_specialized_vec(trace, vec_id, &self.const_registers)
+            {
+                let stack_offset = specialized.stack_offset;
+                self.emit_slot_addr(0, stack_offset);
+                dynasm!(self.ops
+                    ; .arch aarch64
+                    ; ldr x15, [x0, 8]
+                );
+
+                let bound_op = self.operand_x(bound_reg, 12);
+                if is_le {
+                    dynasm!(self.ops
+                        ; .arch aarch64
+                        ; cmp X(bound_op), x15
+                        ; b.hs >fail
+                    );
+                } else {
+                    dynasm!(self.ops
+                        ; .arch aarch64
+                        ; cmp X(bound_op), x15
+                        ; b.hi >fail
+                    );
+                }
+
+                let idx_op = self.operand_x(idx_reg, 13);
+                dynasm!(self.ops
+                    ; .arch aarch64
+                    ; cmp X(idx_op), xzr
+                    ; b.lt >fail
+                );
+
+                if let Some(step_reg) = maybe_step_reg {
+                    let step_op = self.operand_x(step_reg, 10);
+                    dynasm!(self.ops
+                        ; .arch aarch64
+                        ; cmp X(step_op), xzr
+                        ; b.lt >fail
+                    );
+                    self.specialized_stride_loops.insert((vec_id, idx_reg), (bound_reg, is_le, step_reg));
+                }
+
+                self.specialized_bounded_indices.insert((vec_id, idx_reg));
+                crate::jit::log(|| {
+                    format!(
+                        "⚡ JIT: Specialized vec #{} has proven bounded index reg {} (bound reg {}, is_le {})",
+                        vec_id, idx_reg, bound_reg, is_le
+                    )
+                });
+            }
+        }
+
         // `>fail` references so far (preamble) bind here: nothing to write back.
         dynasm!(self.ops
             ; .arch aarch64
@@ -593,12 +707,13 @@ impl JitCompiler {
                 // pins are written before they are read.
                 continue;
             }
-            if pin.class == pins::PinClass::Carried || self.function_mode {
+            if pin.class == pins::PinClass::Carried && (!self.function_mode || pin.proven_at_entry) {
                 self.emit_pin_load(*vm_reg, *pin);
             }
         }
         let has_pins = !self.pins.is_empty();
-        if has_pins {
+        let has_pinned_or_hoisted = has_pins || hoist_candidate.as_ref().and_then(|c| c.3).is_some();
+        if has_pinned_or_hoisted {
             self.pin_active = true;
             // Iteration two onwards arrives with every carried pin possibly
             // newer than memory. The scalar regfile has no memory image.
@@ -612,44 +727,14 @@ impl JitCompiler {
             self.exit_stack.push(exit_pinned_label);
         }
 
-        if let Some((arr, ptr_reg, len_reg)) = Self::find_hoistable_array(trace, &self.pins) {
-            if let Some(layout) = jit::layout::rc_vec_layout() {
-                let array_tag = ValueTag::Array.as_u8() as u32;
-                let rc_offset = layout.array_rc_offset as u32;
-                let borrow_offset = layout.borrow_offset as u32;
-                let ptr_offset = layout.ptr_offset as u32;
-                let len_offset = layout.len_offset as u32;
-
-                self.load_tag(0, arr);
-                dynasm!(self.ops
-                    ; .arch aarch64
-                    ; cmp w0, #array_tag
-                    ; b.ne >fail
-                );
-                self.emit_reg_addr(11, arr);
-                dynasm!(self.ops
-                    ; .arch aarch64
-                    ; ldr x9, [x11, #rc_offset]
-                    ; ldr x10, [x9, #borrow_offset]
-                    ; cbnz x10, >fail
-                    ; ldr X(ptr_reg), [x9, #ptr_offset]
-                );
-                if let Some(len_r) = len_reg {
-                    dynasm!(self.ops
-                        ; .arch aarch64
-                        ; ldr X(len_r), [x9, #len_offset]
-                    );
-                }
-                self.hoisted_array = Some(HoistedArray {
-                    array_reg: arr,
-                    ptr_reg,
-                    len_reg,
-                });
-            }
+        if let Some((arr, rc_reg, ptr_reg, len_reg)) = hoist_candidate {
+            self.emit_hoist_array(arr, rc_reg, ptr_reg, len_reg, None);
         }
 
         // Create a loop_start label AFTER preamble, BEFORE loop body
         self.current_fail_ip = None;
+        self.cached_specialized_vec = None;
+        self.cached_bool_const = None;
         let loop_start_label = self.ops.new_dynamic_label();
         dynasm!(self.ops
             ; .arch aarch64
@@ -687,7 +772,7 @@ impl JitCompiler {
                 ; b => loop_start_label
             );
         }
-        if has_pins {
+        if has_pinned_or_hoisted {
             self.exit_stack.pop();
         }
         self.pin_active = false;
@@ -710,6 +795,8 @@ impl JitCompiler {
         );
         self.emit_unwind_inline_frames();
         self.emit_writeback_carried_pins();
+        self.emit_writeback_hoisted_array();
+        self.emit_writeback_specialized_vec();
         dynasm!(self.ops
             ; .arch aarch64
             ; b => after_unwind_label
@@ -746,10 +833,12 @@ impl JitCompiler {
             (self.scalar_saved.len() as u32) * 16
         } else if self.scalar_fast {
             16u32
-        } else if self.function_mode && self.pins.is_empty() {
-            32u32
-        } else {
+        } else if self.function_mode {
+            32u32 + fn_saved_pairs * 16
+        } else if save_x23_24 {
             SAVED_BELOW_FP as u32
+        } else {
+            32u32
         };
         dynasm!(self.ops
             ; .arch aarch64
@@ -757,19 +846,13 @@ impl JitCompiler {
             ; => epilogue_label
             ; sub sp, x29, #saved_below_fp
         );
-        if self.scalar_fast || (self.function_mode && self.pins.is_empty()) {
-        } else {
-            dynasm!(self.ops
-                ; .arch aarch64
-                ; ldp d14, d15, [sp], 16
-                ; ldp d12, d13, [sp], 16
-                ; ldp d10, d11, [sp], 16
-                ; ldp d8, d9, [sp], 16
-                ; ldp x27, x28, [sp], 16
-                ; ldp x25, x26, [sp], 16
-                ; ldp x23, x24, [sp], 16
-            );
-        }
+        if save_d14_15 { dynasm!(self.ops ; .arch aarch64 ; ldp d14, d15, [sp], 16); }
+        if save_d12_13 { dynasm!(self.ops ; .arch aarch64 ; ldp d12, d13, [sp], 16); }
+        if save_d10_11 { dynasm!(self.ops ; .arch aarch64 ; ldp d10, d11, [sp], 16); }
+        if save_d8_9 { dynasm!(self.ops ; .arch aarch64 ; ldp d8, d9, [sp], 16); }
+        if save_x27_28 { dynasm!(self.ops ; .arch aarch64 ; ldp x27, x28, [sp], 16); }
+        if save_x25_26 { dynasm!(self.ops ; .arch aarch64 ; ldp x25, x26, [sp], 16); }
+        if save_x23_24 { dynasm!(self.ops ; .arch aarch64 ; ldp x23, x24, [sp], 16); }
         if self.scalar_regfile {
             for (lo, hi) in self.scalar_saved.iter().rev().copied() {
                 dynasm!(self.ops ; .arch aarch64 ; ldp X(lo), X(hi), [sp], 16);
@@ -831,6 +914,20 @@ impl JitCompiler {
                 } else {
                     crate::jit::log(|| format!("📝 JIT: Dumped trace bytes to {:?}", path));
                 }
+                let mut txt_path = PathBuf::from("target");
+                txt_path.push(format!(
+                    "jit_trace_{}_{}.txt",
+                    trace_id.0, trace.function_idx
+                ));
+                let mut text = format!(
+                    "Trace {:?}, func: {}, is_fn: {}, pins: {:?}\n",
+                    trace_id, trace.function_idx, trace.is_function, self.pins
+                );
+                for op in &trace.ops {
+                    use std::fmt::Write;
+                    let _ = writeln!(text, "  {op:?}");
+                }
+                let _ = fs::write(&txt_path, text);
             }
         }
         let data = mem::take(&mut self.data);
@@ -854,7 +951,7 @@ impl JitCompiler {
     /// between (before the jump, whether or not a conditional one is
     /// taken).
 
-    fn emit_back_edge_gas_check(&mut self, label: usize) {
+    pub(super) fn emit_back_edge_gas_check(&mut self, label: usize) {
         if let Some(position) = self.label_positions.get(&label).copied() {
             self.emit_gas_check(self.op_counter.saturating_sub(position));
         }
@@ -957,6 +1054,7 @@ impl JitCompiler {
                 | TraceOp::GetEnumValue { .. }
                 | TraceOp::BorrowField { .. }
                 | TraceOp::BorrowEnumValue { .. }
+                | TraceOp::BorrowFieldSome { .. }
                 | TraceOp::Unbox { .. }
                 | TraceOp::Rebox { .. }
                 | TraceOp::DropSpecialized { .. }
@@ -1079,6 +1177,16 @@ impl JitCompiler {
                 self.update_scalar_registers(op);
                 continue;
             }
+            if !self.in_stride_batch_fallback {
+                if let Some(last_index) = self.try_batch_push_stores(ops, op_index, guard_index, guards)? {
+                    skip_through = Some(last_index);
+                    continue;
+                }
+                if let Some(last_index) = self.try_batch_stride_stores(ops, op_index, guard_index, guards)? {
+                    skip_through = Some(last_index);
+                    continue;
+                }
+            }
             // Fusion looks at the next real op; `At` markers are transparent.
             let next_index =
                 (op_index + 1..ops.len()).find(|&j| !matches!(ops[j], TraceOp::At { .. }));
@@ -1087,7 +1195,6 @@ impl JitCompiler {
                 if let TraceOp::GuardLoopContinue {
                     condition_register, ..
                 } = next
-                    && self.scalar_registers.contains_key(condition_register)
                     && Self::register_overwritten_before_read(
                         &ops[next_index + 1..],
                         *condition_register,
@@ -1139,6 +1246,127 @@ impl JitCompiler {
                     }
                     continue;
                 }
+                if let TraceOp::IsEnumVariant {
+                    dest,
+                    value,
+                    enum_name,
+                    variant_name,
+                } = op
+                    && let TraceOp::BranchIf {
+                        condition_register,
+                        expect_truthy: false,
+                        label,
+                    } = next
+                    && condition_register == dest
+                {
+                    let dead_dest = Self::register_overwritten_before_read(
+                        &ops[next_index + 1..],
+                        *dest,
+                    );
+                    if self.compile_is_enum_variant_branch(*dest, *value, enum_name, variant_name, *label, dead_dest)? {
+                        self.verified_enum = Some(*value);
+                        skip_through = Some(next_index);
+                        continue;
+                    }
+                }
+                let cmp_match = match op {
+                    TraceOp::Lt { dest, lhs, rhs, lhs_type, rhs_type } => Some((*dest, *lhs, *rhs, *lhs_type, *rhs_type, CmpOp::Lt)),
+                    TraceOp::Le { dest, lhs, rhs, lhs_type, rhs_type } => Some((*dest, *lhs, *rhs, *lhs_type, *rhs_type, CmpOp::Le)),
+                    TraceOp::Gt { dest, lhs, rhs, lhs_type, rhs_type } => Some((*dest, *lhs, *rhs, *lhs_type, *rhs_type, CmpOp::Gt)),
+                    TraceOp::Ge { dest, lhs, rhs, lhs_type, rhs_type } => Some((*dest, *lhs, *rhs, *lhs_type, *rhs_type, CmpOp::Ge)),
+                    TraceOp::Eq { dest, lhs, rhs, lhs_type, rhs_type } => Some((*dest, *lhs, *rhs, *lhs_type, *rhs_type, CmpOp::Eq)),
+                    TraceOp::Ne { dest, lhs, rhs, lhs_type, rhs_type } => Some((*dest, *lhs, *rhs, *lhs_type, *rhs_type, CmpOp::Ne)),
+                    _ => None,
+                };
+                if let Some((dest, lhs, rhs, lhs_type, rhs_type, cmp_op)) = cmp_match
+                    && let TraceOp::BranchIf { condition_register, expect_truthy, label } = next
+                    && *condition_register == dest
+                {
+                    let dead_dest = Self::register_overwritten_before_read(
+                        &ops[next_index + 1..],
+                        dest,
+                    );
+                    if self.compile_comparison_branch(
+                        dest,
+                        lhs,
+                        rhs,
+                        lhs_type,
+                        rhs_type,
+                        cmp_op,
+                        *expect_truthy,
+                        *label,
+                        dead_dest,
+                    )? {
+                        self.update_scalar_registers(op);
+                        skip_through = Some(next_index);
+                        continue;
+                    }
+                }
+                if let TraceOp::ArrayIndexOk {
+                    value_dest,
+                    condition_dest,
+                    array,
+                    index,
+                    value_type,
+                } = op
+                    && let TraceOp::BranchIf {
+                        condition_register,
+                        expect_truthy,
+                        label,
+                    } = next
+                    && *condition_register == *condition_dest
+                {
+                    let dead_condition = Self::register_overwritten_before_read(
+                        &ops[next_index + 1..],
+                        *condition_dest,
+                    );
+                    if self.compile_array_index_ok_branch(
+                        *value_dest,
+                        *condition_dest,
+                        *array,
+                        *index,
+                        *value_type,
+                        *expect_truthy,
+                        *label,
+                        dead_condition,
+                    )? {
+                        self.update_scalar_registers(op);
+                        skip_through = Some(next_index);
+                        continue;
+                    }
+                }
+                if let TraceOp::Mod {
+                    dest: mod_dest,
+                    lhs,
+                    rhs,
+                    lhs_type: ValueType::Int,
+                    rhs_type: ValueType::Int,
+                } = op
+                    && self.const_registers.get(rhs) == Some(&Value::Int(2))
+                {
+                    if let Some((branch_index, label, expect_truthy)) =
+                        Self::find_mod2_branch(ops, op_index, *mod_dest, &self.const_registers)
+                    {
+                        let src_reg = self.operand_x(*lhs, 10);
+                        let target = self.function_label(label);
+                        self.emit_back_edge_gas_check(label);
+                        if !expect_truthy {
+                            dynasm!(self.ops
+                                ; .arch aarch64
+                                ; tst X(src_reg), #1
+                                ; b.ne => target
+                            );
+                        } else {
+                            dynasm!(self.ops
+                                ; .arch aarch64
+                                ; tst X(src_reg), #1
+                                ; b.eq => target
+                            );
+                        }
+                        skip_through = Some(branch_index);
+                        continue;
+                    }
+                }
             }
             match op {
                 TraceOp::At { .. } => unreachable!("markers are consumed above"),
@@ -1170,7 +1398,9 @@ impl JitCompiler {
                 }
 
                 TraceOp::Move { dest, src } => {
-                    self.compile_move(*dest, *src)?;
+                    if !Self::register_overwritten_before_read(&ops[op_index + 1..], *dest) {
+                        self.compile_move(*dest, *src)?;
+                    }
                 }
 
                 TraceOp::Add {
@@ -1322,8 +1552,11 @@ impl JitCompiler {
 
                 TraceOp::ArrayPush { dest, array, value } => {
                     self.compile_array_push(*array, *value)?;
-                    // `array.push` returns Nil.
-                    self.compile_load_const(*dest, &Value::Nil)?;
+                    let dead_dest = !ops.iter().any(|other| Self::op_reads_register(other, *dest))
+                        || Self::register_overwritten_before_read(&ops[op_index + 1..], *dest);
+                    if !dead_dest {
+                        self.compile_load_const(*dest, &Value::Nil)?;
+                    }
                 }
 
                 TraceOp::ArrayIndexOk {
@@ -1352,6 +1585,7 @@ impl JitCompiler {
                         *layout,
                         *guard_index as usize,
                     )?;
+                    self.guarded_structs.insert(*register);
                     guards.push(guard);
                     *guard_index += 1;
                 }
@@ -1575,6 +1809,10 @@ impl JitCompiler {
                     self.compile_new_array(*dest, *first_element, *count)?;
                 }
 
+                TraceOp::StoreGlobal { name, src } => {
+                    self.compile_store_global(name, *src)?;
+                }
+
                 TraceOp::NewStruct {
                     dest,
                     struct_name,
@@ -1664,6 +1902,15 @@ impl JitCompiler {
                     self.compile_borrow_enum_value(*dest, *enum_reg, *index)?;
                 }
 
+                TraceOp::BorrowFieldSome {
+                    dest,
+                    object,
+                    field_index,
+                    label,
+                } => {
+                    self.compile_borrow_field_some(*dest, *object, *field_index, *label)?;
+                }
+
                 TraceOp::Guard {
                     register,
                     expected_type,
@@ -1683,6 +1930,29 @@ impl JitCompiler {
                         *condition_register,
                         *expect_truthy,
                         *bailout_ip,
+                        *guard_index as usize,
+                    )?;
+                    guards.push(guard);
+                    *guard_index += 1;
+                }
+
+                TraceOp::ConditionalHammock {
+                    condition_register,
+                    expect_truthy,
+                    bailout_ip,
+                    acc_dest,
+                    acc_src,
+                    acc_imm,
+                    inner_loop_bypass,
+                } => {
+                    let guard = self.compile_conditional_hammock(
+                        *condition_register,
+                        *expect_truthy,
+                        *bailout_ip,
+                        *acc_dest,
+                        *acc_src,
+                        *acc_imm,
+                        inner_loop_bypass,
                         *guard_index as usize,
                     )?;
                     guards.push(guard);
@@ -1711,7 +1981,13 @@ impl JitCompiler {
                     source_reg,
                     layout,
                 } => {
-                    self.compile_unbox(*specialized_id, *source_reg, layout)?;
+                    self.compile_unbox(
+                        *specialized_id,
+                        *source_reg,
+                        layout,
+                        guard_index,
+                        guards,
+                    )?;
                 }
 
                 TraceOp::Rebox {
@@ -1730,7 +2006,8 @@ impl JitCompiler {
                 }
 
                 TraceOp::SpecializedOp { op, operands } => {
-                    self.compile_specialized_op(op, operands)?;
+                    let is_last_push = true;
+                    self.compile_specialized_op(op, operands, is_last_push)?;
                 }
 
                 TraceOp::Return { value } => {
@@ -1740,6 +2017,13 @@ impl JitCompiler {
                 }
 
                 TraceOp::Label { id, scalars } => {
+                    if let Some((arr, rc_r, ptr_r, len_r, bounded_info)) =
+                        Self::find_hoistable_array_for_loop(ops, *id, op_index, &self.pins)
+                    {
+                        if self.hoisted_array.as_ref().map(|h| h.array_reg) != Some(arr) {
+                            self.emit_hoist_array(arr, rc_r, ptr_r, len_r, bounded_info);
+                        }
+                    }
                     let label = self.function_label(*id);
                     dynasm!(self.ops ; .arch aarch64 ; => label);
                     self.label_positions.insert(*id, self.op_counter);
@@ -1771,9 +2055,11 @@ impl JitCompiler {
                     self.hot_x0_in = None;
                     self.hot_d0_in = None;
                     self.verified_enum_in = None;
+                    self.cached_specialized_vec = None;
                 }
 
                 TraceOp::Jump { label } => {
+                    self.cached_specialized_vec = None;
                     self.emit_back_edge_gas_check(*label);
                     let label = self.function_label(*label);
                     dynasm!(self.ops ; .arch aarch64 ; b => label);
@@ -1784,6 +2070,7 @@ impl JitCompiler {
                     expect_truthy,
                     label,
                 } => {
+                    self.cached_specialized_vec = None;
                     let verified = self.verified_enum_in.take();
                     self.emit_back_edge_gas_check(*label);
                     self.compile_branch_if(*condition_register, *expect_truthy, *label);
@@ -1804,6 +2091,19 @@ impl JitCompiler {
                     alias_mask,
                     result_type,
                 } => {
+                    let next_real_idx = (op_index + 1..ops.len())
+                        .find(|&j| !matches!(ops[j], TraceOp::At { .. }));
+                    let dead_dest = if let Some(n_idx) = next_real_idx {
+                        let next_op = &ops[n_idx];
+                        let consumed_by_next = Self::op_reads_register(next_op, *dest)
+                            && !Self::op_may_exit(next_op);
+                        let unused_at_all = !ops[op_index + 1..].iter().any(|op| Self::op_reads_register(op, *dest));
+                        let unread_after_next = consumed_by_next && !ops[n_idx + 1..].iter().any(|op| Self::op_reads_register(op, *dest));
+                        let overwritten_after = consumed_by_next && Self::register_overwritten_before_read(&ops[n_idx + 1..], *dest);
+                        unused_at_all || unread_after_next || overwritten_after
+                    } else {
+                        true
+                    };
                     self.compile_call_direct(
                         *dest,
                         *callee,
@@ -1816,6 +2116,7 @@ impl JitCompiler {
                         *resume_ip,
                         *alias_mask,
                         *result_type,
+                        dead_dest,
                         guard_index,
                         guards,
                     )?;
@@ -2115,6 +2416,56 @@ impl JitCompiler {
         }))
     }
 
+    fn find_mod2_branch(
+        ops: &[TraceOp],
+        op_index: usize,
+        mod_dest: u8,
+        const_registers: &hashbrown::HashMap<u8, Value>,
+    ) -> Option<(usize, usize, bool)> {
+        let mut eq_info = None;
+        let mut local_consts = const_registers.clone();
+        let end_search = (op_index + 6).min(ops.len());
+        for j in op_index + 1..end_search {
+            match &ops[j] {
+                TraceOp::At { .. } => continue,
+                TraceOp::LoadConst { dest, value } => {
+                    local_consts.insert(*dest, value.clone());
+                    continue;
+                }
+                TraceOp::Eq { dest, lhs, rhs, lhs_type, rhs_type }
+                    if *lhs_type == ValueType::Int && *rhs_type == ValueType::Int =>
+                {
+                    let is_zero = |r: u8| local_consts.get(&r) == Some(&Value::Int(0));
+                    if (*lhs == mod_dest && is_zero(*rhs)) || (*rhs == mod_dest && is_zero(*lhs)) {
+                        eq_info = Some((*dest, j));
+                        break;
+                    } else {
+                        return None;
+                    }
+                }
+                _ => return None,
+            }
+        }
+        let (eq_dest, eq_idx) = eq_info?;
+        for k in eq_idx + 1..ops.len().min(eq_idx + 4) {
+            match &ops[k] {
+                TraceOp::At { .. } => continue,
+                TraceOp::BranchIf { condition_register, expect_truthy, label } if *condition_register == eq_dest => {
+                    let is_dead = |reg: u8| {
+                        !ops[k + 1..].iter().any(|op| Self::op_reads_register(op, reg))
+                            || Self::register_overwritten_before_read(&ops[k + 1..], reg)
+                    };
+                    if is_dead(mod_dest) && is_dead(eq_dest) {
+                        return Some((k, *label, *expect_truthy));
+                    }
+                    return None;
+                }
+                _ => return None,
+            }
+        }
+        None
+    }
+
     fn register_overwritten_before_read(ops: &[TraceOp], register: u8) -> bool {
         for op in ops {
             if Self::op_reads_register(op, register) {
@@ -2259,7 +2610,8 @@ impl JitCompiler {
             | TraceOp::TypeIs { value, .. }
             | TraceOp::TryCast { value, .. } => *value == register,
             TraceOp::GetEnumValue { enum_reg, .. } => *enum_reg == register,
-            TraceOp::BorrowField { object, .. } => *object == register,
+            TraceOp::BorrowField { object, .. }
+            | TraceOp::BorrowFieldSome { object, .. } => *object == register,
             TraceOp::BorrowEnumValue { enum_reg, .. } => *enum_reg == register,
             TraceOp::Select { cond, .. } => *cond == register,
             TraceOp::SelectBitZero { src, .. } => *src == register,
@@ -2267,6 +2619,18 @@ impl JitCompiler {
             TraceOp::GuardLoopContinue {
                 condition_register, ..
             } => *condition_register == register,
+            TraceOp::ConditionalHammock {
+                condition_register,
+                acc_src,
+                inner_loop_bypass,
+                ..
+            } => {
+                *condition_register == register
+                    || *acc_src == register
+                    || inner_loop_bypass.as_ref().is_some_and(|b| {
+                        b.mul_lhs == register || b.mul_rhs == register || b.bound_reg == register
+                    })
+            }
             TraceOp::Return { value } => *value == Some(register),
             TraceOp::Unbox { source_reg, .. } => *source_reg == register,
             TraceOp::SpecializedOp { operands, .. } => operands.iter().any(|operand| {
@@ -2291,6 +2655,7 @@ impl JitCompiler {
                     || *receiver == Some(register)
                     || in_args(*first_arg, *arg_count)
             }
+            TraceOp::StoreGlobal { src, .. } => *src == register,
         }
     }
 
@@ -2323,6 +2688,7 @@ impl JitCompiler {
             | TraceOp::Select { dest, .. }
             | TraceOp::SelectBitZero { dest, .. }
             | TraceOp::ModImm { dest, .. }
+            | TraceOp::ConditionalHammock { acc_dest: dest, .. }
             | TraceOp::GetIndex { dest, .. }
             | TraceOp::TryGetIndex { dest, .. }
             | TraceOp::ArrayPush { dest, .. }
@@ -2342,7 +2708,8 @@ impl JitCompiler {
             | TraceOp::TryCast { dest, .. }
             | TraceOp::GetEnumValue { dest, .. }
             | TraceOp::BorrowField { dest, .. }
-            | TraceOp::BorrowEnumValue { dest, .. } => *dest == register,
+            | TraceOp::BorrowEnumValue { dest, .. }
+            | TraceOp::BorrowFieldSome { dest, .. } => *dest == register,
             _ => false,
         }
     }
@@ -2350,6 +2717,21 @@ impl JitCompiler {
     fn update_scalar_registers(&mut self, op: &TraceOp) {
         if matches!(op, TraceOp::At { .. }) {
             return;
+        }
+        if let Some(hoisted) = self.hoisted_array {
+            let invalidate = match op {
+                TraceOp::CallDirect { .. }
+                | TraceOp::CallFunction { .. }
+                | TraceOp::CallNative { .. }
+                | TraceOp::CallMethod { .. }
+                | TraceOp::InlineCall { .. }
+                | TraceOp::NestedLoopCall { .. }
+                | TraceOp::NewArray { .. } => true,
+                _ => Self::op_writes_to_reg(op, hoisted.array_reg),
+            };
+            if invalidate {
+                self.hoisted_array = None;
+            }
         }
         let scalar_type = |ty: ValueType| {
             matches!(
@@ -2366,6 +2748,82 @@ impl JitCompiler {
             }
         };
 
+        if let TraceOp::GuardStructLayout { register, .. } = op {
+            self.guarded_structs.insert(*register);
+        } else if let TraceOp::Move { dest, src } = op {
+            if self.guarded_structs.contains(src) {
+                self.guarded_structs.insert(*dest);
+            } else {
+                self.guarded_structs.remove(dest);
+            }
+        } else {
+            match op {
+                TraceOp::LoadConst { dest, .. }
+                | TraceOp::Neg { dest, .. }
+                | TraceOp::Add { dest, .. }
+                | TraceOp::Sub { dest, .. }
+                | TraceOp::Mul { dest, .. }
+                | TraceOp::Div { dest, .. }
+                | TraceOp::Mod { dest, .. }
+                | TraceOp::ModImm { dest, .. }
+                | TraceOp::Lt { dest, .. }
+                | TraceOp::Le { dest, .. }
+                | TraceOp::Gt { dest, .. }
+                | TraceOp::Ge { dest, .. }
+                | TraceOp::Eq { dest, .. }
+                | TraceOp::Ne { dest, .. }
+                | TraceOp::And { dest, .. }
+                | TraceOp::Or { dest, .. }
+                | TraceOp::Not { dest, .. }
+                | TraceOp::Concat { dest, .. }
+                | TraceOp::GetIndex { dest, .. }
+                | TraceOp::TryGetIndex { dest, .. }
+                | TraceOp::ArrayPush { dest, .. }
+                | TraceOp::ArrayLen { dest, .. }
+                | TraceOp::GetField { dest, .. }
+                | TraceOp::NewArray { dest, .. }
+                | TraceOp::NewStruct { dest, .. }
+                | TraceOp::NewEnumUnit { dest, .. }
+                | TraceOp::NewEnumVariant { dest, .. }
+                | TraceOp::IsEnumVariant { dest, .. }
+                | TraceOp::TypeIs { dest, .. }
+                | TraceOp::TryCast { dest, .. }
+                | TraceOp::GetEnumValue { dest, .. }
+                | TraceOp::CallNative { dest, .. }
+                | TraceOp::CallFunction { dest, .. }
+                | TraceOp::CallMethod { dest, .. }
+                | TraceOp::CallDirect { dest, .. }
+                | TraceOp::InlineCall { dest, .. }
+                | TraceOp::BorrowField { dest, .. }
+                | TraceOp::BorrowEnumValue { dest, .. }
+                | TraceOp::BorrowFieldSome { dest, .. }
+                | TraceOp::Select { dest, .. }
+                | TraceOp::SelectBitZero { dest, .. } => {
+                    self.guarded_structs.remove(dest);
+                    self.const_registers.remove(dest);
+                }
+                TraceOp::ArrayIndexOk {
+                    value_dest,
+                    condition_dest,
+                    ..
+                } => {
+                    self.guarded_structs.remove(value_dest);
+                    self.guarded_structs.remove(condition_dest);
+                    self.const_registers.remove(value_dest);
+                    self.const_registers.remove(condition_dest);
+                }
+                TraceOp::Rebox { dest_reg, .. } => {
+                    self.guarded_structs.remove(dest_reg);
+                    self.const_registers.remove(dest_reg);
+                }
+                TraceOp::NestedLoopCall { .. } => {
+                    self.guarded_structs.clear();
+                    self.const_registers.clear();
+                }
+                _ => {}
+            }
+        }
+
         match op {
             TraceOp::At { .. } => {}
             TraceOp::LoadConst { dest, value } => {
@@ -2379,6 +2837,11 @@ impl JitCompiler {
                     _ => None,
                 };
                 set(&mut self.scalar_registers, *dest, ty);
+                if !self.pins.contains_key(dest) {
+                    self.const_registers.insert(*dest, value.clone());
+                } else {
+                    self.const_registers.remove(dest);
+                }
             }
             TraceOp::Move { dest, src } => {
                 // A copy of a borrow is a clone the destination owns; a
@@ -2389,6 +2852,15 @@ impl JitCompiler {
                     self.scalar_registers.get(src).copied()
                 };
                 set(&mut self.scalar_registers, *dest, ty);
+                if !self.pins.contains_key(src) && !self.pins.contains_key(dest) {
+                    if let Some(val) = self.const_registers.get(src).cloned() {
+                        self.const_registers.insert(*dest, val);
+                    } else {
+                        self.const_registers.remove(dest);
+                    }
+                } else {
+                    self.const_registers.remove(dest);
+                }
                 if self.array_registers.contains(src) {
                     self.array_registers.insert(*dest);
                 } else {
@@ -2427,6 +2899,7 @@ impl JitCompiler {
                     _ => None,
                 };
                 set(&mut self.scalar_registers, *dest, ty);
+                self.const_registers.remove(dest);
             }
             TraceOp::Mod {
                 dest,
@@ -2439,10 +2912,12 @@ impl JitCompiler {
                     _ => None,
                 };
                 set(&mut self.scalar_registers, *dest, ty);
+                self.const_registers.remove(dest);
             }
             TraceOp::Neg { dest, src } => {
                 let ty = self.scalar_registers.get(src).copied();
                 set(&mut self.scalar_registers, *dest, ty);
+                self.const_registers.remove(dest);
             }
             TraceOp::Eq { dest, .. }
             | TraceOp::Ne { dest, .. }
@@ -2456,12 +2931,15 @@ impl JitCompiler {
             | TraceOp::IsEnumVariant { dest, .. }
             | TraceOp::TypeIs { dest, .. } => {
                 self.scalar_registers.insert(*dest, ValueType::Bool);
+                self.const_registers.remove(dest);
             }
             TraceOp::ArrayLen { dest, .. } => {
                 self.scalar_registers.insert(*dest, ValueType::Int);
+                self.const_registers.remove(dest);
             }
             TraceOp::GetField { dest, .. } => {
                 self.scalar_registers.remove(dest);
+                self.const_registers.remove(dest);
             }
             TraceOp::Guard {
                 register,
@@ -2482,12 +2960,15 @@ impl JitCompiler {
                 ..
             } => {
                 self.scalar_registers.remove(value_dest);
+                self.const_registers.remove(value_dest);
                 self.array_registers.remove(value_dest);
                 self.scalar_registers
                     .insert(*condition_dest, ValueType::Bool);
+                self.const_registers.remove(condition_dest);
             }
             TraceOp::NewArray { dest, .. } => {
                 self.scalar_registers.remove(dest);
+                self.const_registers.remove(dest);
                 self.array_registers.insert(*dest);
             }
             TraceOp::Concat { dest, .. }
@@ -2503,25 +2984,65 @@ impl JitCompiler {
             | TraceOp::TryCast { dest, .. }
             | TraceOp::GetEnumValue { dest, .. } => {
                 self.scalar_registers.remove(dest);
+                self.const_registers.remove(dest);
                 self.array_registers.remove(dest);
             }
             // A borrow owns nothing; the value is of no particular type.
-            TraceOp::BorrowField { dest, .. } | TraceOp::BorrowEnumValue { dest, .. } => {
+            TraceOp::BorrowField { dest, .. }
+            | TraceOp::BorrowEnumValue { dest, .. }
+            | TraceOp::BorrowFieldSome { dest, .. } => {
                 self.scalar_registers.insert(*dest, ValueType::Plain);
+                self.const_registers.remove(dest);
             }
             TraceOp::Rebox { dest_reg, .. } => {
                 self.scalar_registers.remove(dest_reg);
+                self.const_registers.remove(dest_reg);
             }
-            TraceOp::SpecializedOp { operands, .. } => {
-                for operand in operands {
-                    if let crate::jit::trace::Operand::Register(register) = operand {
-                        self.scalar_registers.remove(register);
+            TraceOp::SpecializedOp { op, operands } => {
+                match op {
+                    crate::jit::trace::SpecializedOpKind::VecLen => {
+                        if let Some(crate::jit::trace::Operand::Register(dest)) = operands.get(1) {
+                            set(&mut self.scalar_registers, *dest, Some(ValueType::Int));
+                            self.const_registers.remove(dest);
+                        }
                     }
+                    crate::jit::trace::SpecializedOpKind::VecIndexOk => {
+                        if let Some(crate::jit::trace::Operand::Register(cond_dest)) = operands.get(1) {
+                            set(&mut self.scalar_registers, *cond_dest, Some(ValueType::Bool));
+                            self.const_registers.remove(cond_dest);
+                        }
+                        if let (Some(crate::jit::trace::Operand::Register(val_dest)), Some(crate::jit::trace::Operand::Specialized(vec_id))) =
+                            (operands.get(0), operands.get(2))
+                        {
+                            let elem_ty = self.specialized_values.get(vec_id).map(|s| match s.kind {
+                                VecKind::Int => ValueType::Int,
+                                VecKind::Bool => ValueType::Bool,
+                                VecKind::Float => ValueType::Float,
+                            });
+                            set(&mut self.scalar_registers, *val_dest, elem_ty);
+                            self.const_registers.remove(val_dest);
+                        }
+                    }
+                    crate::jit::trace::SpecializedOpKind::VecGet => {
+                        if let (Some(crate::jit::trace::Operand::Register(dest)), Some(crate::jit::trace::Operand::Specialized(vec_id))) =
+                            (operands.get(0), operands.get(1))
+                        {
+                            let elem_ty = self.specialized_values.get(vec_id).map(|s| match s.kind {
+                                VecKind::Int => ValueType::Int,
+                                VecKind::Bool => ValueType::Bool,
+                                VecKind::Float => ValueType::Float,
+                            });
+                            set(&mut self.scalar_registers, *dest, elem_ty);
+                            self.const_registers.remove(dest);
+                        }
+                    }
+                    _ => {}
                 }
             }
             TraceOp::ArrayPush { dest, .. } => {
                 // `array.push` returns Nil.
                 self.scalar_registers.insert(*dest, ValueType::Plain);
+                self.const_registers.remove(dest);
             }
             TraceOp::SetField { .. }
             | TraceOp::RestoreField { .. }
@@ -2536,7 +3057,10 @@ impl JitCompiler {
             | TraceOp::Unbox { .. }
             | TraceOp::DropSpecialized { .. } => {}
             // The inner loop may have written any register.
-            TraceOp::NestedLoopCall { .. } => self.scalar_registers.clear(),
+            TraceOp::NestedLoopCall { .. } => {
+                self.scalar_registers.clear();
+                self.const_registers.clear();
+            }
             // Set by the `Label` arm itself.
             TraceOp::Label { .. } | TraceOp::Jump { .. } | TraceOp::BranchIf { .. } => {}
             TraceOp::Select { dest, on_true, .. } => {
@@ -2547,6 +3071,7 @@ impl JitCompiler {
                     _ => None,
                 };
                 set(&mut self.scalar_registers, *dest, ty);
+                self.const_registers.remove(dest);
             }
             TraceOp::SelectBitZero { dest, on_zero, .. } => {
                 let ty = match on_zero {
@@ -2556,13 +3081,23 @@ impl JitCompiler {
                     _ => None,
                 };
                 set(&mut self.scalar_registers, *dest, ty);
+                self.const_registers.remove(dest);
             }
             TraceOp::ModImm { dest, .. } => {
                 set(&mut self.scalar_registers, *dest, Some(ValueType::Int));
+                self.const_registers.remove(dest);
+            }
+            TraceOp::ConditionalHammock { acc_dest, .. } => {
+                set(&mut self.scalar_registers, *acc_dest, Some(ValueType::Int));
+                self.const_registers.remove(acc_dest);
             }
             TraceOp::CallDirect {
                 dest, result_type, ..
-            } => set(&mut self.scalar_registers, *dest, *result_type),
+            } => {
+                set(&mut self.scalar_registers, *dest, *result_type);
+                self.const_registers.remove(dest);
+            }
+            TraceOp::StoreGlobal { .. } => {}
         }
     }
 
@@ -2957,10 +3492,7 @@ impl JitCompiler {
     fn find_hoistable_array(
         trace: &Trace,
         pins: &HashMap<u8, pins::Pin>,
-    ) -> Option<(u8, u8, Option<u8>)> {
-        if trace.is_function {
-            return None;
-        }
+    ) -> Option<(u8, u8, u8, Option<u8>)> {
         let mut candidate = None;
         for op in &trace.ops {
             match op {
@@ -2968,6 +3500,15 @@ impl JitCompiler {
                 | TraceOp::ArrayIndexOk { array, .. }
                 | TraceOp::GetIndex { array, .. }
                 | TraceOp::ArrayLen { array, .. } => {
+                    if let Some(cand) = candidate {
+                        if cand != *array {
+                            return None;
+                        }
+                    } else {
+                        candidate = Some(*array);
+                    }
+                }
+                TraceOp::ArrayPush { array, .. } => {
                     if let Some(cand) = candidate {
                         if cand != *array {
                             return None;
@@ -2988,8 +3529,7 @@ impl JitCompiler {
                 | TraceOp::CallMethod { .. }
                 | TraceOp::InlineCall { .. }
                 | TraceOp::NestedLoopCall { .. }
-                | TraceOp::NewArray { .. }
-                | TraceOp::ArrayPush { .. } => return None,
+                | TraceOp::NewArray { .. } => return None,
                 _ => {
                     if Self::op_writes_to_reg(op, arr) {
                         return None;
@@ -2997,15 +3537,1064 @@ impl JitCompiler {
                 }
             }
         }
-        let ptr_reg = 22;
         let used_regs: hashbrown::HashSet<u8> = pins.values().map(|p| p.reg).collect();
-        let mut len_reg = None;
-        for r in (23..=28).rev() {
-            if !used_regs.contains(&r) {
-                len_reg = Some(r);
+        let mut available = (23..=28).filter(|r| !used_regs.contains(r));
+        let rc_reg = available.next()?;
+        let ptr_reg = available.next()?;
+        let len_reg = available.next();
+        Some((arr, rc_reg, ptr_reg, len_reg))
+    }
+
+    fn emit_writeback_hoisted_array(&mut self) {
+        if let Some(hoisted) = self.hoisted_array {
+            if let Some(len_r) = hoisted.len_reg {
+                if let Some(layout) = jit::layout::rc_vec_layout() {
+                    let len_offset = layout.len_offset as u32;
+                    dynasm!(self.ops
+                        ; .arch aarch64
+                        ; str X(len_r), [X(hoisted.rc_reg), #len_offset]
+                    );
+                }
+            }
+        }
+    }
+
+    pub(super) fn emit_writeback_specialized_vec(&mut self) {
+        if let Some(vec_id) = self.cached_specialized_vec {
+            if let Ok(stack_offset) = self.slot_offset(vec_id, "vec") {
+                self.emit_slot_addr(10, stack_offset);
+                dynasm!(self.ops
+                    ; .arch aarch64
+                    ; str x15, [x10, 8]
+                );
+            }
+        }
+    }
+
+    fn emit_hoist_array(
+        &mut self,
+        arr: u8,
+        rc_reg: u8,
+        ptr_reg: u8,
+        len_reg: Option<u8>,
+        bounded_info: Option<(u8, u8, bool)>,
+    ) {
+        if let Some(layout) = jit::layout::rc_vec_layout() {
+            let array_tag = ValueTag::Array.as_u8() as u32;
+            let rc_offset = layout.array_rc_offset as u32;
+            let borrow_offset = layout.borrow_offset as u32;
+            let ptr_offset = layout.ptr_offset as u32;
+            let len_offset = layout.len_offset as u32;
+
+            self.load_tag(0, arr);
+            dynasm!(self.ops
+                ; .arch aarch64
+                ; cmp w0, #array_tag
+                ; b.ne >fail
+            );
+            self.emit_reg_addr(11, arr);
+            dynasm!(self.ops
+                ; .arch aarch64
+                ; ldr X(rc_reg), [x11, #rc_offset]
+                ; ldr x10, [X(rc_reg), #borrow_offset]
+                ; cbnz x10, >fail
+                ; ldr X(ptr_reg), [X(rc_reg), #ptr_offset]
+            );
+            let mut bounded_index = None;
+            if let Some(len_r) = len_reg {
+                dynasm!(self.ops
+                    ; .arch aarch64
+                    ; ldr X(len_r), [X(rc_reg), #len_offset]
+                );
+                if let Some((idx_reg, bound_reg, is_le)) = bounded_info {
+                    let bound_op = self.operand_x(bound_reg, 12);
+                    if is_le {
+                        dynasm!(self.ops
+                            ; .arch aarch64
+                            ; cmp X(bound_op), X(len_r)
+                            ; b.hs >fail
+                        );
+                    } else {
+                        dynasm!(self.ops
+                            ; .arch aarch64
+                            ; cmp X(bound_op), X(len_r)
+                            ; b.hi >fail
+                        );
+                    }
+                    bounded_index = Some(idx_reg);
+                }
+            }
+            self.hoisted_array = Some(HoistedArray {
+                array_reg: arr,
+                rc_reg,
+                ptr_reg,
+                len_reg,
+                bounded_index,
+            });
+        }
+    }
+
+    fn find_hoistable_array_for_loop(
+        ops: &[TraceOp],
+        loop_id: usize,
+        label_idx: usize,
+        pins: &HashMap<u8, pins::Pin>,
+    ) -> Option<(u8, u8, u8, Option<u8>, Option<(u8, u8, bool)>)> {
+        let mut end_idx = None;
+        for (i, op) in ops.iter().enumerate().skip(label_idx + 1) {
+            match op {
+                TraceOp::Jump { label } if *label == loop_id => {
+                    end_idx = Some(i);
+                }
+                TraceOp::BranchIf { label, .. } if *label == loop_id => {
+                    end_idx = Some(i);
+                }
+                _ => {}
+            }
+        }
+        let end_idx = end_idx?;
+        let loop_ops = &ops[label_idx + 1..=end_idx];
+
+        let mut candidate = None;
+        let mut has_push = false;
+        for op in loop_ops {
+            match op {
+                TraceOp::SetIndex { array, .. }
+                | TraceOp::ArrayIndexOk { array, .. }
+                | TraceOp::GetIndex { array, .. }
+                | TraceOp::ArrayLen { array, .. } => {
+                    if let Some(cand) = candidate {
+                        if cand != *array {
+                            return None;
+                        }
+                    } else {
+                        candidate = Some(*array);
+                    }
+                }
+                TraceOp::ArrayPush { array, .. } => {
+                    has_push = true;
+                    if let Some(cand) = candidate {
+                        if cand != *array {
+                            return None;
+                        }
+                    } else {
+                        candidate = Some(*array);
+                    }
+                }
+                _ => {}
+            }
+        }
+        let arr = candidate?;
+        for op in loop_ops {
+            match op {
+                TraceOp::CallDirect { .. }
+                | TraceOp::CallFunction { .. }
+                | TraceOp::CallNative { .. }
+                | TraceOp::CallMethod { .. }
+                | TraceOp::InlineCall { .. }
+                | TraceOp::NestedLoopCall { .. }
+                | TraceOp::NewArray { .. } => return None,
+                _ => {
+                    if Self::op_writes_to_reg(op, arr) {
+                        return None;
+                    }
+                }
+            }
+        }
+        let used_regs: hashbrown::HashSet<u8> = pins.values().map(|p| p.reg).collect();
+        let mut available = (23..=28).filter(|r| !used_regs.contains(r));
+        let rc_reg = available.next()?;
+        let ptr_reg = available.next()?;
+        let len_reg = available.next();
+
+        let mut bounded_info = None;
+        if len_reg.is_some() && !has_push {
+            for (idx, op) in loop_ops.iter().enumerate().take(8) {
+                let cmp_info = match op {
+                    TraceOp::Le { dest, lhs, rhs, lhs_type: ValueType::Int, rhs_type: ValueType::Int } => {
+                        Some((*dest, *lhs, *rhs, true))
+                    }
+                    TraceOp::Lt { dest, lhs, rhs, lhs_type: ValueType::Int, rhs_type: ValueType::Int } => {
+                        Some((*dest, *lhs, *rhs, false))
+                    }
+                    _ => None,
+                };
+                if let Some((cond_dest, idx_reg, bound_reg, is_le)) = cmp_info {
+                    let has_exit_branch = loop_ops[idx + 1..].iter().take(4).any(|b_op| {
+                        matches!(b_op, TraceOp::BranchIf { condition_register, expect_truthy: false, label }
+                            if *condition_register == cond_dest && *label != loop_id)
+                    });
+                    let bound_unwritten = !loop_ops.iter().any(|w_op| Self::op_writes_to_reg(w_op, bound_reg));
+                    let all_indexing_matches = loop_ops.iter().all(|i_op| match i_op {
+                        TraceOp::SetIndex { array, index, .. }
+                        | TraceOp::GetIndex { array, index, .. }
+                        | TraceOp::ArrayIndexOk { array, index, .. } if *array == arr => *index == idx_reg,
+                        _ => true,
+                    });
+                    if has_exit_branch && bound_unwritten && all_indexing_matches {
+                        bounded_info = Some((idx_reg, bound_reg, is_le));
+                        break;
+                    }
+                }
+            }
+        }
+
+        Some((arr, rc_reg, ptr_reg, len_reg, bounded_info))
+    }
+
+    fn find_bounded_index_for_specialized_vec(
+        trace: &Trace,
+        vec_id: usize,
+        const_registers: &hashbrown::HashMap<u8, Value>,
+    ) -> Option<(u8, u8, bool, Option<u8>)> {
+        // 1. Vector must not undergo size-changing mutations in the loop.
+        for op in &trace.ops {
+            if let TraceOp::SpecializedOp { op: kind, operands } = op {
+                if matches!(kind, SpecializedOpKind::VecPush | SpecializedOpKind::VecPop)
+                    && operands.first() == Some(&Operand::Specialized(vec_id))
+                {
+                    return None;
+                }
+            }
+        }
+
+        // 2. Identify the index register used to access this specialized vector.
+        let mut index_registers = hashbrown::HashSet::new();
+        for op in &trace.ops {
+            match op {
+                TraceOp::SpecializedOp { op: SpecializedOpKind::VecSet, operands } => {
+                    if operands.get(0) == Some(&Operand::Specialized(vec_id)) {
+                        if let Some(Operand::Register(r)) = operands.get(1) {
+                            index_registers.insert(*r);
+                        } else {
+                            return None;
+                        }
+                    }
+                }
+                TraceOp::SpecializedOp { op: SpecializedOpKind::VecGet, operands } => {
+                    if operands.get(1) == Some(&Operand::Specialized(vec_id)) {
+                        if let Some(Operand::Register(r)) = operands.get(2) {
+                            index_registers.insert(*r);
+                        } else {
+                            return None;
+                        }
+                    }
+                }
+                TraceOp::SpecializedOp { op: SpecializedOpKind::VecIndexOk, operands } => {
+                    if operands.get(2) == Some(&Operand::Specialized(vec_id)) {
+                        if let Some(Operand::Register(r)) = operands.get(3) {
+                            index_registers.insert(*r);
+                        } else {
+                            return None;
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        if index_registers.len() != 1 {
+            return None;
+        }
+        let index_reg = *index_registers.iter().next().unwrap();
+
+        // 3. Find the upper bound comparison: index_reg <= bound_reg or index_reg < bound_reg.
+        let mut bound_info: Option<(u8, bool)> = None;
+        for (i, op) in trace.ops.iter().enumerate() {
+            let cmp = match op {
+                TraceOp::Le { dest, lhs, rhs, lhs_type: ValueType::Int, rhs_type: ValueType::Int }
+                    if *lhs == index_reg =>
+                {
+                    Some((*rhs, true, *dest))
+                }
+                TraceOp::Lt { dest, lhs, rhs, lhs_type: ValueType::Int, rhs_type: ValueType::Int }
+                    if *lhs == index_reg =>
+                {
+                    Some((*rhs, false, *dest))
+                }
+                TraceOp::Ge { dest, lhs, rhs, lhs_type: ValueType::Int, rhs_type: ValueType::Int }
+                    if *rhs == index_reg =>
+                {
+                    Some((*lhs, true, *dest))
+                }
+                TraceOp::Gt { dest, lhs, rhs, lhs_type: ValueType::Int, rhs_type: ValueType::Int }
+                    if *rhs == index_reg =>
+                {
+                    Some((*lhs, false, *dest))
+                }
+                _ => None,
+            };
+            if let Some((b_reg, is_le, cond_dest)) = cmp {
+                let has_guard = trace.ops[i + 1..].iter().take(4).any(|next_op| match next_op {
+                    TraceOp::GuardLoopContinue { condition_register, expect_truthy: true, .. } => {
+                        *condition_register == cond_dest
+                    }
+                    TraceOp::BranchIf { condition_register, expect_truthy: false, .. } => {
+                        *condition_register == cond_dest
+                    }
+                    _ => false,
+                });
+                if has_guard {
+                    bound_info = Some((b_reg, is_le));
+                    break;
+                }
+            }
+        }
+        let (bound_reg, is_le) = bound_info?;
+
+        // bound_reg must be loop invariant (never written in trace.ops).
+        if trace.ops.iter().any(|op| Self::op_writes_to_reg(op, bound_reg)) {
+            return None;
+        }
+
+        // 4. Any modification to index_reg must be a monotonic increment (Add with step >= 0).
+        let mut step_reg: Option<u8> = None;
+        for op in &trace.ops {
+            if Self::op_writes_to_reg(op, index_reg) {
+                match op {
+                    TraceOp::Add { dest, lhs, rhs, lhs_type: ValueType::Int, rhs_type: ValueType::Int }
+                        if *dest == index_reg && *lhs == index_reg =>
+                    {
+                        if let Some(const_val) = const_registers.get(rhs) {
+                            if let Value::Int(i) = const_val {
+                                if *i < 0 {
+                                    return None;
+                                }
+                            } else {
+                                return None;
+                            }
+                        } else {
+                            if let Some(existing_step) = step_reg {
+                                if existing_step != *rhs {
+                                    return None;
+                                }
+                            } else {
+                                step_reg = Some(*rhs);
+                            }
+                        }
+                    }
+                    _ => return None,
+                }
+            }
+        }
+        if let Some(step) = step_reg {
+            if trace.ops.iter().any(|op| Self::op_writes_to_reg(op, step)) {
+                return None;
+            }
+        }
+
+        // 5. Verify every indexing operation on this vector is guarded by the bound check.
+        let mut active_cond: Option<u8> = None;
+        let mut guarded = false;
+        for op in &trace.ops {
+            match op {
+                TraceOp::Le { dest, lhs, rhs, lhs_type: ValueType::Int, rhs_type: ValueType::Int }
+                    if *lhs == index_reg && *rhs == bound_reg && is_le =>
+                {
+                    active_cond = Some(*dest);
+                }
+                TraceOp::Lt { dest, lhs, rhs, lhs_type: ValueType::Int, rhs_type: ValueType::Int }
+                    if *lhs == index_reg && *rhs == bound_reg && !is_le =>
+                {
+                    active_cond = Some(*dest);
+                }
+                TraceOp::Ge { dest, lhs, rhs, lhs_type: ValueType::Int, rhs_type: ValueType::Int }
+                    if *rhs == index_reg && *lhs == bound_reg && is_le =>
+                {
+                    active_cond = Some(*dest);
+                }
+                TraceOp::Gt { dest, lhs, rhs, lhs_type: ValueType::Int, rhs_type: ValueType::Int }
+                    if *rhs == index_reg && *lhs == bound_reg && !is_le =>
+                {
+                    active_cond = Some(*dest);
+                }
+                TraceOp::GuardLoopContinue { condition_register, expect_truthy: true, .. } => {
+                    if active_cond == Some(*condition_register) {
+                        guarded = true;
+                    }
+                }
+                TraceOp::BranchIf { condition_register, expect_truthy: false, .. } => {
+                    if active_cond == Some(*condition_register) {
+                        guarded = true;
+                    }
+                }
+                TraceOp::Add { dest, .. } if *dest == index_reg => {
+                    guarded = false;
+                    active_cond = None;
+                }
+                TraceOp::SpecializedOp { op: kind, operands }
+                    if matches!(kind, SpecializedOpKind::VecSet | SpecializedOpKind::VecGet | SpecializedOpKind::VecIndexOk) =>
+                {
+                    let accesses_this_vec = match kind {
+                        SpecializedOpKind::VecSet => operands.get(0) == Some(&Operand::Specialized(vec_id)),
+                        SpecializedOpKind::VecGet => operands.get(1) == Some(&Operand::Specialized(vec_id)),
+                        SpecializedOpKind::VecIndexOk => operands.get(2) == Some(&Operand::Specialized(vec_id)),
+                        _ => false,
+                    };
+                    if accesses_this_vec && !guarded {
+                        return None;
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        // 6. Index, bound, and step (if register) must be verified Int at trace entry.
+        let reg_is_int = |reg: u8| -> bool {
+            trace.entry_scalars.iter().any(|(r, ty)| *r == reg && *ty == ValueType::Int)
+                || trace.preamble.iter().any(|op| match op {
+                    TraceOp::Guard { register, expected_type } => {
+                        *register == reg && *expected_type == ValueType::Int
+                    }
+                    _ => false,
+                })
+        };
+        if !reg_is_int(index_reg) || !reg_is_int(bound_reg) {
+            return None;
+        }
+        if let Some(step) = step_reg {
+            if !reg_is_int(step) {
+                return None;
+            }
+        }
+
+        Some((index_reg, bound_reg, is_le, step_reg))
+    }
+
+    fn parse_stride_iteration(
+        ops: &[TraceOp],
+        start: usize,
+        stride_loops: &hashbrown::HashMap<(usize, u8), (u8, bool, u8)>,
+    ) -> Option<(usize, usize, u8, u8, u8, u8, usize)> {
+        let mut k = start;
+        while k < ops.len() && matches!(ops[k], TraceOp::At { .. }) {
+            k += 1;
+        }
+        if k >= ops.len() {
+            return None;
+        }
+        while k < ops.len() {
+            if let TraceOp::Guard {
+                expected_type: ValueType::Int,
+                ..
+            } = ops[k] {
+                k += 1;
+                while k < ops.len() && matches!(ops[k], TraceOp::At { .. }) {
+                    k += 1;
+                }
+            } else {
                 break;
             }
         }
-        Some((arr, ptr_reg, len_reg))
+        if k >= ops.len() {
+            return None;
+        }
+
+        let (cond_reg, idx_reg, bound_reg, is_le) = match ops[k] {
+            TraceOp::Le {
+                dest,
+                lhs,
+                rhs,
+                lhs_type: ValueType::Int,
+                rhs_type: ValueType::Int,
+            } => (dest, lhs, rhs, true),
+            TraceOp::Lt {
+                dest,
+                lhs,
+                rhs,
+                lhs_type: ValueType::Int,
+                rhs_type: ValueType::Int,
+            } => (dest, lhs, rhs, false),
+            _ => return None,
+        };
+
+        let mut found = None;
+        for (&(v_id, i_reg), &(b_reg, le, s_reg)) in stride_loops {
+            if i_reg == idx_reg && b_reg == bound_reg && le == is_le {
+                found = Some((v_id, s_reg));
+                break;
+            }
+        }
+        let (vec_id, step_reg) = found?;
+        k += 1;
+
+        while k < ops.len() && matches!(ops[k], TraceOp::At { .. }) {
+            k += 1;
+        }
+        if k >= ops.len() {
+            return None;
+        }
+
+        let (expect_truthy, bailout_ip) = match ops[k] {
+            TraceOp::GuardLoopContinue {
+                condition_register,
+                expect_truthy,
+                bailout_ip,
+            } if condition_register == cond_reg => (expect_truthy, bailout_ip),
+            _ => return None,
+        };
+        if !expect_truthy {
+            return None;
+        }
+        k += 1;
+
+        while k < ops.len() && matches!(ops[k], TraceOp::At { .. }) {
+            k += 1;
+        }
+        if k >= ops.len() {
+            return None;
+        }
+
+        let val_reg = match &ops[k] {
+            TraceOp::SpecializedOp {
+                op: SpecializedOpKind::VecSet,
+                operands,
+            } => {
+                if operands.len() != 3 {
+                    return None;
+                }
+                if operands[0] != Operand::Specialized(vec_id) {
+                    return None;
+                }
+                if operands[1] != Operand::Register(idx_reg) {
+                    return None;
+                }
+                match operands[2] {
+                    Operand::Register(r) => r,
+                    _ => return None,
+                }
+            }
+            _ => return None,
+        };
+        k += 1;
+
+        while k < ops.len() && matches!(ops[k], TraceOp::At { .. }) {
+            k += 1;
+        }
+        if k >= ops.len() {
+            return None;
+        }
+
+        while k < ops.len() {
+            if let TraceOp::Guard {
+                register,
+                expected_type: ValueType::Int,
+            } = ops[k] {
+                if register == idx_reg || register == step_reg {
+                    k += 1;
+                    while k < ops.len() && matches!(ops[k], TraceOp::At { .. }) {
+                        k += 1;
+                    }
+                } else {
+                    break;
+                }
+            } else {
+                break;
+            }
+        }
+        if k >= ops.len() {
+            return None;
+        }
+
+        match ops[k] {
+            TraceOp::Add {
+                dest,
+                lhs,
+                rhs,
+                lhs_type: ValueType::Int,
+                rhs_type: ValueType::Int,
+            } if dest == idx_reg && lhs == idx_reg && rhs == step_reg => {}
+            _ => return None,
+        }
+        k += 1;
+
+        while k < ops.len() && matches!(ops[k], TraceOp::At { .. }) {
+            k += 1;
+        }
+
+        Some((k - start, vec_id, idx_reg, bound_reg, step_reg, val_reg, bailout_ip))
+    }
+
+    fn try_batch_stride_stores(
+        &mut self,
+        ops: &[TraceOp],
+        start: usize,
+        guard_index: &mut i32,
+        guards: &mut Vec<Guard>,
+    ) -> Result<Option<usize>> {
+        let first = match Self::parse_stride_iteration(ops, start, &self.specialized_stride_loops) {
+            Some(f) => f,
+            None => return Ok(None),
+        };
+        let (span_0, vec_id, idx_reg, bound_reg, step_reg, val_reg, _bailout_ip) = first;
+
+        let mut iter_spans = vec![span_0];
+        let mut curr_offset = span_0;
+        while iter_spans.len() < 8 && start + curr_offset < ops.len() {
+            if let Some(next) = Self::parse_stride_iteration(ops, start + curr_offset, &self.specialized_stride_loops) {
+                if (next.1, next.2, next.3, next.4, next.5) == (vec_id, idx_reg, bound_reg, step_reg, val_reg) {
+                    iter_spans.push(next.0);
+                    curr_offset += next.0;
+                    continue;
+                }
+            }
+            break;
+        }
+
+        let batch_size = if iter_spans.len() >= 8 {
+            8
+        } else if iter_spans.len() >= 4 {
+            4
+        } else {
+            return Ok(None);
+        };
+
+        let total_span: usize = iter_spans[..batch_size].iter().sum();
+
+        let idx_pin = match self.active_pin(idx_reg) {
+            Some(p) => p,
+            None => return Ok(None),
+        };
+        let bound_pin = match self.active_pin(bound_reg) {
+            Some(p) => p,
+            None => return Ok(None),
+        };
+        let step_pin = match self.active_pin(step_reg) {
+            Some(p) => p,
+            None => return Ok(None),
+        };
+
+        let specialized = match self.specialized_values.get(&vec_id) {
+            Some(s) => s.clone(),
+            None => return Ok(None),
+        };
+
+        if specialized.kind != VecKind::Bool {
+            return Ok(None);
+        }
+
+        let is_bool_false = matches!(self.const_registers.get(&val_reg), Some(Value::Bool(false)));
+        let val_pin = self.active_pin(val_reg);
+        if !is_bool_false && val_pin.is_none() {
+            return Ok(None);
+        }
+
+        if self.cached_specialized_vec != Some(vec_id) {
+            let stack_offset = specialized.stack_offset;
+            self.emit_slot_addr(0, stack_offset);
+            dynasm!(self.ops
+                ; .arch aarch64
+                ; ldr x14, [x0, 0]
+                ; ldr x15, [x0, 8]
+                ; ldr x16, [x0, 16]
+            );
+            self.cached_specialized_vec = Some(vec_id);
+            self.cached_select_imms = None;
+        }
+
+        let fallback_label = self.ops.new_dynamic_label();
+        let after_label = self.ops.new_dynamic_label();
+
+        let idx_r = idx_pin.reg;
+        let bound_r = bound_pin.reg;
+        let step_r = step_pin.reg;
+
+        if batch_size == 8 {
+            dynasm!(self.ops
+                ; .arch aarch64
+                ; lsl x9, X(step_r), #3
+                ; sub x9, x9, X(step_r)
+                ; subs x10, X(bound_r), x9
+                ; b.mi => fallback_label
+                ; cmp X(idx_r), x10
+                ; b.gt => fallback_label
+            );
+            if is_bool_false {
+                dynasm!(self.ops
+                    ; .arch aarch64
+                    ; strb wzr, [x14, X(idx_r)]
+                    ; add x9, X(idx_r), X(step_r)
+                    ; strb wzr, [x14, x9]
+                    ; add x9, x9, X(step_r)
+                    ; strb wzr, [x14, x9]
+                    ; add x9, x9, X(step_r)
+                    ; strb wzr, [x14, x9]
+                    ; add x9, x9, X(step_r)
+                    ; strb wzr, [x14, x9]
+                    ; add x9, x9, X(step_r)
+                    ; strb wzr, [x14, x9]
+                    ; add x9, x9, X(step_r)
+                    ; strb wzr, [x14, x9]
+                    ; add x9, x9, X(step_r)
+                    ; strb wzr, [x14, x9]
+                    ; add X(idx_r), x9, X(step_r)
+                    ; b => after_label
+                    ; => fallback_label
+                );
+            } else {
+                let v_reg = val_pin.unwrap().reg;
+                dynasm!(self.ops
+                    ; .arch aarch64
+                    ; strb W(v_reg), [x14, X(idx_r)]
+                    ; add x9, X(idx_r), X(step_r)
+                    ; strb W(v_reg), [x14, x9]
+                    ; add x9, x9, X(step_r)
+                    ; strb W(v_reg), [x14, x9]
+                    ; add x9, x9, X(step_r)
+                    ; strb W(v_reg), [x14, x9]
+                    ; add x9, x9, X(step_r)
+                    ; strb W(v_reg), [x14, x9]
+                    ; add x9, x9, X(step_r)
+                    ; strb W(v_reg), [x14, x9]
+                    ; add x9, x9, X(step_r)
+                    ; strb W(v_reg), [x14, x9]
+                    ; add x9, x9, X(step_r)
+                    ; strb W(v_reg), [x14, x9]
+                    ; add X(idx_r), x9, X(step_r)
+                    ; b => after_label
+                    ; => fallback_label
+                );
+            }
+        } else {
+            dynasm!(self.ops
+                ; .arch aarch64
+                ; add x9, X(step_r), X(step_r), lsl #1
+                ; subs x10, X(bound_r), x9
+                ; b.mi => fallback_label
+                ; cmp X(idx_r), x10
+                ; b.gt => fallback_label
+            );
+            if is_bool_false {
+                dynasm!(self.ops
+                    ; .arch aarch64
+                    ; strb wzr, [x14, X(idx_r)]
+                    ; add x9, X(idx_r), X(step_r)
+                    ; strb wzr, [x14, x9]
+                    ; add x9, x9, X(step_r)
+                    ; strb wzr, [x14, x9]
+                    ; add x9, x9, X(step_r)
+                    ; strb wzr, [x14, x9]
+                    ; add X(idx_r), x9, X(step_r)
+                    ; b => after_label
+                    ; => fallback_label
+                );
+            } else {
+                let v_reg = val_pin.unwrap().reg;
+                dynasm!(self.ops
+                    ; .arch aarch64
+                    ; strb W(v_reg), [x14, X(idx_r)]
+                    ; add x9, X(idx_r), X(step_r)
+                    ; strb W(v_reg), [x14, x9]
+                    ; add x9, x9, X(step_r)
+                    ; strb W(v_reg), [x14, x9]
+                    ; add x9, x9, X(step_r)
+                    ; strb W(v_reg), [x14, x9]
+                    ; add X(idx_r), x9, X(step_r)
+                    ; b => after_label
+                    ; => fallback_label
+                );
+            }
+        }
+
+        self.in_stride_batch_fallback = true;
+        let ops_slice = &ops[start..start + total_span];
+        self.compile_ops(ops_slice, guard_index, guards)?;
+        self.in_stride_batch_fallback = false;
+
+        dynasm!(self.ops
+            ; .arch aarch64
+            ; => after_label
+        );
+
+        self.mark_dirty(idx_reg);
+        crate::jit::log(|| {
+            format!(
+                "⚡ JIT: Batched {} stride stores for vec #{} on reg {}",
+                batch_size, vec_id, idx_reg
+            )
+        });
+        Ok(Some(start + total_span - 1))
+    }
+
+    fn parse_push_iteration(
+        ops: &[TraceOp],
+        start: usize,
+    ) -> Option<(usize, usize, u8, u8, u8, u8, usize)> {
+        let mut k = start;
+        while k < ops.len() && matches!(ops[k], TraceOp::At { .. }) {
+            k += 1;
+        }
+        if k >= ops.len() {
+            return None;
+        }
+        while k < ops.len() {
+            if let TraceOp::Guard {
+                expected_type: ValueType::Int,
+                ..
+            } = ops[k] {
+                k += 1;
+                while k < ops.len() && matches!(ops[k], TraceOp::At { .. }) {
+                    k += 1;
+                }
+            } else {
+                break;
+            }
+        }
+        if k >= ops.len() {
+            return None;
+        }
+
+        let (cond_reg, idx_reg, bound_reg, is_le) = match ops[k] {
+            TraceOp::Le {
+                dest,
+                lhs,
+                rhs,
+                lhs_type: ValueType::Int,
+                rhs_type: ValueType::Int,
+            } => (dest, lhs, rhs, true),
+            TraceOp::Lt {
+                dest,
+                lhs,
+                rhs,
+                lhs_type: ValueType::Int,
+                rhs_type: ValueType::Int,
+            } => (dest, lhs, rhs, false),
+            _ => return None,
+        };
+        if !is_le {
+            return None;
+        }
+        k += 1;
+
+        while k < ops.len() && matches!(ops[k], TraceOp::At { .. }) {
+            k += 1;
+        }
+        if k >= ops.len() {
+            return None;
+        }
+
+        let (expect_truthy, bailout_ip) = match ops[k] {
+            TraceOp::GuardLoopContinue {
+                condition_register,
+                expect_truthy,
+                bailout_ip,
+            } if condition_register == cond_reg => (expect_truthy, bailout_ip),
+            _ => return None,
+        };
+        if !expect_truthy {
+            return None;
+        }
+        k += 1;
+
+        while k < ops.len() && matches!(ops[k], TraceOp::At { .. }) {
+            k += 1;
+        }
+        if k >= ops.len() {
+            return None;
+        }
+
+        let (vec_id, val_reg) = match &ops[k] {
+            TraceOp::SpecializedOp {
+                op: SpecializedOpKind::VecPush,
+                operands,
+            } => {
+                if operands.len() != 2 {
+                    return None;
+                }
+                let v_id = match operands[0] {
+                    Operand::Specialized(id) => id,
+                    _ => return None,
+                };
+                let v_reg = match operands[1] {
+                    Operand::Register(r) => r,
+                    _ => return None,
+                };
+                (v_id, v_reg)
+            }
+            _ => return None,
+        };
+        k += 1;
+
+        while k < ops.len() && matches!(ops[k], TraceOp::At { .. }) {
+            k += 1;
+        }
+        if k >= ops.len() {
+            return None;
+        }
+
+        while k < ops.len() {
+            if let TraceOp::Guard {
+                register,
+                expected_type: ValueType::Int,
+            } = ops[k] {
+                if register == idx_reg {
+                    k += 1;
+                    while k < ops.len() && matches!(ops[k], TraceOp::At { .. }) {
+                        k += 1;
+                    }
+                } else {
+                    break;
+                }
+            } else {
+                break;
+            }
+        }
+        if k >= ops.len() {
+            return None;
+        }
+
+        let step_reg = match ops[k] {
+            TraceOp::Add {
+                dest,
+                lhs,
+                rhs,
+                lhs_type: ValueType::Int,
+                rhs_type: ValueType::Int,
+            } if dest == idx_reg && lhs == idx_reg => rhs,
+            _ => return None,
+        };
+        k += 1;
+
+        while k < ops.len() && matches!(ops[k], TraceOp::At { .. }) {
+            k += 1;
+        }
+
+        Some((k - start, vec_id, idx_reg, bound_reg, step_reg, val_reg, bailout_ip))
+    }
+
+    fn try_batch_push_stores(
+        &mut self,
+        ops: &[TraceOp],
+        start: usize,
+        guard_index: &mut i32,
+        guards: &mut Vec<Guard>,
+    ) -> Result<Option<usize>> {
+        let first = match Self::parse_push_iteration(ops, start) {
+            Some(f) => f,
+            None => return Ok(None),
+        };
+        let (span_0, vec_id, idx_reg, bound_reg, step_reg, val_reg, _bailout_ip) = first;
+
+        let mut iter_spans = vec![span_0];
+        let mut curr_offset = span_0;
+        while iter_spans.len() < 8 && start + curr_offset < ops.len() {
+            if let Some(next) = Self::parse_push_iteration(ops, start + curr_offset) {
+                if (next.1, next.2, next.3, next.4, next.5) == (vec_id, idx_reg, bound_reg, step_reg, val_reg) {
+                    iter_spans.push(next.0);
+                    curr_offset += next.0;
+                    continue;
+                }
+            }
+            break;
+        }
+
+        if iter_spans.len() < 8 {
+            return Ok(None);
+        }
+
+        let batch_size = 8;
+        let total_span: usize = iter_spans[..batch_size].iter().sum();
+
+        let idx_pin = match self.active_pin(idx_reg) {
+            Some(p) => p,
+            None => return Ok(None),
+        };
+        let bound_pin = match self.active_pin(bound_reg) {
+            Some(p) => p,
+            None => return Ok(None),
+        };
+        let step_pin = match self.active_pin(step_reg) {
+            Some(p) => p,
+            None => return Ok(None),
+        };
+
+        let specialized = match self.specialized_values.get(&vec_id) {
+            Some(s) => s.clone(),
+            None => return Ok(None),
+        };
+
+        if specialized.kind != VecKind::Bool {
+            return Ok(None);
+        }
+
+        let val_pin = match self.active_pin(val_reg) {
+            Some(p) => p,
+            None => return Ok(None),
+        };
+
+        let stack_offset = specialized.stack_offset;
+        if self.cached_specialized_vec != Some(vec_id) {
+            self.emit_slot_addr(0, stack_offset);
+            dynasm!(self.ops
+                ; .arch aarch64
+                ; ldr x14, [x0, 0]
+                ; ldr x15, [x0, 8]
+                ; ldr x16, [x0, 16]
+            );
+            self.cached_specialized_vec = Some(vec_id);
+            self.cached_select_imms = None;
+        }
+
+        let fallback_label = self.ops.new_dynamic_label();
+        let after_label = self.ops.new_dynamic_label();
+
+        let idx_r = idx_pin.reg;
+        let bound_r = bound_pin.reg;
+        let step_r = step_pin.reg;
+        let val_r = val_pin.reg;
+
+        dynasm!(self.ops
+            ; .arch aarch64
+            // Loop bound check: idx + 7 * step <= bound
+            ; lsl x9, X(step_r), #3
+            ; sub x9, x9, X(step_r)
+            ; subs x10, X(bound_r), x9
+            ; b.mi => fallback_label
+            ; cmp X(idx_r), x10
+            ; b.gt => fallback_label
+
+            // Capacity check: len + 8 <= cap
+            ; subs x10, x16, #8
+            ; b.mi => fallback_label
+            ; cmp x15, x10
+            ; b.gt => fallback_label
+
+            // Fast push: broadcast boolean into 64-bit register
+            ; movz x10, 0x0101
+            ; movk x10, 0x0101, lsl #16
+            ; movk x10, 0x0101, lsl #32
+            ; movk x10, 0x0101, lsl #48
+            ; and x9, X(val_r), #0xff
+            ; mul x10, x10, x9
+            ; str x10, [x14, x15]
+            ; add x15, x15, #8
+            ; add X(idx_r), X(idx_r), X(step_r), lsl #3
+            ; b => after_label
+            ; => fallback_label
+        );
+
+        self.in_stride_batch_fallback = true;
+        let ops_slice = &ops[start..start + total_span];
+        self.compile_ops(ops_slice, guard_index, guards)?;
+        self.in_stride_batch_fallback = false;
+
+        dynasm!(self.ops
+            ; .arch aarch64
+            ; => after_label
+        );
+
+        self.emit_slot_addr(10, stack_offset);
+        dynasm!(self.ops
+            ; .arch aarch64
+            ; str x15, [x10, 8]
+        );
+
+        self.mark_dirty(idx_reg);
+        crate::jit::log(|| {
+            format!(
+                "⚡ JIT: Batched 8 bool pushes for vec #{} from reg {}",
+                vec_id, val_reg
+            )
+        });
+        Ok(Some(start + total_span - 1))
     }
 }

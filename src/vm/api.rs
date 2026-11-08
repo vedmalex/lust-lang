@@ -258,6 +258,13 @@ impl VM {
         }
     }
 
+    #[inline]
+    pub(crate) fn observe_struct_direct(&mut self, object: &alloc::rc::Rc<crate::bytecode::value::StructObject>) {
+        if self.cycle_collector.is_enabled() {
+            self.cycle_collector.register_struct_direct(object);
+        }
+    }
+
     pub(crate) fn set_pending_jit_error(&mut self, error: LustError) {
         self.pending_jit_error = Some(error);
     }
@@ -443,6 +450,10 @@ impl VM {
                 });
             }
         };
+        if let Some(val) = crate::bytecode::value::get_specialized_cached_element(values, index) {
+            self.budgets.charge_value_vec(1)?;
+            return Ok(Value::ok(val));
+        }
         let values = values.try_borrow().map_err(|_| LustError::RuntimeError {
             message: "Cannot read array while it is mutably borrowed".to_string(),
         })?;
@@ -844,6 +855,7 @@ impl VM {
         self.last_dispatched_target.clone()
     }
 
+    #[allow(dead_code)]
     pub(crate) fn current_frame_target(&self) -> Option<(usize, &str)> {
         self.call_stack.last().and_then(|frame| {
             let idx = frame.function_idx;
@@ -1011,6 +1023,7 @@ impl VM {
     }
 
 
+    #[allow(dead_code)]
     pub(crate) fn call_retained_target(
         &mut self,
         func_idx: usize,

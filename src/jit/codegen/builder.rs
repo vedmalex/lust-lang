@@ -123,6 +123,7 @@ impl JitCompiler {
         register_count: u8,
         entry_table: usize,
         result_type: Option<ValueType>,
+        hoisted_constants: Vec<(u8, Value)>,
     ) -> Result<CompiledTrace> {
         self.function_mode = true;
         self.function_frame = (register_count, trace.frame_may_own);
@@ -135,7 +136,7 @@ impl JitCompiler {
         self.function_result = result_type;
         self.function_entry_table = entry_table;
         self.function_labels.clear();
-        let result = self.compile_trace(trace, trace_id, Vec::new());
+        let result = self.compile_trace(trace, trace_id, hoisted_constants);
         self.function_mode = false;
         result
     }
@@ -1005,6 +1006,10 @@ impl JitCompiler {
                     self.compile_new_array(*dest, *first_element, *count)?;
                 }
 
+                TraceOp::StoreGlobal { name, src } => {
+                    self.compile_store_global(name, *src)?;
+                }
+
                 TraceOp::NewStruct {
                     dest,
                     struct_name,
@@ -1080,6 +1085,15 @@ impl JitCompiler {
                     self.compile_borrow_enum_value(*dest, *enum_reg, *index)?;
                 }
 
+                TraceOp::BorrowFieldSome {
+                    dest,
+                    object,
+                    field_index,
+                    label,
+                } => {
+                    self.compile_borrow_field_some(*dest, *object, *field_index, *label)?;
+                }
+
                 TraceOp::Guard {
                     register,
                     expected_type,
@@ -1099,6 +1113,22 @@ impl JitCompiler {
                     condition_register,
                     expect_truthy,
                     bailout_ip,
+                } => {
+                    let guard = self.compile_truth_guard(
+                        *condition_register,
+                        *expect_truthy,
+                        *bailout_ip,
+                        *guard_index as usize,
+                    )?;
+                    guards.push(guard);
+                    *guard_index += 1;
+                }
+
+                TraceOp::ConditionalHammock {
+                    condition_register,
+                    expect_truthy,
+                    bailout_ip,
+                    ..
                 } => {
                     let guard = self.compile_truth_guard(
                         *condition_register,
@@ -1387,6 +1417,7 @@ impl JitCompiler {
                 | TraceOp::GetEnumValue { .. }
                 | TraceOp::BorrowField { .. }
                 | TraceOp::BorrowEnumValue { .. }
+                | TraceOp::BorrowFieldSome { .. }
                 | TraceOp::Unbox { .. }
                 | TraceOp::Rebox { .. }
                 | TraceOp::DropSpecialized { .. }
@@ -1612,6 +1643,7 @@ impl JitCompiler {
                 | TraceOp::GetEnumValue { .. }
                 | TraceOp::BorrowField { .. }
                 | TraceOp::BorrowEnumValue { .. }
+                | TraceOp::BorrowFieldSome { .. }
                 | TraceOp::Guard { .. }
                 | TraceOp::GuardLoopContinue { .. }
                 | TraceOp::NestedLoopCall { .. }
@@ -1709,11 +1741,24 @@ impl JitCompiler {
             | TraceOp::TypeIs { value, .. }
             | TraceOp::TryCast { value, .. } => *value == register,
             TraceOp::GetEnumValue { enum_reg, .. } => *enum_reg == register,
-            TraceOp::BorrowField { object, .. } => *object == register,
+            TraceOp::BorrowField { object, .. }
+            | TraceOp::BorrowFieldSome { object, .. } => *object == register,
             TraceOp::BorrowEnumValue { enum_reg, .. } => *enum_reg == register,
             TraceOp::GuardLoopContinue {
                 condition_register, ..
             } => *condition_register == register,
+            TraceOp::ConditionalHammock {
+                condition_register,
+                acc_src,
+                inner_loop_bypass,
+                ..
+            } => {
+                *condition_register == register
+                    || *acc_src == register
+                    || inner_loop_bypass.as_ref().is_some_and(|b| {
+                        b.mul_lhs == register || b.mul_rhs == register || b.bound_reg == register
+                    })
+            }
             TraceOp::Select { cond, .. } => *cond == register,
             TraceOp::SelectBitZero { src, .. } => *src == register,
             TraceOp::ModImm { src, .. } => *src == register,
@@ -1791,8 +1836,10 @@ impl JitCompiler {
             | TraceOp::Select { dest, .. }
             | TraceOp::SelectBitZero { dest, .. }
             | TraceOp::ModImm { dest, .. }
+            | TraceOp::ConditionalHammock { acc_dest: dest, .. }
             | TraceOp::BorrowField { dest, .. }
-            | TraceOp::BorrowEnumValue { dest, .. } => *dest == register,
+            | TraceOp::BorrowEnumValue { dest, .. }
+            | TraceOp::BorrowFieldSome { dest, .. } => *dest == register,
             _ => false,
         }
     }
@@ -1943,7 +1990,9 @@ impl JitCompiler {
                 self.scalar_registers.remove(dest);
             }
             // A borrow owns nothing; the value is of no particular type.
-            TraceOp::BorrowField { dest, .. } | TraceOp::BorrowEnumValue { dest, .. } => {
+            TraceOp::BorrowField { dest, .. }
+            | TraceOp::BorrowEnumValue { dest, .. }
+            | TraceOp::BorrowFieldSome { dest, .. } => {
                 self.scalar_registers.insert(*dest, ValueType::Plain);
             }
             TraceOp::Rebox { dest_reg, .. } => {

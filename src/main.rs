@@ -1,4 +1,8 @@
 #![cfg(feature = "std")]
+#[cfg(all(feature = "std", not(target_arch = "wasm32")))]
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 #[cfg(all(feature = "packages", not(target_arch = "wasm32")))]
 use lust::LoadedRustModule;
 #[cfg(feature = "lua_transpile")]
@@ -110,21 +114,50 @@ fn main() {
         _ => {}
     }
 
+    let run_args: &[String] = if args[1] == "run" {
+        &args[2..]
+    } else {
+        &args[1..]
+    };
+
     let mut disassemble = false;
     let mut use_mir = false;
     let mut strict_mir = false;
     let mut no_gc = false;
+    let mut backend_mode: Option<String> = None;
     let mut script_file: Option<String> = None;
 
-    for arg in &args[1..] {
+    let mut i = 0;
+    while i < run_args.len() {
+        let arg = &run_args[i];
         match arg.as_str() {
+            "--help" | "-h" => {
+                print_help(&args[0]);
+                return;
+            }
             "--disassemble" | "-d" => disassemble = true,
             "--mir" => use_mir = true,
-            "--strict-mir" | "--strict" => {
+            "--strict-mir" => {
+                strict_mir = true;
+                use_mir = true;
+            }
+            "--strict" => {
                 strict_mir = true;
                 use_mir = true;
             }
             "--no-gc" => no_gc = true,
+            "--backend" => {
+                i += 1;
+                let Some(val) = run_args.get(i) else {
+                    eprintln!("Error: --backend requires a mode argument (vm, mir, cranelift, zig, auto)");
+                    process::exit(1);
+                };
+                backend_mode = Some(val.clone());
+            }
+            opt if opt.starts_with("--backend=") => {
+                let val = opt.strip_prefix("--backend=").unwrap();
+                backend_mode = Some(val.to_string());
+            }
             other if other.starts_with('-') => {
                 eprintln!("Unknown option '{}'", other);
                 print_usage(&args[0]);
@@ -136,10 +169,43 @@ fn main() {
                 }
             }
         }
+        i += 1;
+    }
+
+    let mut is_zig_aot = false;
+    if let Some(mode) = backend_mode {
+        match mode.to_ascii_lowercase().as_str() {
+            "vm" => {
+                // Default Bytecode VM
+            }
+            "mir" | "mir-vm" => {
+                use_mir = true;
+            }
+            "cranelift" | "jit" => {
+                use_mir = true;
+            }
+            "zig" | "aot" => {
+                is_zig_aot = true;
+            }
+            "auto" => {
+                // Auto: default VM with JIT/MIR
+            }
+            other => {
+                eprintln!(
+                    "Error: unknown backend '{}'. Supported backends for run: vm, mir, cranelift, zig, auto",
+                    other
+                );
+                process::exit(1);
+            }
+        }
     }
 
     if let Some(file) = script_file {
-        run_file_with_options(&file, disassemble, use_mir, strict_mir, no_gc);
+        if is_zig_aot {
+            run_file_zig_aot(&file);
+        } else {
+            run_file_with_options(&file, disassemble, use_mir, strict_mir, no_gc);
+        }
     } else {
         print_usage(&args[0]);
         process::exit(1);
@@ -148,6 +214,14 @@ fn main() {
 
 fn print_usage(program: &str) {
     eprintln!("Usage: {} [options] <script.lust>", program);
+    eprintln!(
+        "       {} run <file> --backend [vm|cranelift|zig|auto] [--strict]",
+        program
+    );
+    eprintln!(
+        "       {} build <file> --backend zig [--cdylib|--staticlib] [--emit-h] [--max-memory <size>] [-o <out>]",
+        program
+    );
     #[cfg(feature = "bindgen")]
     eprintln!(
         "       {} bindgen <entry.lust> [--out <file.rs>] [--name Bindings]",
@@ -168,8 +242,22 @@ fn print_help(program: &str) {
     println!();
     println!("USAGE:");
     println!(
-        "    {} <script.lust>                   Run a Lust script",
+        "    {} [options] <script.lust>         Run a Lust script",
         program
+    );
+    println!(
+        "    {} run <file> --backend [vm|cranelift|zig|auto] [--strict]",
+        program
+    );
+    println!(
+        "                                        Run script with specified backend"
+    );
+    println!(
+        "    {} build <file> --backend zig [--cdylib|--staticlib] [--emit-h] [--max-memory <size>] [-o <out>]",
+        program
+    );
+    println!(
+        "                                        Build native binary or C-ABI library via Zig AOT"
     );
     println!(
         "    {} --disassemble <script.lust>     Show bytecode disassembly",
@@ -227,6 +315,24 @@ fn print_help(program: &str) {
     println!(
         "    {} script.lust                     Run script.lust",
         program
+    );
+    println!(
+        "    {} run script.lust --backend zig   Compile and run via Zig AOT",
+        program
+    );
+    println!(
+        "    {} run script.lust --backend cranelift --strict",
+        program
+    );
+    println!(
+        "                                        Run via Cranelift JIT (strict MIR)"
+    );
+    println!(
+        "    {} build app.lust --backend zig --cdylib",
+        program
+    );
+    println!(
+        "                                        Build shared library via Zig AOT"
     );
     println!(
         "    {} -d script.lust                  Disassemble script.lust",
@@ -1277,10 +1383,14 @@ fn dump_externs(_: &str) {
 }
 
 fn build_command(args: &[String]) {
-    if args.first().is_some_and(|arg| arg == "--help" || arg == "-h") {
-        eprintln!("Usage: lust build <entry.lust> [options]");
+    if args.iter().any(|arg| arg == "--help" || arg == "-h") {
+        eprintln!(
+            "Usage: lust build <file> --backend zig [--cdylib|--staticlib] [--emit-h] [--max-memory <size>] [-o <out>]"
+        );
+        eprintln!("       lust build [options] <entry.lust>");
         eprintln!();
         eprintln!("OPTIONS:");
+        eprintln!("    --backend <name>          Backend compiler: zig (default), mir-zig, mir");
         eprintln!("    -o, --output <path>       Specify output binary or library path");
         eprintln!("    --cdylib, --dylib         Build dynamic shared library (.dylib, .so, .dll)");
         eprintln!("    --staticlib               Build static library (.a, .lib)");
@@ -1298,19 +1408,28 @@ fn build_command(args: &[String]) {
         eprintln!("    --cache-dir <dir>         Zig compilation cache directory");
         return;
     }
-    let Some(entry_arg) = args.first() else {
-        eprintln!("Error: lust build requires an entry file");
-        process::exit(1);
-    };
 
-    let entry_path = PathBuf::from(entry_arg);
+    let mut entry_file: Option<String> = None;
+    let mut backend = "zig".to_string();
     let mut output_bin = None;
     let mut emit_zig = false;
+    let mut emit_header_requested = false;
     let mut opts = lust::codegen_zig::CompileOptions::default();
 
-    let mut index = 1;
+    let mut index = 0;
     while index < args.len() {
         match args[index].as_str() {
+            "--backend" => {
+                index += 1;
+                let Some(val) = args.get(index) else {
+                    eprintln!("Error: --backend requires a backend name (zig, mir-zig, mir)");
+                    process::exit(1);
+                };
+                backend = val.clone();
+            }
+            opt if opt.starts_with("--backend=") => {
+                backend = opt.strip_prefix("--backend=").unwrap().to_string();
+            }
             "-o" | "--output" => {
                 index += 1;
                 let Some(val) = args.get(index) else {
@@ -1326,15 +1445,14 @@ fn build_command(args: &[String]) {
                 opts.target_kind = lust::codegen_zig::BuildTargetKind::StaticLibrary;
             }
             "--emit-h" => {
+                emit_header_requested = true;
                 if let Some(next_arg) = args.get(index + 1) {
-                    if !next_arg.starts_with('-') {
+                    if !next_arg.starts_with('-')
+                        && (entry_file.is_some() || !next_arg.ends_with(".lust"))
+                    {
                         index += 1;
                         opts.emit_header = Some(PathBuf::from(next_arg));
-                    } else {
-                        opts.emit_header = Some(entry_path.with_extension("h"));
                     }
-                } else {
-                    opts.emit_header = Some(entry_path.with_extension("h"));
                 }
             }
             "--emit-zig" => {
@@ -1376,16 +1494,45 @@ fn build_command(args: &[String]) {
                 };
                 opts.cache_dir = Some(PathBuf::from(val));
             }
-            opt => {
+            opt if opt.starts_with('-') => {
                 eprintln!("Error: unknown option '{opt}'");
                 process::exit(1);
+            }
+            pos => {
+                if entry_file.is_none() {
+                    entry_file = Some(pos.to_string());
+                } else {
+                    eprintln!("Error: unexpected argument '{pos}'");
+                    process::exit(1);
+                }
             }
         }
         index += 1;
     }
 
+    let Some(entry_arg) = entry_file else {
+        eprintln!("Error: lust build requires an entry file");
+        process::exit(1);
+    };
+
+    match backend.to_ascii_lowercase().as_str() {
+        "zig" | "mir-zig" | "mir" => {}
+        other => {
+            eprintln!(
+                "Error: unknown backend '{}'. Supported backends for build: zig, mir-zig, mir",
+                other
+            );
+            process::exit(1);
+        }
+    }
+
+    let entry_path = PathBuf::from(&entry_arg);
+    if emit_header_requested && opts.emit_header.is_none() {
+        opts.emit_header = Some(entry_path.with_extension("h"));
+    }
+
     let mut loader = ModuleLoader::new(entry_path.parent().unwrap_or_else(|| Path::new(".")));
-    let program = match loader.load_program_from_entry(entry_arg) {
+    let program = match loader.load_program_from_entry(&entry_arg) {
         Ok(p) => p,
         Err(e) => {
             eprintln!("Error loading program: {}", e);
@@ -1746,6 +1893,121 @@ fn run_file_with_options(
     if let Err(e) = vm.call("__script", vec![]) {
         print_error_with_context(&source, filename, &e);
         process::exit(1);
+    }
+
+    if std::env::var_os("LUST_JIT_STATS").is_some() {
+        eprintln!("JIT stats: {:?}", vm.jit_stats());
+    }
+}
+
+fn run_file_zig_aot(filename: &str) {
+    let entry_path = Path::new(filename);
+    let parent = entry_path.parent().unwrap_or_else(|| Path::new("."));
+    let mut loader = ModuleLoader::new(parent);
+    let program = match loader.load_program_from_entry(filename) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("Error loading program: {}", e);
+            process::exit(1);
+        }
+    };
+
+    let mut all_items = Vec::new();
+    for module in &program.modules {
+        all_items.extend(module.items.clone());
+    }
+
+    let is_library = false;
+    let filtered_items = lust::codegen_zig::tree_shake_items(&all_items, is_library);
+
+    let runtime_opts = lust::codegen_zig::analyze_runtime_requirements(
+        &filtered_items,
+        is_library,
+        None,
+    );
+    let link_libc = runtime_opts.needs_io || runtime_opts.needs_os;
+
+    let mut codegen = lust::codegen_zig::ZigCodegen::with_options(runtime_opts);
+    let zig_source = match codegen.generate_program(&filtered_items) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("AOT Codegen error: {}", e);
+            process::exit(1);
+        }
+    };
+
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let pid = process::id();
+    let temp_dir = env::temp_dir().join(format!("lust_run_zig_{}_{}", pid, nanos));
+    if let Err(e) = fs::create_dir_all(&temp_dir) {
+        eprintln!("Failed to create temporary directory: {}", e);
+        process::exit(1);
+    }
+
+    let stem = entry_path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("script");
+    let zig_file = temp_dir.join(format!("{}.zig", stem));
+    if let Err(e) = fs::write(&zig_file, &zig_source) {
+        eprintln!("Failed to write {}: {}", zig_file.display(), e);
+        let _ = fs::remove_dir_all(&temp_dir);
+        process::exit(1);
+    }
+
+    let target_bin = temp_dir.join(if cfg!(target_os = "windows") {
+        format!("{}.exe", stem)
+    } else {
+        stem.to_string()
+    });
+
+    let opts = lust::codegen_zig::CompileOptions {
+        target_kind: lust::codegen_zig::BuildTargetKind::Executable,
+        release_mode: "ReleaseFast".to_string(),
+        emit_zig: false,
+        emit_header: None,
+        max_memory: None,
+        max_memory_bytes: None,
+        tree_shake: true,
+        strip: false,
+        target_triple: None,
+        cache_dir: None,
+    };
+
+    let compiled_bin = match lust::codegen_zig::compile_zig(&zig_file, &target_bin, &opts, link_libc) {
+        Ok(bin) => bin,
+        Err(e) => {
+            eprintln!("{}", e);
+            let _ = fs::remove_dir_all(&temp_dir);
+            process::exit(1);
+        }
+    };
+
+    let status = Command::new(&compiled_bin).status();
+    let _ = fs::remove_dir_all(&temp_dir);
+
+    match status {
+        Ok(s) => {
+            if let Some(code) = s.code() {
+                process::exit(code);
+            } else {
+                #[cfg(unix)]
+                {
+                    use std::os::unix::process::ExitStatusExt;
+                    if let Some(sig) = s.signal() {
+                        process::exit(128 + sig);
+                    }
+                }
+                process::exit(1);
+            }
+        }
+        Err(e) => {
+            eprintln!("Failed to execute compiled binary: {}", e);
+            process::exit(1);
+        }
     }
 }
 

@@ -352,21 +352,43 @@ impl Compiler {
         func_def: &crate::ast::FunctionDef,
     ) -> Result<()> {
         if self.use_mir {
-            let mut mir_fn = crate::mir::AstLowering::lower_function(func_def);
-            mir_fn.signature.name = self.functions[func_idx].name.clone();
-            match crate::mir::MirVerifier::verify_fn(&mir_fn) {
-                Ok(_) => {
-                    crate::mir::MirOptimizer::optimize_function(&mut mir_fn);
-                    let mut bytecode_fn = crate::mir::MirToBytecodeCompiler::compile(&mir_fn);
-                    bytecode_fn.is_method = self.functions[func_idx].is_method;
-                    self.functions[func_idx] = bytecode_fn;
-                    return Ok(());
+            match crate::mir::AstLowering::lower_function(func_def) {
+                Ok(mut mir_fn) => {
+                    mir_fn.signature.name = self.functions[func_idx].name.clone();
+                    match crate::mir::MirVerifier::verify_fn(&mir_fn) {
+                        Ok(_) => {
+                            crate::mir::MirOptimizer::optimize_function(&mut mir_fn);
+                            match crate::mir::MirToBytecodeCompiler::compile(&mir_fn) {
+                                Ok(mut bytecode_fn) => {
+                                    bytecode_fn.is_method = self.functions[func_idx].is_method;
+                                    self.functions[func_idx] = bytecode_fn;
+                                    return Ok(());
+                                }
+                                Err(err) => {
+                                    if self.strict_mir {
+                                        return Err(LustError::CompileError(format!(
+                                            "Strict MIR compilation failed for function '{}': {err}",
+                                            func_def.name
+                                        )));
+                                    }
+                                }
+                            }
+                        }
+                        Err(errors) => {
+                            if self.strict_mir {
+                                return Err(LustError::CompileError(format!(
+                                    "Strict MIR verification failed for function '{}': {:?}",
+                                    func_def.name, errors
+                                )));
+                            }
+                        }
+                    }
                 }
-                Err(errors) => {
+                Err(err) => {
                     if self.strict_mir {
                         return Err(LustError::CompileError(format!(
-                            "Strict MIR verification failed for function '{}': {:?}",
-                            func_def.name, errors
+                            "Strict MIR lowering failed for function '{}': {err}",
+                            func_def.name
                         )));
                     }
                 }

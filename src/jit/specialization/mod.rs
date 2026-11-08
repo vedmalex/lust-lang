@@ -9,7 +9,7 @@ use hashbrown::HashMap;
 #[derive(Debug, Clone, PartialEq)]
 pub enum SpecializedLayout {
     /// Raw scalar value on stack
-    Scalar { size: usize, align: usize },
+    Scalar { size: usize, align: usize, is_float: bool },
 
     /// Specialized vector (ptr, len, cap on stack)
     Vec {
@@ -114,14 +114,20 @@ impl SpecializationRegistry {
             TypeKind::Int => Some(SpecializedLayout::Scalar {
                 size: size_of::<LustInt>(),
                 align: align_of::<LustInt>(),
+                is_float: false,
             }),
 
             TypeKind::Float => Some(SpecializedLayout::Scalar {
                 size: size_of::<LustFloat>(),
                 align: align_of::<LustFloat>(),
+                is_float: true,
             }),
 
-            TypeKind::Bool => Some(SpecializedLayout::Scalar { size: 1, align: 1 }),
+            TypeKind::Bool => Some(SpecializedLayout::Scalar {
+                size: 1,
+                align: 1,
+                is_float: false,
+            }),
 
             // Array<T> where T is specializable
             TypeKind::Array(element_type) => {

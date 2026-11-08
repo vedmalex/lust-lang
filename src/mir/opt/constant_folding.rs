@@ -131,9 +131,32 @@ impl ConstantFolding {
                 MirBinaryOp::LtEq => Some(MirConstant::Bool(l <= r)),
                 MirBinaryOp::Gt => Some(MirConstant::Bool(l > r)),
                 MirBinaryOp::GtEq => Some(MirConstant::Bool(l >= r)),
+                MirBinaryOp::FloorDiv => {
+                    if *r != 0 {
+                        if *l == i64::MIN && *r == -1 {
+                            Some(MirConstant::Int(i64::MIN))
+                        } else {
+                            let d = l / r;
+                            let rem = l % r;
+                            let floor_d = if (rem != 0) && ((rem < 0) != (*r < 0)) { d - 1 } else { d };
+                            Some(MirConstant::Int(floor_d))
+                        }
+                    } else {
+                        None
+                    }
+                }
+                MirBinaryOp::Pow => {
+                    if *r >= 0 {
+                        Some(MirConstant::Int(wrapping_pow_i64(*l, *r as u64)))
+                    } else {
+                        None
+                    }
+                }
                 MirBinaryOp::BitAnd => Some(MirConstant::Int(l & r)),
                 MirBinaryOp::BitOr => Some(MirConstant::Int(l | r)),
                 MirBinaryOp::BitXor => Some(MirConstant::Int(l ^ r)),
+                MirBinaryOp::Shl => Some(MirConstant::Int(l.wrapping_shl((*r & 63) as u32))),
+                MirBinaryOp::Shr => Some(MirConstant::Int(l.wrapping_shr((*r & 63) as u32))),
                 _ => None,
             },
             (MirConstant::Bool(l), MirConstant::Bool(r)) => match op {
@@ -151,6 +174,7 @@ impl ConstantFolding {
         match val {
             MirConstant::Int(i) => match op {
                 MirUnaryOp::Neg => Some(MirConstant::Int(i.wrapping_neg())),
+                MirUnaryOp::BitNot => Some(MirConstant::Int(!i)),
                 _ => None,
             },
             MirConstant::Bool(b) => match op {
@@ -160,4 +184,16 @@ impl ConstantFolding {
             _ => None,
         }
     }
+}
+
+fn wrapping_pow_i64(mut base: i64, mut exp: u64) -> i64 {
+    let mut res: i64 = 1;
+    while exp > 0 {
+        if exp & 1 == 1 {
+            res = res.wrapping_mul(base);
+        }
+        base = base.wrapping_mul(base);
+        exp >>= 1;
+    }
+    res
 }

@@ -218,6 +218,14 @@ impl Parser {
                         TokenKind::MinusEqual,
                         TokenKind::StarEqual,
                         TokenKind::SlashEqual,
+                        TokenKind::PercentEqual,
+                        TokenKind::DoubleSlashEqual,
+                        TokenKind::CaretEqual,
+                        TokenKind::AmpersandEqual,
+                        TokenKind::PipeEqual,
+                        TokenKind::DoubleCaretEqual,
+                        TokenKind::DoubleLessEqual,
+                        TokenKind::DoubleGreaterEqual,
                     ]) && targets.len() == 1
                     {
                         let op = match self.tokens[self.current - 1].kind {
@@ -225,6 +233,14 @@ impl Parser {
                             TokenKind::MinusEqual => crate::ast::BinaryOp::Sub,
                             TokenKind::StarEqual => crate::ast::BinaryOp::Mul,
                             TokenKind::SlashEqual => crate::ast::BinaryOp::Div,
+                            TokenKind::PercentEqual => crate::ast::BinaryOp::Mod,
+                            TokenKind::DoubleSlashEqual => crate::ast::BinaryOp::FloorDiv,
+                            TokenKind::CaretEqual => crate::ast::BinaryOp::Pow,
+                            TokenKind::AmpersandEqual => crate::ast::BinaryOp::BitAnd,
+                            TokenKind::PipeEqual => crate::ast::BinaryOp::BitOr,
+                            TokenKind::DoubleCaretEqual => crate::ast::BinaryOp::BitXor,
+                            TokenKind::DoubleLessEqual => crate::ast::BinaryOp::Shl,
+                            TokenKind::DoubleGreaterEqual => crate::ast::BinaryOp::Shr,
                             _ => unreachable!(),
                         };
                         let value = self.parse_expr()?;

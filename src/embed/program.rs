@@ -1547,6 +1547,7 @@ impl EmbeddedProgram {
         }
     }
 
+    #[allow(dead_code)]
     pub(crate) fn validate_argument_value(
         &self,
         value: &Value,
@@ -1681,6 +1682,7 @@ impl EmbeddedProgram {
     // Bounded traversal: Depth and work budget bound recursion and traversal effort.
     // Active ancestors tracking detects cyclic containers (CYCLE status) without rejecting
     // acyclic shared aliases traversed by value.
+    #[allow(dead_code)]
     pub(crate) fn validate_return_value(
         &self,
         value: &Value,
@@ -1879,6 +1881,7 @@ impl EmbeddedProgram {
         }
     }
 
+    #[allow(dead_code)]
     pub(crate) fn call_preflight_spike(
         &mut self,
         selector: &str,
@@ -1889,6 +1892,7 @@ impl EmbeddedProgram {
         self.call_retained_target_spike(&target, args, limits)
     }
 
+    #[allow(dead_code)]
     pub(crate) fn call_retained_target_spike(
         &mut self,
         target: &PreflightTarget,
@@ -2002,6 +2006,7 @@ impl EmbeddedProgram {
     }
 }
 
+#[allow(dead_code)]
 fn function_signatures_equal(a: &FunctionSignature, b: &FunctionSignature) -> bool {
     a.params == b.params
         && a.return_type == b.return_type
@@ -2010,6 +2015,7 @@ fn function_signatures_equal(a: &FunctionSignature, b: &FunctionSignature) -> bo
         && a.trait_bounds == b.trait_bounds
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PreflightStatus {
     Call,
@@ -2047,6 +2053,7 @@ impl PreflightError {
         }
     }
 
+    #[allow(dead_code)]
     pub(crate) fn borrow(msg: impl Into<String>) -> Self {
         Self {
             status: PreflightStatus::Borrow,
@@ -2054,6 +2061,7 @@ impl PreflightError {
         }
     }
 
+    #[allow(dead_code)]
     pub(crate) fn cycle(msg: impl Into<String>) -> Self {
         Self {
             status: PreflightStatus::Cycle,
@@ -2070,6 +2078,7 @@ impl fmt::Display for PreflightError {
 
 impl std::error::Error for PreflightError {}
 
+#[allow(dead_code)]
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct PreflightLimits {
     pub(crate) max_depth: usize,
@@ -2121,6 +2130,7 @@ impl WorkBudget {
     }
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub(crate) struct PreflightTarget {
     program_id: u64,

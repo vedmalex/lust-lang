@@ -306,8 +306,20 @@ impl TypeChecker {
         let target_type = self.check_expr(target)?;
         let value_type = self.check_expr(value)?;
         let result_type = match op {
-            BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul | BinaryOp::Div => {
-                if matches!(target_type.kind, TypeKind::Int | TypeKind::Float)
+            BinaryOp::Add
+            | BinaryOp::Sub
+            | BinaryOp::Mul
+            | BinaryOp::Div
+            | BinaryOp::Mod
+            | BinaryOp::FloorDiv
+            | BinaryOp::Pow => {
+                if matches!(target_type.kind, TypeKind::Unknown)
+                    || matches!(value_type.kind, TypeKind::Unknown)
+                    || matches!(&target_type.kind, TypeKind::Named(name) if name == "LuaValue")
+                    || matches!(&value_type.kind, TypeKind::Named(name) if name == "LuaValue")
+                {
+                    Type::new(TypeKind::Unknown, value.span)
+                } else if matches!(target_type.kind, TypeKind::Int | TypeKind::Float)
                     && matches!(value_type.kind, TypeKind::Int | TypeKind::Float)
                 {
                     if matches!(target_type.kind, TypeKind::Float)
@@ -321,6 +333,29 @@ impl TypeChecker {
                     return Err(self.type_error(format!(
                         "Compound assignment {}= requires numeric types",
                         op
+                    )));
+                }
+            }
+
+            BinaryOp::BitAnd
+            | BinaryOp::BitOr
+            | BinaryOp::BitXor
+            | BinaryOp::Shl
+            | BinaryOp::Shr => {
+                if matches!(target_type.kind, TypeKind::Unknown)
+                    || matches!(value_type.kind, TypeKind::Unknown)
+                    || matches!(&target_type.kind, TypeKind::Named(name) if name == "LuaValue")
+                    || matches!(&value_type.kind, TypeKind::Named(name) if name == "LuaValue")
+                {
+                    Type::new(TypeKind::Int, value.span)
+                } else if matches!(target_type.kind, TypeKind::Int)
+                    && matches!(value_type.kind, TypeKind::Int)
+                {
+                    Type::new(TypeKind::Int, value.span)
+                } else {
+                    return Err(self.type_error(format!(
+                        "Compound assignment {}= requires integer types, got '{}' and '{}'",
+                        op, target_type, value_type
                     )));
                 }
             }
@@ -798,5 +833,79 @@ impl TypeChecker {
         }
 
         Ok(None)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{intern::Interner, lexer::Lexer, parser::Parser};
+
+    fn check(source: &str) -> crate::error::Result<()> {
+        let mut interner = Interner::new();
+        let tokens = Lexer::new(source, &mut interner).tokenize()?;
+        let mut parser = Parser::new(tokens);
+        let items = parser.parse()?;
+        let mut checker = TypeChecker::new();
+        checker.check_module(&items)
+    }
+
+    #[test]
+    fn test_math_and_bitwise_typechecking() {
+        check(
+            "local a: int = 10 // 3\n\
+             local b: float = 10.0 // 2\n\
+             local c: float = 10 // 2.0\n\
+             local d: int = -2 ^ 2\n\
+             local e: float = 2.0 ^ 3.0\n\
+             local f: int = 1 & 2\n\
+             local g: int = 1 | 2\n\
+             local h: int = 1 ^^ 2\n\
+             local i: int = 1 ~ 2\n\
+             local j: int = ~1\n\
+             local k: int = 1 << 2\n\
+             local l: int = 8 >> 2\n",
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn test_compound_assignments_typechecking() {
+        check(
+            "local x: int = 10\n\
+             x //= 2\n\
+             x %= 3\n\
+             x ^= 2\n\
+             x &= 3\n\
+             x |= 1\n\
+             x ^^= 2\n\
+             x <<= 2\n\
+             x >>= 1\n",
+        )
+        .unwrap();
+
+        check(
+            "local f: float = 10.0\n\
+             f //= 2.0\n\
+             f %= 3.0\n\
+             f ^= 2.0\n",
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn test_bitwise_rejection_on_non_ints() {
+        assert!(check("local x = 1.5 & 2\n").is_err());
+        assert!(check("local x = 1 | 2.5\n").is_err());
+        assert!(check("local x = 1.0 ^^ 2\n").is_err());
+        assert!(check("local x = 1 ~ 2.0\n").is_err());
+        assert!(check("local x = ~1.5\n").is_err());
+        assert!(check("local x = 1.0 << 2\n").is_err());
+        assert!(check("local x = 1 >> 2.0\n").is_err());
+        assert!(check("local x: float = 1.0\nx &= 2\n").is_err());
+        assert!(check("local x: float = 1.0\nx |= 2\n").is_err());
+        assert!(check("local x: float = 1.0\nx ^^= 2\n").is_err());
+        assert!(check("local x: float = 1.0\nx <<= 2\n").is_err());
+        assert!(check("local x: float = 1.0\nx >>= 2\n").is_err());
     }
 }

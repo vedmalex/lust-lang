@@ -133,6 +133,7 @@ impl Compiler {
                         self.emit(instruction, 0)
                     }
                     UnaryOp::Not => self.emit(Instruction::Not(result_reg, operand_reg), 0),
+                    UnaryOp::BitNot => self.emit(Instruction::BitNot(result_reg, operand_reg), 0),
                 };
                 self.free_register(operand_reg);
                 Ok(result_reg)
@@ -832,6 +833,8 @@ impl Compiler {
             BinaryOp::Mul => Instruction::Mul(dest, left, right),
             BinaryOp::Div => Instruction::Div(dest, left, right),
             BinaryOp::Mod => Instruction::Mod(dest, left, right),
+            BinaryOp::Pow => Instruction::Pow(dest, left, right),
+            BinaryOp::FloorDiv => Instruction::FloorDiv(dest, left, right),
             BinaryOp::Eq => Instruction::Eq(dest, left, right),
             BinaryOp::Ne => Instruction::Ne(dest, left, right),
             BinaryOp::Lt => Instruction::Lt(dest, left, right),
@@ -840,6 +843,11 @@ impl Compiler {
             BinaryOp::Ge => Instruction::Ge(dest, left, right),
             BinaryOp::And => Instruction::And(dest, left, right),
             BinaryOp::Or => Instruction::Or(dest, left, right),
+            BinaryOp::BitAnd => Instruction::BitAnd(dest, left, right),
+            BinaryOp::BitOr => Instruction::BitOr(dest, left, right),
+            BinaryOp::BitXor => Instruction::BitXor(dest, left, right),
+            BinaryOp::Shl => Instruction::Shl(dest, left, right),
+            BinaryOp::Shr => Instruction::Shr(dest, left, right),
             BinaryOp::Concat => Instruction::Concat(dest, left, right),
             _ => {
                 return Err(LustError::CompileError(format!(

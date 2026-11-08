@@ -203,6 +203,8 @@ struct Env {
     layouts: HashMap<Register, (Rc<StructLayout>, bool)>,
     /// Registers holding an array whose elements are of a scalar type.
     elements: HashMap<Register, ValueType>,
+    /// Register aliases created by Move: register was moved from source register.
+    aliases: HashMap<Register, Register>,
     /// Registers holding a snapshot of a global native function taken under
     /// the globals guard. Mutable containers (like Map) are never stored here
     /// because in-place mutation does not change globals_version.
@@ -216,6 +218,7 @@ struct Env {
 fn same_constant(a: &Value, b: &Value) -> bool {
     match (a, b) {
         (Value::NativeFunction(x), Value::NativeFunction(y)) => Rc::ptr_eq(x, y),
+        (Value::Map(x), Value::Map(y)) => Rc::ptr_eq(x, y),
         _ => false,
     }
 }
@@ -236,6 +239,7 @@ impl Env {
         self.constants.remove(&reg);
         self.natives_guarded.remove(&reg);
         self.borrows.remove(&reg);
+        self.aliases.retain(|k, v| *k != reg && *v != reg);
     }
 
     /// Facts both environments agree on.
@@ -271,6 +275,12 @@ impl Env {
                 .iter()
                 .filter(|(reg, ty)| other.elements.get(*reg) == Some(*ty))
                 .map(|(reg, ty)| (*reg, *ty))
+                .collect(),
+            aliases: self
+                .aliases
+                .iter()
+                .filter(|(reg, target)| other.aliases.get(*reg) == Some(*target))
+                .map(|(reg, target)| (*reg, *target))
                 .collect(),
             constants: self
                 .constants
@@ -309,6 +319,7 @@ impl Env {
                     .is_some_and(|(o, g)| Rc::ptr_eq(layout, o) && guarded == g)
             })
             && self.elements == other.elements
+            && self.aliases == other.aliases
             && self.constants.len() == other.constants.len()
             && self.constants.iter().all(|(reg, value)| {
                 other
@@ -331,7 +342,9 @@ impl Env {
         let constant = self.constants.get(&from).cloned();
         let native_guarded = self.natives_guarded.contains(&from);
         let borrowed = self.borrows.contains(&from);
+        let root = self.aliases.get(&from).copied().unwrap_or(from);
         self.write(to, scalar);
+        self.aliases.insert(to, root);
         if borrowed {
             self.borrows.insert(to);
         }
@@ -351,6 +364,9 @@ impl Env {
             self.natives_guarded.insert(to);
         }
         self.write(from, previous.scalars.get(&from).copied());
+        if let Some(target) = previous.aliases.get(&from) {
+            self.aliases.insert(from, *target);
+        }
         if let Some(idx) = previous.functions.get(&from) {
             self.functions.insert(from, *idx);
         }
@@ -803,13 +819,22 @@ impl<'a> Translator<'a> {
                 {
                     return Some(());
                 }
-                self.ops.push(TraceOp::LoadConst { dest, value });
+                self.ops.push(TraceOp::LoadConst {
+                    dest,
+                    value: value.clone(),
+                });
                 // A function index or Nil is plain: nothing to drop when
                 // the register is written again.
                 self.env
                     .write(dest, ty.or(plain.then_some(ValueType::Plain)));
-                if let Some(idx) = function {
-                    self.env.functions.insert(dest, idx);
+                match &value {
+                    Value::Function(idx) => {
+                        self.env.functions.insert(dest, *idx);
+                    }
+                    Value::NativeFunction(_) | Value::Map(_) => {
+                        self.env.constants.insert(dest, value.clone());
+                    }
+                    _ => {}
                 }
             }
             Instruction::LoadGlobal(dest, name_idx) => {
@@ -831,11 +856,16 @@ impl<'a> Translator<'a> {
                     Value::Function(idx) => {
                         self.env.functions.insert(dest, *idx);
                     }
-                    Value::NativeFunction(_) => {
+                    Value::NativeFunction(_) | Value::Map(_) => {
                         self.env.constants.insert(dest, value);
                     }
                     _ => {}
                 }
+            }
+            Instruction::StoreGlobal(name_idx, src) => {
+                let name = self.constant_string(name_idx)?;
+                self.ops.push(TraceOp::StoreGlobal { name, src });
+                self.env.globals_guarded = false;
             }
             Instruction::Move(dest, src) => {
                 // A temporary moved into a local right after being
@@ -874,6 +904,9 @@ impl<'a> Translator<'a> {
                         self.frame_may_own = true;
                     }
                     self.env.move_facts(src, dest, &previous);
+                    if let Some(kind) = self.function.register_types.get(&dest).cloned() {
+                        self.note_type(dest, &kind);
+                    }
                     return Some(());
                 }
                 let ty = self.env.scalars.get(&src).copied();
@@ -890,6 +923,8 @@ impl<'a> Translator<'a> {
                     ty
                 };
                 self.write(dest, ty);
+                let root = self.env.aliases.get(&src).copied().unwrap_or(src);
+                self.env.aliases.insert(dest, root);
                 if let Some(idx) = function {
                     self.env.functions.insert(dest, idx);
                 }
@@ -904,6 +939,9 @@ impl<'a> Translator<'a> {
                 }
                 if native_guarded {
                     self.env.natives_guarded.insert(dest);
+                }
+                if let Some(kind) = self.function.register_types.get(&dest).cloned() {
+                    self.note_type(dest, &kind);
                 }
             }
             Instruction::Not(dest, src) => {
@@ -962,24 +1000,19 @@ impl<'a> Translator<'a> {
                     // A native from a global (or a module table): its
                     // identity is guarded, since the table is mutable.
                     let traced = TracedNativeFn::new(Rc::clone(native));
-                    if !self.env.natives_guarded.contains(&callee) {
-                        self.ops.push(TraceOp::GuardNativeFunction {
-                            register: callee,
-                            function: traced.clone(),
-                        });
-                        self.env.natives_guarded.insert(callee);
-                    }
                     let intrinsic = self
                         .ctx
                         .intrinsics
                         .get(&(Rc::as_ptr(native) as *const () as usize))
                         .copied();
                     if intrinsic == Some(super::Intrinsic::ArrayLen) && arg_count == 1 {
-                        // `array.len(a)`, with the native's identity guarded
-                        // above: the length read inline.
+                        // `array.len(a)`: the length read inline.
+                        self.prune_inlined_method_lookup(callee);
+                        let root = self.env.aliases.get(&first_arg).copied().unwrap_or(first_arg);
+                        self.prune_inlined_argument_move(ip, first_arg, root);
                         self.ops.push(TraceOp::ArrayLen {
                             dest,
-                            array: first_arg,
+                            array: root,
                         });
                         self.write(dest, Some(ValueType::Int));
                         return Some(());
@@ -987,13 +1020,30 @@ impl<'a> Translator<'a> {
                     if intrinsic == Some(super::Intrinsic::ArrayPush) && arg_count == 2 {
                         // `array.push(a, v)`: the array's type is checked by
                         // the op (anything else fails to the interpreter).
+                        self.prune_inlined_method_lookup(callee);
+                        let root = self.env.aliases.get(&first_arg).copied().unwrap_or(first_arg);
+                        self.prune_inlined_argument_move(ip, first_arg, root);
                         self.ops.push(TraceOp::ArrayPush {
                             dest,
-                            array: first_arg,
+                            array: root,
                             value: first_arg + 1,
                         });
                         self.write(dest, Some(ValueType::Plain));
+                        if let Some(val_ty) = self.env.scalars.get(&(first_arg + 1)).copied() {
+                            if val_ty != ValueType::Plain {
+                                let root = self.env.aliases.get(&first_arg).copied().unwrap_or(first_arg);
+                                self.env.elements.insert(first_arg, val_ty);
+                                self.env.elements.insert(root, val_ty);
+                            }
+                        }
                         return Some(());
+                    }
+                    if !self.env.natives_guarded.contains(&callee) {
+                        self.ops.push(TraceOp::GuardNativeFunction {
+                            register: callee,
+                            function: traced.clone(),
+                        });
+                        self.env.natives_guarded.insert(callee);
                     }
                     self.ops.push(TraceOp::CallNative {
                         dest,
@@ -1086,12 +1136,32 @@ impl<'a> Translator<'a> {
                         self.ops.push(TraceOp::GetField {
                             dest,
                             object,
-                            field_name,
+                            field_name: field_name.clone(),
                             field_index: None,
                             value_type: None,
                             is_weak: false,
                         });
                         self.write(dest, None);
+                        let found_val = if let Some(Value::Map(map)) = self.env.constants.get(&object) {
+                            let key = crate::bytecode::ValueKey::from(field_name.as_str());
+                            map.borrow().get(&key).cloned()
+                        } else {
+                            None
+                        };
+                        if let Some(val) = found_val {
+                            match &val {
+                                Value::Function(idx) => {
+                                    self.env.functions.insert(dest, *idx);
+                                }
+                                Value::NativeFunction(native) => {
+                                    let ptr = Rc::as_ptr(native) as *const () as usize;
+                                    if self.ctx.intrinsics.contains_key(&ptr) {
+                                        self.env.constants.insert(dest, val);
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
                     }
                 }
             }
@@ -1120,7 +1190,17 @@ impl<'a> Translator<'a> {
             }
             Instruction::SetIndex(array, index, value) => {
                 self.guard(index, ValueType::Int);
-                let element_type = self.env.elements.get(&array).copied();
+                let mut element_type = self.env.elements.get(&array).copied();
+                if element_type.is_none() {
+                    if let Some(val_ty) = self.env.scalars.get(&value).copied() {
+                        if val_ty != ValueType::Plain {
+                            element_type = Some(val_ty);
+                            let root = self.env.aliases.get(&array).copied().unwrap_or(array);
+                            self.env.elements.insert(array, val_ty);
+                            self.env.elements.insert(root, val_ty);
+                        }
+                    }
+                }
                 self.ops.push(TraceOp::SetIndex {
                     array,
                     index,
@@ -1190,6 +1270,19 @@ impl<'a> Translator<'a> {
                     src: dest,
                 });
                 self.write(binding, value_type);
+            }
+            Instruction::ArrayIndexOk(value_dest, condition_dest, array, index) => {
+                self.guard(index, ValueType::Int);
+                let value_type = self.env.elements.get(&array).copied();
+                self.ops.push(TraceOp::ArrayIndexOk {
+                    value_dest,
+                    condition_dest,
+                    array,
+                    index,
+                    value_type,
+                });
+                self.write(value_dest, value_type);
+                self.write(condition_dest, Some(ValueType::Bool));
             }
             Instruction::NewArray(dest, first_element, count) => {
                 self.ops.push(TraceOp::NewArray {
@@ -1356,6 +1449,76 @@ impl<'a> Translator<'a> {
         }
         Some(())
     }
+
+    fn prune_inlined_method_lookup(&mut self, callee: Register) {
+        let mut removed_callee = false;
+        let mut object_reg = None;
+        let mut i = self.ops.len();
+        while i > 0 {
+            i -= 1;
+            match &self.ops[i] {
+                TraceOp::At { .. } => continue,
+                TraceOp::GetField { dest, object, .. } if *dest == callee => {
+                    object_reg = Some(*object);
+                    self.ops.remove(i);
+                    removed_callee = true;
+                    break;
+                }
+                _ => break,
+            }
+        }
+        if removed_callee {
+            if let Some(obj) = object_reg {
+                let mut j = self.ops.len();
+                while j > 0 {
+                    j -= 1;
+                    match &self.ops[j] {
+                        TraceOp::At { .. } => continue,
+                        TraceOp::LoadConst { dest, .. } if *dest == obj => {
+                            self.ops.remove(j);
+                            let mut k = j;
+                            while k > 0 {
+                                k -= 1;
+                                match &self.ops[k] {
+                                    TraceOp::At { .. } => continue,
+                                    TraceOp::GuardGlobals { .. } => {
+                                        self.ops.remove(k);
+                                        break;
+                                    }
+                                    _ => break,
+                                }
+                            }
+                            break;
+                        }
+                        _ => break,
+                    }
+                }
+            }
+        }
+    }
+
+    fn prune_inlined_argument_move(&mut self, ip: usize, arg: Register, root: Register) {
+        if arg == root || !super::trace::register_dead_after(self.function, ip + 1, arg) {
+            return;
+        }
+        let mut i = self.ops.len();
+        while i > 0 {
+            i -= 1;
+            match &self.ops[i] {
+                TraceOp::At { .. } => continue,
+                TraceOp::Move { dest, src } if *dest == arg && *src == root => {
+                    self.ops.remove(i);
+                    self.env.aliases.remove(&arg);
+                    self.owned_written.remove(&arg);
+                    break;
+                }
+                TraceOp::Move { dest, .. } | TraceOp::LoadConst { dest, .. } if *dest != arg => {
+                    continue;
+                }
+                _ => break,
+            }
+        }
+    }
 }
 
 /// The environment a function starts with: its parameters' declared
@@ -1451,6 +1614,13 @@ fn translate_pass(
         borrow_returned: HashSet::new(),
     };
     let mut label_envs: HashMap<usize, Env> = HashMap::new();
+    let accesses_globals = instructions.iter().any(|ins| matches!(ins, Instruction::LoadGlobal(..)));
+    if accesses_globals {
+        t.ops.push(TraceOp::GuardGlobals {
+            version: ctx.globals_version,
+        });
+        t.env.globals_guarded = true;
+    }
     let mut ip = 0;
     while ip < instructions.len() {
         if targets.contains(&ip) {

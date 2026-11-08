@@ -11,6 +11,46 @@ pub(super) enum ArgCheck {
     /// Kinds only; the typechecker proved the rest (bytecode calls).
     Shallow,
 }
+
+#[inline]
+fn wrapping_pow_i64(mut base: i64, mut exp: u64) -> i64 {
+    let mut acc: i64 = 1;
+    while exp > 0 {
+        if (exp & 1) == 1 {
+            acc = acc.wrapping_mul(base);
+        }
+        base = base.wrapping_mul(base);
+        exp >>= 1;
+    }
+    acc
+}
+
+#[inline]
+fn int_pow(a: i64, b: i64) -> Result<Value> {
+    if b < 0 {
+        return Err(LustError::RuntimeError {
+            message: "Negative exponent in integer power; cast base to float first".to_string(),
+        });
+    }
+    Ok(Value::Int(wrapping_pow_i64(a, b as u64)))
+}
+
+#[inline]
+fn floor_div_i64(a: i64, b: i64) -> Result<i64> {
+    if b == 0 {
+        return Err(LustError::RuntimeError {
+            message: "Division by zero".to_string(),
+        });
+    }
+    if a == i64::MIN && b == -1 {
+        return Ok(i64::MIN);
+    }
+    let d = a / b;
+    let r = a % b;
+    let floor_d = if (r != 0) && ((r < 0) != (b < 0)) { d - 1 } else { d };
+    Ok(floor_d)
+}
+
 impl VM {
     fn is_loop_in_hierarchy(
         &self,
@@ -99,11 +139,13 @@ impl VM {
         // Specialize the dispatch loop once rather than testing it around every
         // instruction; the interpreter-only copy has no trace bookkeeping or JIT backedges.
         // When a memory budget is active, effective execution is the interpreter.
-        if self.effective_jit_enabled() {
+        let result = if self.effective_jit_enabled() {
             self.run_inner::<true>()
         } else {
             self.run_inner::<false>()
-        }
+        };
+        crate::bytecode::value::sync_all_specialized_arrays();
+        result
     }
 
     fn run_inner<const JIT_ENABLED: bool>(&mut self) -> Result<Value> {
@@ -580,6 +622,12 @@ impl VM {
                         }
                     })?;
                 }
+                Instruction::PowInt(dest, lhs, rhs) => {
+                    self.int_binary_op(dest, lhs, rhs, |a, b| int_pow(a, b))?;
+                }
+                Instruction::FloorDivInt(dest, lhs, rhs) => {
+                    self.int_binary_op(dest, lhs, rhs, |a, b| floor_div_i64(a, b).map(Value::Int))?;
+                }
                 Instruction::NegInt(dest, src) => {
                     self.int_binary_op(dest, src, src, |a, _| Ok(Value::Int(a.wrapping_neg())))?;
                 }
@@ -621,6 +669,20 @@ impl VM {
                             })
                         } else {
                             Ok(Value::Float(a % b))
+                        }
+                    })?;
+                }
+                Instruction::PowFloat(dest, lhs, rhs) => {
+                    self.float_binary_op(dest, lhs, rhs, |a, b| Ok(Value::Float(a.powf(b))))?;
+                }
+                Instruction::FloorDivFloat(dest, lhs, rhs) => {
+                    self.float_binary_op(dest, lhs, rhs, |a, b| {
+                        if b == 0.0 {
+                            Err(LustError::RuntimeError {
+                                message: "Division by zero".to_string(),
+                            })
+                        } else {
+                            Ok(Value::Float((a / b).floor()))
                         }
                     })?;
                 }
@@ -767,6 +829,58 @@ impl VM {
                     })?;
                 }
 
+                Instruction::Pow(dest, lhs, rhs) => {
+                    self.binary_op(dest, lhs, rhs, |l, r| match (l, r) {
+                        (Value::Int(a), Value::Int(b)) => int_pow(*a, *b),
+                        (Value::Float(a), Value::Float(b)) => Ok(Value::Float(a.powf(*b))),
+                        (Value::Int(a), Value::Float(b)) => {
+                            Ok(Value::Float(float_from_int(*a).powf(*b)))
+                        }
+                        (Value::Float(a), Value::Int(b)) => {
+                            Ok(Value::Float(a.powf(float_from_int(*b))))
+                        }
+                        _ => Err(LustError::RuntimeError {
+                            message: format!("Cannot raise {:?} to power {:?}", l, r),
+                        }),
+                    })?;
+                }
+
+                Instruction::FloorDiv(dest, lhs, rhs) => {
+                    self.binary_op(dest, lhs, rhs, |l, r| match (l, r) {
+                        (Value::Int(a), Value::Int(b)) => floor_div_i64(*a, *b).map(Value::Int),
+                        (Value::Float(a), Value::Float(b)) => {
+                            if *b == 0.0 {
+                                Err(LustError::RuntimeError {
+                                    message: "Division by zero".to_string(),
+                                })
+                            } else {
+                                Ok(Value::Float((a / b).floor()))
+                            }
+                        }
+                        (Value::Int(a), Value::Float(b)) => {
+                            if *b == 0.0 {
+                                Err(LustError::RuntimeError {
+                                    message: "Division by zero".to_string(),
+                                })
+                            } else {
+                                Ok(Value::Float((float_from_int(*a) / b).floor()))
+                            }
+                        }
+                        (Value::Float(a), Value::Int(b)) => {
+                            if *b == 0 {
+                                Err(LustError::RuntimeError {
+                                    message: "Division by zero".to_string(),
+                                })
+                            } else {
+                                Ok(Value::Float((a / float_from_int(*b)).floor()))
+                            }
+                        }
+                        _ => Err(LustError::RuntimeError {
+                            message: format!("Cannot floor divide {:?} and {:?}", l, r),
+                        }),
+                    })?;
+                }
+
                 Instruction::Neg(dest, src) => {
                     let value = self.get_register(src)?;
                     let result = match value {
@@ -826,6 +940,39 @@ impl VM {
                 Instruction::Not(dest, src) => {
                     let value = self.get_register(src)?;
                     self.set_register(dest, Value::Bool(!value.is_truthy()))?;
+                }
+
+                Instruction::BitAnd(dest, lhs, rhs) => {
+                    self.int_binary_op(dest, lhs, rhs, |a, b| Ok(Value::Int(a & b)))?;
+                }
+                Instruction::BitOr(dest, lhs, rhs) => {
+                    self.int_binary_op(dest, lhs, rhs, |a, b| Ok(Value::Int(a | b)))?;
+                }
+                Instruction::BitXor(dest, lhs, rhs) => {
+                    self.int_binary_op(dest, lhs, rhs, |a, b| Ok(Value::Int(a ^ b)))?;
+                }
+                Instruction::Shl(dest, lhs, rhs) => {
+                    self.int_binary_op(dest, lhs, rhs, |a, b| {
+                        Ok(Value::Int(a.wrapping_shl((b & 63) as u32)))
+                    })?;
+                }
+                Instruction::Shr(dest, lhs, rhs) => {
+                    self.int_binary_op(dest, lhs, rhs, |a, b| {
+                        Ok(Value::Int(a.wrapping_shr((b & 63) as u32)))
+                    })?;
+                }
+                Instruction::BitNot(dest, src) => {
+                    let value = self.get_register(src)?;
+                    match value {
+                        Value::Int(a) => {
+                            self.set_register(dest, Value::Int(!a))?;
+                        }
+                        _ => {
+                            return Err(LustError::RuntimeError {
+                                message: format!("Cannot perform bitwise NOT on {:?}", value),
+                            });
+                        }
+                    }
                 }
 
                 Instruction::Jump(offset) => {
@@ -1379,18 +1526,22 @@ impl VM {
                                     index.as_int().ok_or_else(|| LustError::RuntimeError {
                                         message: "Array index must be an integer".to_string(),
                                     })?;
-                                let borrowed = arr.borrow();
-                                if idx < 0 || idx as usize >= borrowed.len() {
-                                    return Err(LustError::RuntimeError {
-                                        message: format!(
-                                            "Array index {} out of bounds (length: {})",
-                                            idx,
-                                            borrowed.len()
-                                        ),
-                                    });
-                                }
+                                if let Some(val) = crate::bytecode::value::get_specialized_cached_element(&arr, idx) {
+                                    val
+                                } else {
+                                    let borrowed = arr.borrow();
+                                    if idx < 0 || idx as usize >= borrowed.len() {
+                                        return Err(LustError::RuntimeError {
+                                            message: format!(
+                                                "Array index {} out of bounds (length: {})",
+                                                idx,
+                                                borrowed.len()
+                                            ),
+                                        });
+                                    }
 
-                                borrowed[idx as usize].clone()
+                                    borrowed[idx as usize].clone()
+                                }
                             }
 
                             Value::Map(map) => {
@@ -1444,12 +1595,57 @@ impl VM {
                     self.set_register(dest, result)?;
                 }
 
+                Instruction::ArrayIndexOk(val_dest, cond_dest, array_reg, idx_reg) => {
+                    let collection = self.get_register(array_reg)?.clone();
+                    let index = self.get_register(idx_reg)?.clone();
+                    if let Value::Array(arr) = &collection {
+                        let idx = index.as_int().ok_or_else(|| LustError::RuntimeError {
+                            message: "Array index must be an integer".to_string(),
+                        })?;
+                        if let Some(val) = crate::bytecode::value::get_specialized_cached_element(arr, idx) {
+                            self.set_register(val_dest, val)?;
+                            self.set_register(cond_dest, Value::Bool(true))?;
+                        } else if let Some(len) = crate::bytecode::value::get_specialized_cached_len(arr) {
+                            if idx >= 0 && (idx as usize) < len {
+                                let borrowed = arr.borrow();
+                                if (idx as usize) < borrowed.len() {
+                                    let val = borrowed[idx as usize].clone();
+                                    drop(borrowed);
+                                    self.set_register(val_dest, val)?;
+                                    self.set_register(cond_dest, Value::Bool(true))?;
+                                } else {
+                                    drop(borrowed);
+                                    self.set_register(cond_dest, Value::Bool(false))?;
+                                }
+                            } else {
+                                self.set_register(cond_dest, Value::Bool(false))?;
+                            }
+                        } else {
+                            let borrowed = arr.borrow();
+                            if idx >= 0 && (idx as usize) < borrowed.len() {
+                                let val = borrowed[idx as usize].clone();
+                                drop(borrowed);
+                                self.set_register(val_dest, val)?;
+                                self.set_register(cond_dest, Value::Bool(true))?;
+                            } else {
+                                drop(borrowed);
+                                self.set_register(cond_dest, Value::Bool(false))?;
+                            }
+                        }
+                    } else {
+                        return Err(LustError::RuntimeError {
+                            message: format!("Cannot index {:?}", collection.type_of()),
+                        });
+                    }
+                }
+
                 Instruction::ArrayLen(dest, array_reg) => {
                     let collection = self.get_register(array_reg)?;
                     match collection {
                         Value::Array(arr) => {
-                            let len = int_from_usize(arr.borrow().len());
-                            self.set_register(dest, Value::Int(len))?;
+                            let len = crate::bytecode::value::get_specialized_cached_len(arr)
+                                .unwrap_or_else(|| arr.borrow().len());
+                            self.set_register(dest, Value::Int(int_from_usize(len)))?;
                         }
 
                         _ => {
@@ -1677,18 +1873,25 @@ impl VM {
                                     index.as_int().ok_or_else(|| LustError::RuntimeError {
                                         message: "Array index must be an integer".to_string(),
                                     })?;
-                                let mut borrowed = arr.borrow_mut();
-                                if idx < 0 || idx as usize >= borrowed.len() {
-                                    return Err(LustError::RuntimeError {
-                                        message: format!(
-                                            "Array index {} out of bounds (length: {})",
-                                            idx,
-                                            borrowed.len()
-                                        ),
-                                    });
-                                }
+                                if let Some(res) = crate::bytecode::value::set_specialized_cached_element(&arr, idx, &value) {
+                                    res.map_err(|message| LustError::RuntimeError { message })?;
+                                } else {
+                                    let mut borrowed = arr.borrow_mut();
+                                    if idx < 0 || idx as usize >= borrowed.len() {
+                                        return Err(LustError::RuntimeError {
+                                            message: format!(
+                                                "Array index {} out of bounds (length: {})",
+                                                idx,
+                                                borrowed.len()
+                                            ),
+                                        });
+                                    }
 
-                                borrowed[idx as usize] = value;
+                                    borrowed[idx as usize] = value;
+                                    crate::bytecode::value::invalidate_specialized_array_cache(
+                                        arr.as_ptr() as usize,
+                                    );
+                                }
                             }
 
                             Value::Map(map) => {
@@ -1877,20 +2080,8 @@ impl VM {
     pub(crate) fn value_is_type(&self, value: &Value, type_name: &str) -> bool {
         // Lua compatibility intentionally treats LuaValue as a dynamic carrier. Transpiled
         // values may still be represented by their underlying VM value at call boundaries.
-        if type_name == "LuaValue" {
+        if type_name == "LuaValue" || type_name == "unknown" {
             return true;
-        }
-
-        if type_name
-            .split('|')
-            .map(str::trim)
-            .any(|member| member != type_name && self.value_is_type(value, member))
-        {
-            return true;
-        }
-
-        if let Some(matches) = self.match_function_type(value, type_name) {
-            return matches;
         }
 
         let value_type_name = match value {
@@ -1914,6 +2105,15 @@ impl VM {
             Value::Task(_) => "Task",
         };
         if value_type_name == type_name || (matches!(value, Value::Nil) && type_name == "()") {
+            return true;
+        }
+
+        if type_name.contains('|')
+            && type_name
+                .split('|')
+                .map(str::trim)
+                .any(|member| member != type_name && self.value_is_type(value, member))
+        {
             return true;
         }
 
@@ -1941,14 +2141,15 @@ impl VM {
             return true;
         }
 
-        if type_name == "unknown" {
-            return true;
+        if let Some(matches) = self.match_function_type(value, type_name) {
+            return matches;
         }
 
-        if self
-            .trait_impls
-            .get(&(value_type_name.to_string(), type_name.to_string()))
-            .is_some()
+        if !self.trait_impls.is_empty()
+            && self
+                .trait_impls
+                .get(&(value_type_name.to_string(), type_name.to_string()))
+                .is_some()
         {
             return true;
         }
@@ -2272,7 +2473,14 @@ impl VM {
         });
         match JitCompiler::new()
             .with_gas_checks(self.gas_checked())
-            .compile_function(&trace, trace_id, register_count, entry_table, result_type)
+            .compile_function(
+                &trace,
+                trace_id,
+                register_count,
+                entry_table,
+                result_type,
+                Vec::new(),
+            )
         {
             Ok(code) => {
                 crate::jit::log(|| format!("✅ JIT: function {} compiled", func_idx));
@@ -2358,7 +2566,6 @@ impl VM {
                 self.recycle_frame(frame);
                 return Err(LustError::RuntimeError { message });
             }
-            self.cycle_collector.register_graph(value);
             frame.registers[index] = value.fast_clone();
         }
         let recursive = self
@@ -2446,7 +2653,7 @@ impl VM {
         self.jit.record_function_call(recursive);
         frame.upvalues.clear();
         for (index, arg) in args.iter().enumerate() {
-            self.observe_value_graph(arg);
+            self.observe_value(arg);
             frame.registers[index] = arg.fast_clone();
         }
         Ok(frame)
@@ -2523,7 +2730,7 @@ impl VM {
         self.jit.record_function_call(recursive);
         frame.upvalues = upvalues;
         for (index, arg) in args.drain(..).enumerate() {
-            self.observe_value_graph(&arg);
+            self.observe_value(&arg);
             frame.registers[index] = arg;
         }
         // Keep the (now empty) argument buffer so the next call allocates
@@ -2929,7 +3136,7 @@ impl VM {
                 let saved_pending_task_signal = self.pending_task_signal.clone();
                 let saved_last_task_signal = self.last_task_signal.clone();
 
-                let frame = self.make_call_frame(*func_idx, None, args, Vec::new())?;
+                let frame = self.make_checked_call_frame(*func_idx, None, args, Vec::new())?;
 
                 let stack_depth_before = self.call_stack.len();
                 self.call_stack.push(frame);
@@ -2974,7 +3181,7 @@ impl VM {
                 let saved_last_task_signal = self.last_task_signal.clone();
 
                 let upvalue_values: Vec<Value> = upvalues.iter().map(|uv| uv.get()).collect();
-                let frame = self.make_call_frame(*func_idx, None, args, upvalue_values)?;
+                let frame = self.make_checked_call_frame(*func_idx, None, args, upvalue_values)?;
 
                 let stack_depth_before = self.call_stack.len();
                 self.call_stack.push(frame);

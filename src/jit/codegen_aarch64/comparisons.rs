@@ -9,6 +9,16 @@ pub(super) enum Compare {
     Float(u8, u8),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CmpOp {
+    Lt,
+    Le,
+    Gt,
+    Ge,
+    Eq,
+    Ne,
+}
+
 impl JitCompiler {
     /// Place comparison operands: pinned registers are used in place, others
     /// load into x0/x10 (ints) or d0/d1 (floats, ints converted).
@@ -186,5 +196,166 @@ impl JitCompiler {
         rhs_type: ValueType,
     ) -> Result<()> {
         self.compile_equality(dest, lhs, rhs, lhs_type, rhs_type, false)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn compile_comparison_branch(
+        &mut self,
+        _dest: u8,
+        lhs: u8,
+        rhs: u8,
+        lhs_type: ValueType,
+        rhs_type: ValueType,
+        op: CmpOp,
+        expect_truthy: bool,
+        label: usize,
+        dead_dest: bool,
+    ) -> Result<bool> {
+        if !dead_dest {
+            return Ok(false);
+        }
+
+        let target = self.function_label(label);
+        self.emit_back_edge_gas_check(label);
+
+        match op {
+            CmpOp::Lt => {
+                let cmp = self.compare_operands(lhs, rhs, lhs_type, rhs_type);
+                self.emit_compare(cmp);
+                match cmp {
+                    Compare::Float(..) => {
+                        if expect_truthy {
+                            dynasm!(self.ops ; .arch aarch64 ; b.mi => target);
+                        } else {
+                            dynasm!(self.ops ; .arch aarch64 ; b.pl => target);
+                        }
+                    }
+                    Compare::Int(..) => {
+                        if expect_truthy {
+                            dynasm!(self.ops ; .arch aarch64 ; b.lt => target);
+                        } else {
+                            dynasm!(self.ops ; .arch aarch64 ; b.ge => target);
+                        }
+                    }
+                }
+            }
+            CmpOp::Le => {
+                let cmp = self.compare_operands(lhs, rhs, lhs_type, rhs_type);
+                self.emit_compare(cmp);
+                match cmp {
+                    Compare::Float(..) => {
+                        if expect_truthy {
+                            dynasm!(self.ops ; .arch aarch64 ; b.ls => target);
+                        } else {
+                            dynasm!(self.ops ; .arch aarch64 ; b.hi => target);
+                        }
+                    }
+                    Compare::Int(..) => {
+                        if expect_truthy {
+                            dynasm!(self.ops ; .arch aarch64 ; b.le => target);
+                        } else {
+                            dynasm!(self.ops ; .arch aarch64 ; b.gt => target);
+                        }
+                    }
+                }
+            }
+            CmpOp::Gt => {
+                let cmp = self.compare_operands(lhs, rhs, lhs_type, rhs_type);
+                self.emit_compare(cmp);
+                match cmp {
+                    Compare::Float(..) => {
+                        if expect_truthy {
+                            dynasm!(self.ops ; .arch aarch64 ; b.gt => target);
+                        } else {
+                            dynasm!(self.ops ; .arch aarch64 ; b.le => target);
+                        }
+                    }
+                    Compare::Int(..) => {
+                        if expect_truthy {
+                            dynasm!(self.ops ; .arch aarch64 ; b.gt => target);
+                        } else {
+                            dynasm!(self.ops ; .arch aarch64 ; b.le => target);
+                        }
+                    }
+                }
+            }
+            CmpOp::Ge => {
+                let cmp = self.compare_operands(lhs, rhs, lhs_type, rhs_type);
+                self.emit_compare(cmp);
+                match cmp {
+                    Compare::Float(..) => {
+                        if expect_truthy {
+                            dynasm!(self.ops ; .arch aarch64 ; b.ge => target);
+                        } else {
+                            dynasm!(self.ops ; .arch aarch64 ; b.lt => target);
+                        }
+                    }
+                    Compare::Int(..) => {
+                        if expect_truthy {
+                            dynasm!(self.ops ; .arch aarch64 ; b.ge => target);
+                        } else {
+                            dynasm!(self.ops ; .arch aarch64 ; b.lt => target);
+                        }
+                    }
+                }
+            }
+            CmpOp::Eq => {
+                if lhs_type != rhs_type {
+                    if !expect_truthy {
+                        dynasm!(self.ops ; .arch aarch64 ; b => target);
+                    }
+                    return Ok(true);
+                }
+                match lhs_type {
+                    ValueType::Float => {
+                        let cmp = self.compare_operands(lhs, rhs, lhs_type, rhs_type);
+                        self.emit_compare(cmp);
+                    }
+                    ValueType::Bool => {
+                        self.load_bool_payload(0, lhs);
+                        self.load_bool_payload(10, rhs);
+                        dynasm!(self.ops ; .arch aarch64 ; cmp w0, w10);
+                    }
+                    _ => {
+                        let (a, b) = self.operand_pair_x(lhs, rhs, 0, 10);
+                        dynasm!(self.ops ; .arch aarch64 ; cmp X(a), X(b));
+                    }
+                }
+                if expect_truthy {
+                    dynasm!(self.ops ; .arch aarch64 ; b.eq => target);
+                } else {
+                    dynasm!(self.ops ; .arch aarch64 ; b.ne => target);
+                }
+            }
+            CmpOp::Ne => {
+                if lhs_type != rhs_type {
+                    if expect_truthy {
+                        dynasm!(self.ops ; .arch aarch64 ; b => target);
+                    }
+                    return Ok(true);
+                }
+                match lhs_type {
+                    ValueType::Float => {
+                        let cmp = self.compare_operands(lhs, rhs, lhs_type, rhs_type);
+                        self.emit_compare(cmp);
+                    }
+                    ValueType::Bool => {
+                        self.load_bool_payload(0, lhs);
+                        self.load_bool_payload(10, rhs);
+                        dynasm!(self.ops ; .arch aarch64 ; cmp w0, w10);
+                    }
+                    _ => {
+                        let (a, b) = self.operand_pair_x(lhs, rhs, 0, 10);
+                        dynasm!(self.ops ; .arch aarch64 ; cmp X(a), X(b));
+                    }
+                }
+                if expect_truthy {
+                    dynasm!(self.ops ; .arch aarch64 ; b.ne => target);
+                } else {
+                    dynasm!(self.ops ; .arch aarch64 ; b.eq => target);
+                }
+            }
+        }
+        Ok(true)
     }
 }

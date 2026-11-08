@@ -547,6 +547,11 @@ impl JitCompiler {
                 } => {
                     self.compile_new_array(*dest, *first_element, *count)?;
                 }
+                TraceOp::StoreGlobal { .. } => {
+                    return Err(crate::jit::JitError::Unsupported(
+                        "StoreGlobal on rv32".to_string(),
+                    ));
+                }
                 TraceOp::NewStruct {
                     dest,
                     struct_name,
@@ -611,6 +616,21 @@ impl JitCompiler {
                     condition_register,
                     expect_truthy,
                     bailout_ip,
+                } => {
+                    let g = self.compile_truth_guard(
+                        *condition_register,
+                        *expect_truthy,
+                        *bailout_ip,
+                        *guard_index as usize,
+                    )?;
+                    guards.push(g);
+                    *guard_index += 1;
+                }
+                TraceOp::ConditionalHammock {
+                    condition_register,
+                    expect_truthy,
+                    bailout_ip,
+                    ..
                 } => {
                     let g = self.compile_truth_guard(
                         *condition_register,
@@ -722,6 +742,7 @@ impl JitCompiler {
                 | TraceOp::ArrayPush { .. }
                 | TraceOp::BorrowField { .. }
                 | TraceOp::BorrowEnumValue { .. }
+                | TraceOp::BorrowFieldSome { .. }
                 | TraceOp::Select { .. }
                 | TraceOp::SelectBitZero { .. }
                 | TraceOp::ModImm { .. } => {

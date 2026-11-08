@@ -53,27 +53,24 @@ impl JitCompiler {
         })
     }
 }
-#[cfg(all(debug_assertions, feature = "std"))]
 #[inline]
 pub(crate) fn log<F>(message: F)
 where
     F: FnOnce() -> String,
 {
-    // Debug builds narrate the JIT; `LUST_JIT_QUIET=1` silences it (the
-    // fuzzer's debug runs would otherwise drown in it).
-    static QUIET: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    if *QUIET.get_or_init(|| std::env::var_os("LUST_JIT_QUIET").is_some()) {
-        return;
+    #[cfg(feature = "std")]
+    {
+        static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let enabled = *ENABLED.get_or_init(|| {
+            if std::env::var_os("LUST_JIT_QUIET").is_some() {
+                return false;
+            }
+            cfg!(debug_assertions) || std::env::var_os("LUST_JIT_LOG").is_some()
+        });
+        if enabled {
+            println!("{}", message());
+        }
     }
-    println!("{}", message());
-}
-
-#[cfg(not(all(debug_assertions, feature = "std")))]
-#[inline]
-pub(crate) fn log<F>(_message: F)
-where
-    F: FnOnce() -> String,
-{
 }
 
 pub const HOT_THRESHOLD: u32 = 5;
@@ -233,6 +230,13 @@ pub(super) enum JitData {
     String(Box<str>),
     StringPointers(Box<[*const u8]>),
     StringLengths(Box<[usize]>),
+    StructSite(Box<JitStructSite>),
+}
+
+pub struct JitStructSite {
+    pub layout: Option<alloc::rc::Rc<crate::bytecode::StructLayout>>,
+    pub name: alloc::string::String,
+    pub field_names: alloc::vec::Vec<alloc::string::String>,
 }
 
 #[derive(Debug, Clone)]
@@ -463,6 +467,11 @@ impl JitState {
         self.function_next_compile
             .get(func_idx)
             .is_some_and(|next| *next != u32::MAX && *count >= *next)
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn is_function_compilable(&self, func_idx: usize) -> bool {
+        self.function_next_compile.get(func_idx).copied() != Some(u32::MAX)
     }
 
     #[cfg_attr(

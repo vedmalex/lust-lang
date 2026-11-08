@@ -6,7 +6,10 @@ use crate::vm::{CallFrame, TaskSignal, VM};
 use alloc::rc::{Rc, Weak};
 use alloc::vec::Vec;
 use core::cell::RefCell;
-use hashbrown::{HashMap, HashSet, hash_map::Entry};
+use foldhash::fast::FixedState;
+type HashMap<K, V> = hashbrown::HashMap<K, V, FixedState>;
+type HashSet<K> = hashbrown::HashSet<K, FixedState>;
+use hashbrown::hash_map::Entry;
 
 /// Base triggers: a collection every this many register writes (raised in
 /// proportion to the size of the heap the previous collection had to
@@ -36,6 +39,7 @@ const NODE_UPVALUE_CELL: u8 = 8;
 
 pub struct CycleCollector {
     enabled: bool,
+    has_mutations: bool,
     containers: HashMap<NodeKey, ContainerKind>,
     steps_since_collect: usize,
     pending_registrations: usize,
@@ -44,17 +48,22 @@ pub struct CycleCollector {
     last_collect_work: usize,
     /// Values visited so far by the collection in progress.
     work: usize,
+    discovery_stack: Vec<Value>,
+    discovery_visited: HashSet<NodeKey>,
 }
 
 impl Default for CycleCollector {
     fn default() -> Self {
         Self {
             enabled: true,
-            containers: HashMap::new(),
+            has_mutations: false,
+            containers: HashMap::default(),
             steps_since_collect: 0,
             pending_registrations: 0,
             last_collect_work: 0,
             work: 0,
+            discovery_stack: Vec::new(),
+            discovery_visited: HashSet::default(),
         }
     }
 }
@@ -106,7 +115,29 @@ impl CycleCollector {
             self.containers.clear();
             self.steps_since_collect = 0;
             self.pending_registrations = 0;
+            self.has_mutations = false;
         }
+    }
+
+    #[inline]
+    pub fn record_mutation(&mut self) {
+        self.has_mutations = true;
+    }
+
+    #[inline]
+    #[allow(dead_code)]
+    pub fn has_mutations(&self) -> bool {
+        self.has_mutations
+    }
+
+    #[inline]
+    pub(crate) fn has_live_containers(&self) -> bool {
+        self.containers.values().any(|container| match container {
+            ContainerKind::Array(weak) => weak.strong_count() > 0,
+            ContainerKind::Struct(weak) => weak.strong_count() > 0,
+            ContainerKind::Map(weak) => weak.strong_count() > 0,
+            ContainerKind::Iterator(weak) => weak.strong_count() > 0,
+        })
     }
 
     #[inline]
@@ -127,6 +158,16 @@ impl CycleCollector {
     }
 
     #[inline]
+    pub fn register_struct_direct(&mut self, rc: &Rc<StructObject>) {
+        if !self.enabled {
+            return;
+        }
+        if self.register_struct(rc) {
+            self.pending_registrations += 1;
+        }
+    }
+
+    #[inline]
     pub(crate) fn register_graph(&mut self, value: &Value) {
         if !self.enabled {
             return;
@@ -141,7 +182,7 @@ impl CycleCollector {
     /// registry here instead of a collection.
     #[inline]
     pub fn should_collect(&mut self) -> bool {
-        if !self.enabled {
+        if !self.enabled || !self.has_mutations {
             return false;
         }
         self.steps_since_collect = self.steps_since_collect.saturating_add(1);
@@ -177,6 +218,7 @@ impl CycleCollector {
         if !self.enabled {
             return;
         }
+        self.has_mutations = false;
         self.work = 0;
         self.discover_vm_roots(vm);
         self.collect_registered();
@@ -188,7 +230,7 @@ impl CycleCollector {
     /// Values that cannot own a cycle need no traversal (and no clone onto
     /// the traversal stack).
     #[inline]
-    fn is_leaf(value: &Value) -> bool {
+    pub(crate) fn is_leaf(value: &Value) -> bool {
         matches!(
             value,
             Value::Nil
@@ -277,8 +319,10 @@ impl CycleCollector {
         // Borrow the root; most writes merely re-observe a registered
         // container or wrap a scalar in Result/Option. Neither case needs
         // an owning traversal stack or a visited-set allocation.
-        let mut stack = Vec::new();
-        let mut visited = HashSet::new();
+        let mut stack = core::mem::take(&mut self.discovery_stack);
+        let mut visited = core::mem::take(&mut self.discovery_visited);
+        stack.clear();
+        visited.clear();
         let mut current = None;
         loop {
             let value = current.as_ref().unwrap_or(value);
@@ -403,6 +447,10 @@ impl CycleCollector {
                 break;
             }
         }
+        stack.clear();
+        visited.clear();
+        self.discovery_stack = stack;
+        self.discovery_visited = visited;
     }
 
     fn collect_registered(&mut self) {
@@ -414,7 +462,7 @@ impl CycleCollector {
             return;
         };
 
-        let mut live = HashSet::new();
+        let mut live = HashSet::default();
         let mut stack = Vec::new();
         for (key, node) in &nodes {
             if node.strong_count > node.internal_incoming {
@@ -435,7 +483,7 @@ impl CycleCollector {
     }
 
     fn snapshot_graph(&mut self) -> Option<HashMap<NodeKey, Node>> {
-        let mut nodes = HashMap::new();
+        let mut nodes = HashMap::default();
 
         // Seed every registered container. The temporary upgrade contributes one
         // strong reference, so exclude it from the exact count being recorded.
@@ -488,7 +536,7 @@ impl CycleCollector {
         // values that are not registered, such as an enum's payload); each
         // round scans what the previous one found. Searching the map for
         // an unscanned key per node made this quadratic in the heap.
-        let mut scanned = HashSet::with_capacity(nodes.len());
+        let mut scanned = HashSet::with_capacity_and_hasher(nodes.len(), FixedState::default());
         let mut pending: Vec<NodeKey> = nodes.keys().copied().collect();
         while !pending.is_empty() {
             for key in pending.drain(..) {

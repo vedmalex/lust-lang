@@ -28,6 +28,7 @@ pub fn create_stdlib(config: &LustConfig, vm: &VM) -> Vec<(&'static str, Value)>
         ("randomseed", create_math_randomseed_fn()),
         ("string", create_string_module(vm)),
         ("array", create_array_module(vm)),
+        ("table", create_table_module(vm)),
         ("map", create_map_module(vm)),
         ("math", create_math_module(vm)),
     ];
@@ -639,6 +640,8 @@ fn create_string_module(vm: &VM) -> Value {
         (string_key("is_empty"), create_string_is_empty_fn()),
         (string_key("chars"), create_string_chars_fn()),
         (string_key("lines"), create_string_lines_fn()),
+        (string_key("slice"), create_string_slice_fn()),
+        (string_key("index_of"), create_string_index_of_fn()),
     ];
     vm.map_with_entries(entries)
 }
@@ -1138,6 +1141,53 @@ fn create_string_lines_fn() -> Value {
     }))
 }
 
+fn create_string_slice_fn() -> Value {
+    Value::NativeFunction(native_fn(|args: &[Value]| {
+        let value = unwrap_lua_value(args.first().cloned().unwrap_or(Value::Nil));
+        let source = value
+            .as_string()
+            .ok_or_else(|| "string.slice expects a string as first argument".to_string())?;
+        let start = args
+            .get(1)
+            .and_then(Value::as_int)
+            .ok_or_else(|| "string.slice expects an integer start index".to_string())?;
+        let end = args
+            .get(2)
+            .and_then(Value::as_int)
+            .ok_or_else(|| "string.slice expects an integer end index".to_string())?;
+
+        let len = source.len();
+        let start_idx = (start.max(0) as usize).min(len);
+        let end_idx = (end.max(0) as usize).min(len);
+
+        if start_idx >= end_idx {
+            return Ok(NativeCallResult::Return(Value::string("")));
+        }
+        let slice = &source.as_bytes()[start_idx..end_idx];
+        Ok(NativeCallResult::Return(Value::string(
+            String::from_utf8_lossy(slice),
+        )))
+    }))
+}
+
+fn create_string_index_of_fn() -> Value {
+    Value::NativeFunction(native_fn(|args: &[Value]| {
+        let value = unwrap_lua_value(args.first().cloned().unwrap_or(Value::Nil));
+        let source = value
+            .as_string()
+            .ok_or_else(|| "string.index_of expects a string as first argument".to_string())?;
+        let substr_val = unwrap_lua_value(args.get(1).cloned().unwrap_or(Value::Nil));
+        let substr = substr_val
+            .as_string()
+            .ok_or_else(|| "string.index_of expects a substring as second argument".to_string())?;
+
+        match source.find(&substr) {
+            Some(idx) => Ok(NativeCallResult::Return(Value::some(Value::Int(idx as LustInt)))),
+            None => Ok(NativeCallResult::Return(Value::none())),
+        }
+    }))
+}
+
 fn create_array_module(vm: &VM) -> Value {
     let entries = [
         (string_key("len"), create_array_len_fn()),
@@ -1167,9 +1217,11 @@ fn create_array_len_fn() -> Value {
     Value::NativeFunction(native_fn(|args: &[Value]| {
         let val = args.first().cloned().unwrap_or(Value::Nil);
         match val {
-            Value::Array(arr) => Ok(NativeCallResult::Return(Value::Int(
-                arr.borrow().len() as LustInt
-            ))),
+            Value::Array(arr) => {
+                let len = crate::bytecode::value::get_specialized_cached_len(&arr)
+                    .unwrap_or_else(|| arr.borrow().len());
+                Ok(NativeCallResult::Return(Value::Int(len as LustInt)))
+            }
             other => Err(format!(
                 "array.len expects an array, got {:?}",
                 other.type_of()
@@ -1182,9 +1234,12 @@ fn create_array_is_empty_fn() -> Value {
     Value::NativeFunction(native_fn(|args: &[Value]| {
         let val = args.first().cloned().unwrap_or(Value::Nil);
         match val {
-            Value::Array(arr) => Ok(NativeCallResult::Return(Value::Bool(
-                arr.borrow().is_empty(),
-            ))),
+            Value::Array(arr) => {
+                let is_empty = crate::bytecode::value::get_specialized_cached_len(&arr)
+                    .map(|l| l == 0)
+                    .unwrap_or_else(|| arr.borrow().is_empty());
+                Ok(NativeCallResult::Return(Value::Bool(is_empty)))
+            }
             other => Err(format!(
                 "array.is_empty expects an array, got {:?}",
                 other.type_of()
@@ -1202,13 +1257,19 @@ fn create_array_get_fn() -> Value {
             .ok_or_else(|| "array.get expects an integer index".to_string())?;
         match val {
             Value::Array(arr) => {
-                let borrowed = arr.borrow();
-                if index < 0 || (index as usize) >= borrowed.len() {
+                if let Some(elem) = crate::bytecode::value::get_specialized_cached_element(&arr, index) {
+                    Ok(NativeCallResult::Return(Value::some(elem)))
+                } else if crate::bytecode::value::get_specialized_cached_len(&arr).is_some() {
                     Ok(NativeCallResult::Return(Value::none()))
                 } else {
-                    Ok(NativeCallResult::Return(Value::some(
-                        borrowed[index as usize].clone(),
-                    )))
+                    let borrowed = arr.borrow();
+                    if index < 0 || (index as usize) >= borrowed.len() {
+                        Ok(NativeCallResult::Return(Value::none()))
+                    } else {
+                        Ok(NativeCallResult::Return(Value::some(
+                            borrowed[index as usize].clone(),
+                        )))
+                    }
                 }
             }
             other => Err(format!(
@@ -1224,14 +1285,28 @@ fn create_array_first_fn() -> Value {
         let val = args.first().cloned().unwrap_or(Value::Nil);
         match val {
             Value::Array(arr) => {
-                let borrowed = arr.borrow();
-                Ok(NativeCallResult::Return(
-                    borrowed
-                        .first()
-                        .cloned()
-                        .map(Value::some)
-                        .unwrap_or_else(Value::none),
-                ))
+                if let Some(elem) = crate::bytecode::value::get_specialized_cached_element(&arr, 0) {
+                    Ok(NativeCallResult::Return(Value::some(elem)))
+                } else if let Some(len) = crate::bytecode::value::get_specialized_cached_len(&arr) {
+                    if len == 0 {
+                        Ok(NativeCallResult::Return(Value::none()))
+                    } else {
+                        crate::bytecode::value::sync_specialized_array(&arr);
+                        let borrowed = arr.borrow();
+                        Ok(NativeCallResult::Return(
+                            borrowed.first().cloned().map(Value::some).unwrap_or_else(Value::none),
+                        ))
+                    }
+                } else {
+                    let borrowed = arr.borrow();
+                    Ok(NativeCallResult::Return(
+                        borrowed
+                            .first()
+                            .cloned()
+                            .map(Value::some)
+                            .unwrap_or_else(Value::none),
+                    ))
+                }
             }
             other => Err(format!(
                 "array.first expects an array, got {:?}",
@@ -1246,14 +1321,28 @@ fn create_array_last_fn() -> Value {
         let val = args.first().cloned().unwrap_or(Value::Nil);
         match val {
             Value::Array(arr) => {
-                let borrowed = arr.borrow();
-                Ok(NativeCallResult::Return(
-                    borrowed
-                        .last()
-                        .cloned()
-                        .map(Value::some)
-                        .unwrap_or_else(Value::none),
-                ))
+                if let Some(len) = crate::bytecode::value::get_specialized_cached_len(&arr) {
+                    if len == 0 {
+                        Ok(NativeCallResult::Return(Value::none()))
+                    } else if let Some(elem) = crate::bytecode::value::get_specialized_cached_element(&arr, (len - 1) as i64) {
+                        Ok(NativeCallResult::Return(Value::some(elem)))
+                    } else {
+                        crate::bytecode::value::sync_specialized_array(&arr);
+                        let borrowed = arr.borrow();
+                        Ok(NativeCallResult::Return(
+                            borrowed.last().cloned().map(Value::some).unwrap_or_else(Value::none),
+                        ))
+                    }
+                } else {
+                    let borrowed = arr.borrow();
+                    Ok(NativeCallResult::Return(
+                        borrowed
+                            .last()
+                            .cloned()
+                            .map(Value::some)
+                            .unwrap_or_else(Value::none),
+                    ))
+                }
             }
             other => Err(format!(
                 "array.last expects an array, got {:?}",
@@ -1280,7 +1369,14 @@ fn create_array_push_fn() -> Value {
                             .map_err(|e| e.to_string())
                     })?;
                 }
+                if !crate::vm::cycle::CycleCollector::is_leaf(&args[1]) {
+                    let _ = VM::with_current(|vm| {
+                        vm.cycle_collector.record_mutation();
+                        Ok::<(), String>(())
+                    });
+                }
                 borrowed.push(args[1].clone());
+                crate::bytecode::value::invalidate_specialized_array_cache(arr.as_ptr() as usize);
                 Ok(NativeCallResult::Return(Value::Nil))
             }
             other => Err(format!(
@@ -1296,6 +1392,7 @@ fn create_array_pop_fn() -> Value {
         let val = args.first().cloned().unwrap_or(Value::Nil);
         match val {
             Value::Array(arr) => {
+                crate::bytecode::value::invalidate_specialized_array_cache(arr.as_ptr() as usize);
                 let popped = arr.borrow_mut().pop();
                 Ok(NativeCallResult::Return(
                     popped.map(Value::some).unwrap_or_else(Value::none),
@@ -1329,8 +1426,15 @@ fn create_array_insert_fn() -> Value {
                             .map_err(|e| e.to_string())
                     })?;
                 }
+                if !crate::vm::cycle::CycleCollector::is_leaf(&args[2]) {
+                    let _ = VM::with_current(|vm| {
+                        vm.cycle_collector.record_mutation();
+                        Ok::<(), String>(())
+                    });
+                }
                 let idx = (index.max(0) as usize).min(borrowed.len());
                 borrowed.insert(idx, args[2].clone());
+                crate::bytecode::value::invalidate_specialized_array_cache(arr.as_ptr() as usize);
                 Ok(NativeCallResult::Return(Value::Nil))
             }
             other => Err(format!(
@@ -1351,6 +1455,7 @@ fn create_array_remove_fn() -> Value {
             .ok_or_else(|| "array.remove expects an integer index".to_string())?;
         match &args[0] {
             Value::Array(arr) => {
+                crate::bytecode::value::invalidate_specialized_array_cache(arr.as_ptr() as usize);
                 let mut borrowed = arr.borrow_mut();
                 if index >= 0 && (index as usize) < borrowed.len() {
                     let val = borrowed.remove(index as usize);
@@ -1372,6 +1477,7 @@ fn create_array_clear_fn() -> Value {
         let val = args.first().cloned().unwrap_or(Value::Nil);
         match val {
             Value::Array(arr) => {
+                crate::bytecode::value::invalidate_specialized_array_cache(arr.as_ptr() as usize);
                 arr.borrow_mut().clear();
                 Ok(NativeCallResult::Return(Value::Nil))
             }
@@ -1635,6 +1741,152 @@ fn create_array_iter_fn() -> Value {
     }))
 }
 
+fn create_table_insert_fn() -> Value {
+    Value::NativeFunction(native_fn(|args: &[Value]| {
+        if args.len() < 2 {
+            return Err("table.insert requires at least 2 arguments".to_string());
+        }
+        let target = unwrap_lua_value(args[0].clone());
+        if args.len() == 2 {
+            // table.insert(arr, val) -> behaves as push
+            let val = args[1].clone();
+            match target {
+                Value::Array(arr) => {
+                    let mut borrowed = arr.borrow_mut();
+                    let len = borrowed.len();
+                    let cap = borrowed.capacity();
+                    if len == cap {
+                        let new_cap = if cap == 0 { 4 } else { cap.saturating_mul(2) };
+                        VM::with_current(|vm| {
+                            vm.charge_vec_growth::<Value>(cap, new_cap)
+                                .map_err(|e| e.to_string())
+                        })?;
+                    }
+                    if !crate::vm::cycle::CycleCollector::is_leaf(&val) {
+                        let _ = VM::with_current(|vm| {
+                            vm.cycle_collector.record_mutation();
+                            Ok::<(), String>(())
+                        });
+                    }
+                    borrowed.push(val);
+                    crate::bytecode::value::invalidate_specialized_array_cache(arr.as_ptr() as usize);
+                    Ok(NativeCallResult::Return(Value::Nil))
+                }
+                other => Err(format!(
+                    "table.insert expects an array as first argument, got {:?}",
+                    other.type_of()
+                )),
+            }
+        } else {
+            // table.insert(arr, idx, val) -> behaves as insert
+            let index = args[1]
+                .as_int()
+                .ok_or_else(|| "table.insert expects an integer index when called with 3 arguments".to_string())?;
+            let val = args[2].clone();
+            match target {
+                Value::Array(arr) => {
+                    let mut borrowed = arr.borrow_mut();
+                    let len = borrowed.len();
+                    let cap = borrowed.capacity();
+                    if len == cap {
+                        let new_cap = if cap == 0 { 4 } else { cap.saturating_mul(2) };
+                        VM::with_current(|vm| {
+                            vm.charge_vec_growth::<Value>(cap, new_cap)
+                                .map_err(|e| e.to_string())
+                        })?;
+                    }
+                    if !crate::vm::cycle::CycleCollector::is_leaf(&val) {
+                        let _ = VM::with_current(|vm| {
+                            vm.cycle_collector.record_mutation();
+                            Ok::<(), String>(())
+                        });
+                    }
+                    let idx = (index.max(0) as usize).min(borrowed.len());
+                    borrowed.insert(idx, val);
+                    crate::bytecode::value::invalidate_specialized_array_cache(arr.as_ptr() as usize);
+                    Ok(NativeCallResult::Return(Value::Nil))
+                }
+                other => Err(format!(
+                    "table.insert expects an array as first argument, got {:?}",
+                    other.type_of()
+                )),
+            }
+        }
+    }))
+}
+
+fn create_table_remove_fn() -> Value {
+    Value::NativeFunction(native_fn(|args: &[Value]| {
+        if args.is_empty() {
+            return Err("table.remove requires at least 1 argument".to_string());
+        }
+        let target = unwrap_lua_value(args[0].clone());
+        if args.len() == 1 {
+            // table.remove(arr) -> behaves as pop
+            match target {
+                Value::Array(arr) => {
+                    crate::bytecode::value::invalidate_specialized_array_cache(arr.as_ptr() as usize);
+                    let popped = arr.borrow_mut().pop();
+                    Ok(NativeCallResult::Return(
+                        popped.map(Value::some).unwrap_or_else(Value::none),
+                    ))
+                }
+                other => Err(format!(
+                    "table.remove expects an array as first argument, got {:?}",
+                    other.type_of()
+                )),
+            }
+        } else {
+            // table.remove(arr, idx) -> behaves as remove
+            let index = args[1]
+                .as_int()
+                .ok_or_else(|| "table.remove expects an integer index when called with 2 arguments".to_string())?;
+            match target {
+                Value::Array(arr) => {
+                    crate::bytecode::value::invalidate_specialized_array_cache(arr.as_ptr() as usize);
+                    let mut borrowed = arr.borrow_mut();
+                    if index >= 0 && (index as usize) < borrowed.len() {
+                        let val = borrowed.remove(index as usize);
+                        Ok(NativeCallResult::Return(Value::some(val)))
+                    } else {
+                        Ok(NativeCallResult::Return(Value::none()))
+                    }
+                }
+                other => Err(format!(
+                    "table.remove expects an array as first argument, got {:?}",
+                    other.type_of()
+                )),
+            }
+        }
+    }))
+}
+
+fn create_table_module(vm: &VM) -> Value {
+    let entries = [
+        (string_key("len"), create_array_len_fn()),
+        (string_key("is_empty"), create_array_is_empty_fn()),
+        (string_key("get"), create_array_get_fn()),
+        (string_key("first"), create_array_first_fn()),
+        (string_key("last"), create_array_last_fn()),
+        (string_key("push"), create_array_push_fn()),
+        (string_key("pop"), create_array_pop_fn()),
+        (string_key("insert"), create_table_insert_fn()),
+        (string_key("remove"), create_table_remove_fn()),
+        (string_key("clear"), create_array_clear_fn()),
+        (string_key("slice"), create_array_slice_fn()),
+        (string_key("concat"), create_array_concat_fn()),
+        (string_key("sort"), create_array_sort_fn()),
+        (string_key("reverse"), create_array_reverse_fn()),
+        (string_key("contains"), create_array_contains_fn()),
+        (string_key("map"), create_array_map_fn()),
+        (string_key("filter"), create_array_filter_fn()),
+        (string_key("reduce"), create_array_reduce_fn()),
+        (string_key("iter"), create_array_iter_fn()),
+        (string_key("unpack"), create_table_unpack_fn()),
+    ];
+    vm.map_with_entries(entries)
+}
+
 fn create_map_module(vm: &VM) -> Value {
     let entries = [
         (string_key("len"), create_map_len_fn()),
@@ -1710,6 +1962,12 @@ fn create_map_set_fn() -> Value {
                             .charge_map_entry_estimate()
                             .map_err(|e| e.to_string())
                     })?;
+                }
+                if !crate::vm::cycle::CycleCollector::is_leaf(&args[2]) {
+                    let _ = VM::with_current(|vm| {
+                        vm.cycle_collector.record_mutation();
+                        Ok::<(), String>(())
+                    });
                 }
                 borrowed.insert(key, args[2].clone());
                 Ok(NativeCallResult::Return(Value::Nil))
@@ -1850,6 +2108,7 @@ fn create_math_module(vm: &VM) -> Value {
         (string_key("log"), create_math_log_fn()),
         (string_key("tointeger"), create_math_tointeger_fn()),
         (string_key("tofloat"), create_math_tofloat_fn()),
+        (string_key("mod"), create_math_mod_fn()),
     ];
     vm.map_with_entries(entries)
 }
@@ -2206,6 +2465,33 @@ fn create_math_tofloat_fn() -> Value {
             }
             _ => Ok(NativeCallResult::Return(Value::none())),
         }
+    }))
+}
+
+fn create_math_mod_fn() -> Value {
+    Value::NativeFunction(native_fn(|args: &[Value]| {
+        if args.len() < 2 {
+            return Err("math.mod expects 2 integer arguments".to_string());
+        }
+        let a = unwrap_lua_value(args[0].clone())
+            .as_int()
+            .ok_or_else(|| "math.mod expects an integer as first argument".to_string())?;
+        let b = unwrap_lua_value(args[1].clone())
+            .as_int()
+            .ok_or_else(|| "math.mod expects an integer as second argument".to_string())?;
+        if b == 0 {
+            return Err("math.mod: division by zero".to_string());
+        }
+        if b == -1 {
+            return Ok(NativeCallResult::Return(Value::Int(0)));
+        }
+        let r = a % b;
+        let res = if (r > 0 && b < 0) || (r < 0 && b > 0) {
+            r + b
+        } else {
+            r
+        };
+        Ok(NativeCallResult::Return(Value::Int(res)))
     }))
 }
 
@@ -2698,5 +2984,234 @@ mod tests {
         assert!(stdlib.iter().any(|(name, _)| *name == "io"));
         assert!(stdlib.iter().any(|(name, _)| *name == "os"));
         assert!(stdlib.iter().any(|(name, _)| *name == "string"));
+        assert!(stdlib.iter().any(|(name, _)| *name == "table"));
+    }
+
+    #[test]
+    fn test_table_insert_push_and_remove_pop() {
+        let mut vm = VM::with_config(&LustConfig::default());
+        struct VmGuard;
+        impl Drop for VmGuard {
+            fn drop(&mut self) {
+                crate::vm::pop_vm_ptr();
+            }
+        }
+        crate::vm::push_vm_ptr(&mut vm);
+        let _guard = VmGuard;
+
+        let stdlib = create_stdlib(&LustConfig::default(), &vm);
+        let table_mod = stdlib.iter().find(|(name, _)| *name == "table").unwrap().1.clone();
+
+        let insert_fn = table_mod.map_get(&string_key("insert")).unwrap();
+        let remove_fn = table_mod.map_get(&string_key("remove")).unwrap();
+        let concat_fn = table_mod.map_get(&string_key("concat")).unwrap();
+
+        let arr = Value::array(Vec::new());
+
+        // table.insert(arr, 10) (push)
+        let res1 = match &insert_fn {
+            Value::NativeFunction(f) => f(&[arr.clone(), Value::Int(10)]).unwrap(),
+            _ => panic!("expected native fn"),
+        };
+        assert!(matches!(res1, NativeCallResult::Return(Value::Nil)));
+
+        // table.insert(arr, 20) (push)
+        let _ = match &insert_fn {
+            Value::NativeFunction(f) => f(&[arr.clone(), Value::Int(20)]).unwrap(),
+            _ => panic!("expected native fn"),
+        };
+
+        // table.insert(arr, 1, 15) (insert at index 1)
+        let _ = match &insert_fn {
+            Value::NativeFunction(f) => f(&[arr.clone(), Value::Int(1), Value::Int(15)]).unwrap(),
+            _ => panic!("expected native fn"),
+        };
+
+        // Check concat: "10, 15, 20"
+        let concat_res = match &concat_fn {
+            Value::NativeFunction(f) => f(&[arr.clone(), Value::string(", ")]).unwrap(),
+            _ => panic!("expected native fn"),
+        };
+        match concat_res {
+            NativeCallResult::Return(Value::String(s)) => assert_eq!(&*s, "10, 15, 20"),
+            other => panic!("expected string, got {:?}", other),
+        }
+
+        // table.remove(arr) -> pop -> Some(20)
+        let pop_res = match &remove_fn {
+            Value::NativeFunction(f) => f(&[arr.clone()]).unwrap(),
+            _ => panic!("expected native fn"),
+        };
+        match pop_res {
+            NativeCallResult::Return(Value::Enum(e)) if e.variant.as_str() == "Some" => {
+                assert_eq!(e.values.as_ref().unwrap().first(), Some(&Value::Int(20)));
+            }
+            other => panic!("expected Some(20), got {:?}", other),
+        }
+
+        // table.remove(arr, 0) -> remove at 0 -> Some(10)
+        let remove_0_res = match &remove_fn {
+            Value::NativeFunction(f) => f(&[arr.clone(), Value::Int(0)]).unwrap(),
+            _ => panic!("expected native fn"),
+        };
+        match remove_0_res {
+            NativeCallResult::Return(Value::Enum(e)) if e.variant.as_str() == "Some" => {
+                assert_eq!(e.values.as_ref().unwrap().first(), Some(&Value::Int(10)));
+            }
+            other => panic!("expected Some(10), got {:?}", other),
+        }
+
+        // Only 15 remains
+        let remove_last = match &remove_fn {
+            Value::NativeFunction(f) => f(&[arr.clone()]).unwrap(),
+            _ => panic!("expected native fn"),
+        };
+        match remove_last {
+            NativeCallResult::Return(Value::Enum(e)) if e.variant.as_str() == "Some" => {
+                assert_eq!(e.values.as_ref().unwrap().first(), Some(&Value::Int(15)));
+            }
+            other => panic!("expected Some(15), got {:?}", other),
+        }
+
+        // Now empty: table.remove(arr) -> None
+        let remove_empty = match &remove_fn {
+            Value::NativeFunction(f) => f(&[arr.clone()]).unwrap(),
+            _ => panic!("expected native fn"),
+        };
+        match remove_empty {
+            NativeCallResult::Return(Value::Enum(e)) => {
+                assert_eq!(e.variant.as_str(), "None");
+            }
+            other => panic!("expected None, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_math_mod() {
+        let vm = VM::with_config(&LustConfig::default());
+        let stdlib = create_stdlib(&LustConfig::default(), &vm);
+        let math_mod = stdlib.iter().find(|(name, _)| *name == "math").unwrap().1.clone();
+        let mod_fn = math_mod.map_get(&string_key("mod")).unwrap();
+
+        let call_mod = |a: i64, b: i64| match &mod_fn {
+            Value::NativeFunction(f) => match f(&[Value::Int(a), Value::Int(b)]).unwrap() {
+                NativeCallResult::Return(Value::Int(res)) => res,
+                other => panic!("expected int, got {:?}", other),
+            },
+            _ => panic!("expected native fn"),
+        };
+
+        // 5 // 2 == 2,  5 = 2*2 + 1
+        assert_eq!(call_mod(5, 2), 1);
+        // -5 // 2 == -3, -5 = -3*2 + 1
+        assert_eq!(call_mod(-5, 2), 1);
+        // 5 // -2 == -3, 5 = -3*(-2) + (-1)
+        assert_eq!(call_mod(5, -2), -1);
+        // -5 // -2 == 2, -5 = 2*(-2) + (-1)
+        assert_eq!(call_mod(-5, -2), -1);
+
+        // Division by zero
+        match &mod_fn {
+            Value::NativeFunction(f) => {
+                assert!(f(&[Value::Int(5), Value::Int(0)]).is_err());
+            }
+            _ => panic!("expected native fn"),
+        }
+    }
+
+    #[test]
+    fn test_string_slice_and_index_of() {
+        let vm = VM::with_config(&LustConfig::default());
+        let stdlib = create_stdlib(&LustConfig::default(), &vm);
+        let str_mod = stdlib.iter().find(|(name, _)| *name == "string").unwrap().1.clone();
+        let slice_fn = str_mod.map_get(&string_key("slice")).unwrap();
+        let index_of_fn = str_mod.map_get(&string_key("index_of")).unwrap();
+
+        // string.slice("hello world", 0, 5) -> "hello"
+        let res = match &slice_fn {
+            Value::NativeFunction(f) => f(&[Value::string("hello world"), Value::Int(0), Value::Int(5)]).unwrap(),
+            _ => panic!("expected native fn"),
+        };
+        match res {
+            NativeCallResult::Return(Value::String(s)) => assert_eq!(&*s, "hello"),
+            other => panic!("expected string, got {:?}", other),
+        }
+
+        // string.slice("hello world", 6, 11) -> "world"
+        let res = match &slice_fn {
+            Value::NativeFunction(f) => f(&[Value::string("hello world"), Value::Int(6), Value::Int(11)]).unwrap(),
+            _ => panic!("expected native fn"),
+        };
+        match res {
+            NativeCallResult::Return(Value::String(s)) => assert_eq!(&*s, "world"),
+            other => panic!("expected string, got {:?}", other),
+        }
+
+        // string.slice inverted indices -> ""
+        let res = match &slice_fn {
+            Value::NativeFunction(f) => f(&[Value::string("hello"), Value::Int(4), Value::Int(2)]).unwrap(),
+            _ => panic!("expected native fn"),
+        };
+        match res {
+            NativeCallResult::Return(Value::String(s)) => assert_eq!(s.as_str(), ""),
+            other => panic!("expected string, got {:?}", other),
+        }
+
+        // string.index_of("hello world", "world") -> Some(6)
+        let res = match &index_of_fn {
+            Value::NativeFunction(f) => f(&[Value::string("hello world"), Value::string("world")]).unwrap(),
+            _ => panic!("expected native fn"),
+        };
+        match res {
+            NativeCallResult::Return(Value::Enum(e)) if e.variant.as_str() == "Some" => {
+                assert_eq!(e.values.as_ref().unwrap().first(), Some(&Value::Int(6)));
+            }
+            other => panic!("expected Some(6), got {:?}", other),
+        }
+
+        // string.index_of("hello world", "notfound") -> None
+        let res = match &index_of_fn {
+            Value::NativeFunction(f) => f(&[Value::string("hello world"), Value::string("notfound")]).unwrap(),
+            _ => panic!("expected native fn"),
+        };
+        match res {
+            NativeCallResult::Return(Value::Enum(e)) => {
+                assert_eq!(e.variant.as_str(), "None");
+            }
+            other => panic!("expected None, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_ipairs_0_based_array() {
+        use crate::bytecode::value::IteratorState;
+        let vm = VM::with_config(&LustConfig::default());
+        let corelib = crate::vm::corelib::core_entries(&vm);
+        let ipairs_fn = corelib.iter().find(|(name, _)| *name == "ipairs").unwrap().1.clone();
+
+        let arr = Value::array(vec![Value::Int(10), Value::Int(20), Value::Int(30)]);
+        let iter_res = match &ipairs_fn {
+            Value::NativeFunction(f) => f(&[arr]).unwrap(),
+            _ => panic!("expected native fn"),
+        };
+
+        match iter_res {
+            NativeCallResult::Return(Value::Iterator(it)) => {
+                let borrowed = it.borrow();
+                match &*borrowed {
+                    IteratorState::MapPairs { items, .. } => {
+                        assert_eq!(items.len(), 3);
+                        assert_eq!(items[0].0.to_value(), Value::Int(0));
+                        assert_eq!(items[0].1, Value::Int(10));
+                        assert_eq!(items[1].0.to_value(), Value::Int(1));
+                        assert_eq!(items[1].1, Value::Int(20));
+                        assert_eq!(items[2].0.to_value(), Value::Int(2));
+                        assert_eq!(items[2].1, Value::Int(30));
+                    }
+                    _ => panic!("expected MapPairs"),
+                }
+            }
+            other => panic!("expected iterator, got {:?}", other),
+        }
     }
 }

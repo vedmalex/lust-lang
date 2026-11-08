@@ -147,6 +147,7 @@ pub enum MirBinaryOp {
     Mul,
     Div,
     Mod,
+    FloorDiv,
     Pow,
     BitAnd,
     BitOr,
@@ -171,6 +172,7 @@ impl fmt::Display for MirBinaryOp {
             MirBinaryOp::Mul => "*",
             MirBinaryOp::Div => "/",
             MirBinaryOp::Mod => "%",
+            MirBinaryOp::FloorDiv => "//",
             MirBinaryOp::Pow => "^",
             MirBinaryOp::BitAnd => "&",
             MirBinaryOp::BitOr => "|",
@@ -194,6 +196,7 @@ impl fmt::Display for MirBinaryOp {
 pub enum MirUnaryOp {
     Neg,
     Not,
+    BitNot,
     Len,
 }
 
@@ -202,6 +205,7 @@ impl fmt::Display for MirUnaryOp {
         match self {
             MirUnaryOp::Neg => write!(f, "-"),
             MirUnaryOp::Not => write!(f, "!"),
+            MirUnaryOp::BitNot => write!(f, "~"),
             MirUnaryOp::Len => write!(f, "len "),
         }
     }

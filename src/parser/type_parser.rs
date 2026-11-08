@@ -169,13 +169,33 @@ impl Parser {
         self.consume(TokenKind::Less, "Expected '<' after type name")?;
         let mut type_args = vec![self.parse_type()?];
         while self.match_token(&[TokenKind::Comma]) {
-            if self.check(TokenKind::Greater) {
+            if self.check(TokenKind::Greater) || self.check(TokenKind::DoubleGreater) {
                 break;
             }
             type_args.push(self.parse_type()?);
         }
 
-        self.consume(TokenKind::Greater, "Expected '>' after type arguments")?;
+        self.consume_closing_angle_bracket("Expected '>' after type arguments")?;
         Ok(type_args)
+    }
+
+    pub(super) fn consume_closing_angle_bracket(&mut self, message: &str) -> Result<()> {
+        if self.check(TokenKind::Greater) {
+            self.advance();
+            Ok(())
+        } else if self.check(TokenKind::DoubleGreater) {
+            let token = &mut self.tokens[self.current];
+            token.kind = TokenKind::Greater;
+            token.column += 1;
+            Ok(())
+        } else {
+            let token = self.current_token();
+            Err(crate::error::LustError::ParserError {
+                line: token.line,
+                column: token.column,
+                message: format!("{} (got {:?}, expected '>')", message, token.kind),
+                module: None,
+            })
+        }
     }
 }

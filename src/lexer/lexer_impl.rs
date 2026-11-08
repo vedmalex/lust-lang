@@ -195,11 +195,44 @@ impl<'a> Lexer<'a> {
             }
             '%' => {
                 self.advance();
-                return Ok(Token::simple(TokenKind::Percent, start_line, start_column));
+                if self.current_char() == '=' {
+                    self.advance();
+                    return Ok(Token::simple(
+                        TokenKind::PercentEqual,
+                        start_line,
+                        start_column,
+                    ));
+                } else {
+                    return Ok(Token::simple(TokenKind::Percent, start_line, start_column));
+                }
             }
             '^' => {
                 self.advance();
-                return Ok(Token::simple(TokenKind::Caret, start_line, start_column));
+                if self.current_char() == '^' {
+                    self.advance();
+                    if self.current_char() == '=' {
+                        self.advance();
+                        return Ok(Token::simple(
+                            TokenKind::DoubleCaretEqual,
+                            start_line,
+                            start_column,
+                        ));
+                    }
+                    return Ok(Token::simple(
+                        TokenKind::DoubleCaret,
+                        start_line,
+                        start_column,
+                    ));
+                } else if self.current_char() == '=' {
+                    self.advance();
+                    return Ok(Token::simple(
+                        TokenKind::CaretEqual,
+                        start_line,
+                        start_column,
+                    ));
+                } else {
+                    return Ok(Token::simple(TokenKind::Caret, start_line, start_column));
+                }
             }
             '?' => {
                 self.advance();
@@ -207,15 +240,33 @@ impl<'a> Lexer<'a> {
             }
             '&' => {
                 self.advance();
-                return Ok(Token::simple(
-                    TokenKind::Ampersand,
-                    start_line,
-                    start_column,
-                ));
+                if self.current_char() == '=' {
+                    self.advance();
+                    return Ok(Token::simple(
+                        TokenKind::AmpersandEqual,
+                        start_line,
+                        start_column,
+                    ));
+                } else {
+                    return Ok(Token::simple(
+                        TokenKind::Ampersand,
+                        start_line,
+                        start_column,
+                    ));
+                }
             }
             '|' => {
                 self.advance();
-                return Ok(Token::simple(TokenKind::Pipe, start_line, start_column));
+                if self.current_char() == '=' {
+                    self.advance();
+                    return Ok(Token::simple(
+                        TokenKind::PipeEqual,
+                        start_line,
+                        start_column,
+                    ));
+                } else {
+                    return Ok(Token::simple(TokenKind::Pipe, start_line, start_column));
+                }
             }
             '+' => {
                 self.advance();
@@ -261,7 +312,22 @@ impl<'a> Lexer<'a> {
             }
             '/' => {
                 self.advance();
-                if self.current_char() == '=' {
+                if self.current_char() == '/' {
+                    self.advance();
+                    if self.current_char() == '=' {
+                        self.advance();
+                        return Ok(Token::simple(
+                            TokenKind::DoubleSlashEqual,
+                            start_line,
+                            start_column,
+                        ));
+                    }
+                    return Ok(Token::simple(
+                        TokenKind::DoubleSlash,
+                        start_line,
+                        start_column,
+                    ));
+                } else if self.current_char() == '=' {
                     self.advance();
                     return Ok(Token::simple(
                         TokenKind::SlashEqual,
@@ -294,12 +360,7 @@ impl<'a> Lexer<'a> {
                     self.advance();
                     return Ok(Token::simple(TokenKind::NotEqual, start_line, start_column));
                 } else {
-                    return Err(LustError::LexerError {
-                        line: start_line,
-                        column: start_column,
-                        message: format!("Unexpected character: {}", ch),
-                        module: None,
-                    });
+                    return Ok(Token::simple(TokenKind::Tilde, start_line, start_column));
                 }
             }
             '!' => {
@@ -318,7 +379,22 @@ impl<'a> Lexer<'a> {
             }
             '<' => {
                 self.advance();
-                if self.current_char() == '=' {
+                if self.current_char() == '<' {
+                    self.advance();
+                    if self.current_char() == '=' {
+                        self.advance();
+                        return Ok(Token::simple(
+                            TokenKind::DoubleLessEqual,
+                            start_line,
+                            start_column,
+                        ));
+                    }
+                    return Ok(Token::simple(
+                        TokenKind::DoubleLess,
+                        start_line,
+                        start_column,
+                    ));
+                } else if self.current_char() == '=' {
                     self.advance();
                     return Ok(Token::simple(
                         TokenKind::LessEqual,
@@ -331,7 +407,22 @@ impl<'a> Lexer<'a> {
             }
             '>' => {
                 self.advance();
-                if self.current_char() == '=' {
+                if self.current_char() == '>' {
+                    self.advance();
+                    if self.current_char() == '=' {
+                        self.advance();
+                        return Ok(Token::simple(
+                            TokenKind::DoubleGreaterEqual,
+                            start_line,
+                            start_column,
+                        ));
+                    }
+                    return Ok(Token::simple(
+                        TokenKind::DoubleGreater,
+                        start_line,
+                        start_column,
+                    ));
+                } else if self.current_char() == '=' {
                     self.advance();
                     return Ok(Token::simple(
                         TokenKind::GreaterEqual,
@@ -674,5 +765,45 @@ impl<'lexer, 'a> core::iter::Iterator for TokenIterator<'lexer, 'a> {
                 Some(Err(e))
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_math_and_bitwise_tokens() {
+        let mut interner = Interner::new();
+        let input = "// //= % %= ^ ^= ^^ ^^= & &= | |= << <<= >> >>= ~ ~= / /=";
+        let mut lexer = Lexer::new(input, &mut interner);
+        let tokens = lexer.tokenize().unwrap();
+        let kinds: Vec<TokenKind> = tokens.into_iter().map(|t| t.kind).collect();
+        assert_eq!(
+            kinds,
+            vec![
+                TokenKind::DoubleSlash,
+                TokenKind::DoubleSlashEqual,
+                TokenKind::Percent,
+                TokenKind::PercentEqual,
+                TokenKind::Caret,
+                TokenKind::CaretEqual,
+                TokenKind::DoubleCaret,
+                TokenKind::DoubleCaretEqual,
+                TokenKind::Ampersand,
+                TokenKind::AmpersandEqual,
+                TokenKind::Pipe,
+                TokenKind::PipeEqual,
+                TokenKind::DoubleLess,
+                TokenKind::DoubleLessEqual,
+                TokenKind::DoubleGreater,
+                TokenKind::DoubleGreaterEqual,
+                TokenKind::Tilde,
+                TokenKind::NotEqual,
+                TokenKind::Slash,
+                TokenKind::SlashEqual,
+                TokenKind::Eof,
+            ]
+        );
     }
 }

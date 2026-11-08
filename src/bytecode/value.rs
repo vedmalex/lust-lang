@@ -1063,21 +1063,31 @@ impl Value {
 
     pub fn as_array(&self) -> Option<Vec<Value>> {
         match self {
-            Value::Array(arr) => Some(arr.borrow().clone()),
+            Value::Array(arr) => {
+                #[cfg(feature = "std")]
+                sync_specialized_array(arr);
+                Some(arr.borrow().clone())
+            }
             _ => None,
         }
     }
 
     pub fn array_len(&self) -> Option<usize> {
         match self {
-            Value::Array(arr) => Some(arr.borrow().len()),
+            Value::Array(arr) => {
+                sync_specialized_array(arr);
+                Some(arr.borrow().len())
+            }
             _ => None,
         }
     }
 
     pub fn array_get(&self, index: usize) -> Option<Value> {
         match self {
-            Value::Array(arr) => arr.borrow().get(index).cloned(),
+            Value::Array(arr) => {
+                sync_specialized_array(arr);
+                arr.borrow().get(index).cloned()
+            }
             _ => None,
         }
     }
@@ -1085,6 +1095,11 @@ impl Value {
     pub fn array_push(&self, value: Value) -> Result<(), String> {
         match self {
             Value::Array(arr) => {
+                #[cfg(feature = "std")]
+                {
+                    sync_specialized_array(arr);
+                    invalidate_specialized_array_cache(arr.as_ptr() as usize);
+                }
                 arr.borrow_mut().push(value);
                 Ok(())
             }
@@ -1095,7 +1110,14 @@ impl Value {
 
     pub fn array_pop(&self) -> Result<Option<Value>, String> {
         match self {
-            Value::Array(arr) => Ok(arr.borrow_mut().pop()),
+            Value::Array(arr) => {
+                #[cfg(feature = "std")]
+                {
+                    sync_specialized_array(arr);
+                    invalidate_specialized_array_cache(arr.as_ptr() as usize);
+                }
+                Ok(arr.borrow_mut().pop())
+            }
             _ => Err("Cannot pop from non-array".to_string()),
         }
     }
@@ -1356,7 +1378,11 @@ impl fmt::Debug for Value {
             Value::Int(i) => write!(f, "Int({})", i),
             Value::Float(fl) => write!(f, "Float({})", fl),
             Value::String(s) => write!(f, "String({:?})", s),
-            Value::Array(arr) => write!(f, "Array({:?})", arr.borrow()),
+            Value::Array(arr) => {
+                #[cfg(feature = "std")]
+                sync_specialized_array(arr);
+                write!(f, "Array({:?})", arr.borrow())
+            }
             Value::Tuple(values) => write!(f, "Tuple({:?})", values),
             Value::Map(map) => write!(f, "Map({:?})", map.borrow()),
             Value::Struct(object) => {
@@ -1429,6 +1455,8 @@ impl fmt::Display for Value {
             Value::Float(fl) => write!(f, "{}", fl),
             Value::String(s) => write!(f, "{}", s),
             Value::Array(arr) => {
+                #[cfg(feature = "std")]
+                sync_specialized_array(arr);
                 write!(f, "[")?;
                 let borrowed = arr.borrow();
                 for (i, val) in borrowed.iter().enumerate() {
@@ -1762,6 +1790,18 @@ pub unsafe extern "C" fn jit_array_get_safe(
                 return 0;
             }
         };
+        if let Some(val) = get_specialized_cached_element(arr, index) {
+            replace_value(out, val);
+            return 1;
+        }
+        if let Some(length) = get_specialized_cached_len(arr) {
+            if index < 0 || index as usize >= length {
+                (&mut *vm_ptr).set_pending_jit_error(crate::LustError::RuntimeError {
+                    message: format!("Array index {} out of bounds (length: {})", index, length),
+                });
+                return 0;
+            }
+        }
         let borrowed = match arr.try_borrow() {
             Ok(b) => b,
             Err(_) => {
@@ -1837,6 +1877,18 @@ pub unsafe extern "C" fn jit_array_index_ok_safe(
         let Some(index) = (&*index_value_ptr).as_int() else {
             return 0;
         };
+        if let Some(value) = get_specialized_cached_element(array, index) {
+            replace_value(value_out, value);
+            replace_value(condition_out, Value::Bool(true));
+            return 1;
+        } else if let Some(len) = get_specialized_cached_len(array) {
+            if index < 0 || (index as usize) >= len {
+                replace_value(value_out, Value::Nil);
+                replace_value(condition_out, Value::Bool(false));
+                return 1;
+            }
+            sync_specialized_array(array);
+        }
         let borrowed = match array.try_borrow() {
             Ok(borrowed) => borrowed,
             Err(_) => return 0,
@@ -1882,6 +1934,9 @@ pub unsafe extern "C" fn jit_array_set_index_safe(
         let Some(index) = (&*index_value_ptr).as_int() else {
             return 0;
         };
+        if let Some(res) = set_specialized_cached_element(array, index, &*value_ptr) {
+            return if res.is_ok() { 1 } else { 0 };
+        }
         let Ok(mut borrowed) = array.try_borrow_mut() else {
             return 0;
         };
@@ -1907,10 +1962,15 @@ pub unsafe extern "C" fn jit_array_len_safe(array_value_ptr: *const Value) -> i6
 
         let array_value = &*array_value_ptr;
         match array_value {
-            Value::Array(arr) => match arr.try_borrow() {
-                Ok(borrowed) => crate::number::int_from_usize(borrowed.len()),
-                Err(_) => -1,
-            },
+            Value::Array(arr) => {
+                if let Some(len) = get_specialized_cached_len(arr) {
+                    return crate::number::int_from_usize(len);
+                }
+                match arr.try_borrow() {
+                    Ok(borrowed) => crate::number::int_from_usize(borrowed.len()),
+                    Err(_) => -1,
+                }
+            }
             _ => -1,
         }
     }
@@ -1991,8 +2051,12 @@ pub unsafe extern "C" fn jit_array_push_safe(
                 let Ok(mut vec_ref) = arr.try_borrow_mut() else {
                     return 0;
                 };
+                invalidate_specialized_array_cache(arr.as_ptr() as usize);
                 if !vm_ptr.is_null() {
                     let vm = &mut *vm_ptr;
+                    if !crate::vm::cycle::CycleCollector::is_leaf(value) {
+                        vm.cycle_collector.record_mutation();
+                    }
                     let len = vec_ref.len();
                     let cap = vec_ref.capacity();
                     if len == cap {
@@ -2021,23 +2085,23 @@ type ArrayRef = Rc<RefCell<Vec<Value>>>;
 #[cfg(feature = "std")]
 #[repr(C)]
 pub struct JitVecSlot {
-    ptr: *mut LustInt,
-    len: usize,
-    cap: usize,
-    array: *const RefCell<Vec<Value>>,
+    pub ptr: *mut LustInt,
+    pub len: usize,
+    pub cap: usize,
+    pub array: *const RefCell<Vec<Value>>,
 }
 
 #[cfg(feature = "std")]
 impl JitVecSlot {
-    /// Take the slot's contents, leaving it zeroed.
+    /// Take the slot's contents as Vec<LustInt>, leaving it zeroed.
     ///
     /// # Safety
     /// The slot holds either zeros or what `jit_unbox_array_int` stored.
-    unsafe fn take(&mut self) -> (Option<Vec<LustInt>>, Option<ArrayRef>) {
+    pub unsafe fn take_int(&mut self) -> (Option<Vec<LustInt>>, Option<ArrayRef>) {
         let vec = if self.ptr.is_null() {
             None
         } else {
-            Some(unsafe { Vec::from_raw_parts(self.ptr, self.len, self.cap) })
+            Some(unsafe { Vec::from_raw_parts(self.ptr as *mut LustInt, self.len, self.cap) })
         };
         let array = if self.array.is_null() {
             None
@@ -2050,16 +2114,366 @@ impl JitVecSlot {
         self.array = ptr::null();
         (vec, array)
     }
+
+    /// Take the slot's contents as Vec<u8> (booleans), leaving it zeroed.
+    ///
+    /// # Safety
+    /// The slot holds either zeros or what `jit_unbox_array_bool` stored.
+    pub unsafe fn take_bool(&mut self) -> (Option<Vec<u8>>, Option<ArrayRef>) {
+        let vec = if self.ptr.is_null() {
+            None
+        } else {
+            Some(unsafe { Vec::from_raw_parts(self.ptr as *mut u8, self.len, self.cap) })
+        };
+        let array = if self.array.is_null() {
+            None
+        } else {
+            Some(unsafe { Rc::from_raw(self.array) })
+        };
+        self.ptr = ptr::null_mut();
+        self.len = 0;
+        self.cap = 0;
+        self.array = ptr::null();
+        (vec, array)
+    }
+
+    /// Take the slot's contents as Vec<LustFloat>, leaving it zeroed.
+    ///
+    /// # Safety
+    /// The slot holds either zeros or what `jit_unbox_array_float` stored.
+    pub unsafe fn take_float(&mut self) -> (Option<Vec<LustFloat>>, Option<ArrayRef>) {
+        let vec = if self.ptr.is_null() {
+            None
+        } else {
+            Some(unsafe { Vec::from_raw_parts(self.ptr as *mut LustFloat, self.len, self.cap) })
+        };
+        let array = if self.array.is_null() {
+            None
+        } else {
+            Some(unsafe { Rc::from_raw(self.array) })
+        };
+        self.ptr = ptr::null_mut();
+        self.len = 0;
+        self.cap = 0;
+        self.array = ptr::null();
+        (vec, array)
+    }
+
+    /// Backwards compatibility alias for take_int.
+    pub unsafe fn take(&mut self) -> (Option<Vec<LustInt>>, Option<ArrayRef>) {
+        unsafe { self.take_int() }
+    }
+}
+
+#[cfg(feature = "std")]
+thread_local! {
+    static SPECIALIZED_BOOL_CACHE: RefCell<HashMap<usize, (Vec<u8>, bool, Weak<RefCell<Vec<Value>>>)>> = RefCell::new(HashMap::new());
+    static SPECIALIZED_INT_CACHE: RefCell<HashMap<usize, (Vec<LustInt>, bool, Weak<RefCell<Vec<Value>>>)>> = RefCell::new(HashMap::new());
+    static SPECIALIZED_FLOAT_CACHE: RefCell<HashMap<usize, (Vec<LustFloat>, bool, Weak<RefCell<Vec<Value>>>)>> = RefCell::new(HashMap::new());
+}
+
+#[cfg(feature = "std")]
+pub fn invalidate_specialized_array_cache(arr_ptr: usize) {
+    SPECIALIZED_BOOL_CACHE.with(|c| c.borrow_mut().remove(&arr_ptr));
+    SPECIALIZED_INT_CACHE.with(|c| c.borrow_mut().remove(&arr_ptr));
+    SPECIALIZED_FLOAT_CACHE.with(|c| c.borrow_mut().remove(&arr_ptr));
+}
+
+pub fn get_specialized_cached_element(arr: &Rc<RefCell<Vec<Value>>>, idx: i64) -> Option<Value> {
+    #[cfg(feature = "std")]
+    {
+        let arr_key = arr.as_ptr() as usize;
+        SPECIALIZED_BOOL_CACHE.with(|c| {
+            c.borrow().get(&arr_key).and_then(|(vec, _, _)| {
+                if idx >= 0 && (idx as usize) < vec.len() {
+                    Some(Value::Bool(vec[idx as usize] != 0))
+                } else {
+                    None
+                }
+            })
+        }).or_else(|| {
+            SPECIALIZED_INT_CACHE.with(|c| {
+                c.borrow().get(&arr_key).and_then(|(vec, _, _)| {
+                    if idx >= 0 && (idx as usize) < vec.len() {
+                        Some(Value::Int(vec[idx as usize]))
+                    } else {
+                        None
+                    }
+                })
+            })
+        }).or_else(|| {
+            SPECIALIZED_FLOAT_CACHE.with(|c| {
+                c.borrow().get(&arr_key).and_then(|(vec, _, _)| {
+                    if idx >= 0 && (idx as usize) < vec.len() {
+                        Some(Value::Float(vec[idx as usize]))
+                    } else {
+                        None
+                    }
+                })
+            })
+        })
+    }
+    #[cfg(not(feature = "std"))]
+    None
+}
+
+pub fn get_specialized_cached_len(arr: &Rc<RefCell<Vec<Value>>>) -> Option<usize> {
+    #[cfg(feature = "std")]
+    {
+        let arr_key = arr.as_ptr() as usize;
+        SPECIALIZED_BOOL_CACHE.with(|c| {
+            c.borrow().get(&arr_key).map(|(vec, _, _)| vec.len())
+        }).or_else(|| {
+            SPECIALIZED_INT_CACHE.with(|c| {
+                c.borrow().get(&arr_key).map(|(vec, _, _)| vec.len())
+            })
+        }).or_else(|| {
+            SPECIALIZED_FLOAT_CACHE.with(|c| {
+                c.borrow().get(&arr_key).map(|(vec, _, _)| vec.len())
+            })
+        })
+    }
+    #[cfg(not(feature = "std"))]
+    None
+}
+
+pub fn set_specialized_cached_element(
+    arr: &Rc<RefCell<Vec<Value>>>,
+    idx: i64,
+    val: &Value,
+) -> Option<Result<(), String>> {
+    #[cfg(feature = "std")]
+    {
+        let arr_key = arr.as_ptr() as usize;
+        let is_bool = SPECIALIZED_BOOL_CACHE.with(|c| c.borrow().contains_key(&arr_key));
+        if is_bool {
+            if let Value::Bool(b) = val {
+                return SPECIALIZED_BOOL_CACHE.with(|c| {
+                    let mut cache = c.borrow_mut();
+                    if let Some((vec, dirty, _)) = cache.get_mut(&arr_key) {
+                        if idx < 0 || (idx as usize) >= vec.len() {
+                            return Some(Err(format!(
+                                "Array index {} out of bounds (length: {})",
+                                idx,
+                                vec.len()
+                            )));
+                        }
+                        vec[idx as usize] = if *b { 1 } else { 0 };
+                        *dirty = true;
+                        Some(Ok(()))
+                    } else {
+                        None
+                    }
+                });
+            } else {
+                sync_specialized_array(arr);
+                invalidate_specialized_array_cache(arr_key);
+                return None;
+            }
+        }
+
+        let is_int = SPECIALIZED_INT_CACHE.with(|c| c.borrow().contains_key(&arr_key));
+        if is_int {
+            if let Value::Int(i) = val {
+                return SPECIALIZED_INT_CACHE.with(|c| {
+                    let mut cache = c.borrow_mut();
+                    if let Some((vec, dirty, _)) = cache.get_mut(&arr_key) {
+                        if idx < 0 || (idx as usize) >= vec.len() {
+                            return Some(Err(format!(
+                                "Array index {} out of bounds (length: {})",
+                                idx,
+                                vec.len()
+                            )));
+                        }
+                        vec[idx as usize] = *i;
+                        *dirty = true;
+                        Some(Ok(()))
+                    } else {
+                        None
+                    }
+                });
+            } else {
+                sync_specialized_array(arr);
+                invalidate_specialized_array_cache(arr_key);
+                return None;
+            }
+        }
+
+        let is_float = SPECIALIZED_FLOAT_CACHE.with(|c| c.borrow().contains_key(&arr_key));
+        if is_float {
+            if let Value::Float(f) = val {
+                return SPECIALIZED_FLOAT_CACHE.with(|c| {
+                    let mut cache = c.borrow_mut();
+                    if let Some((vec, dirty, _)) = cache.get_mut(&arr_key) {
+                        if idx < 0 || (idx as usize) >= vec.len() {
+                            return Some(Err(format!(
+                                "Array index {} out of bounds (length: {})",
+                                idx,
+                                vec.len()
+                            )));
+                        }
+                        vec[idx as usize] = *f;
+                        *dirty = true;
+                        Some(Ok(()))
+                    } else {
+                        None
+                    }
+                });
+            } else {
+                sync_specialized_array(arr);
+                invalidate_specialized_array_cache(arr_key);
+                return None;
+            }
+        }
+    }
+    None
+}
+
+pub fn sync_specialized_array(arr: &Rc<RefCell<Vec<Value>>>) {
+    #[cfg(feature = "std")]
+    {
+        let arr_key = arr.as_ptr() as usize;
+        let remove_bool = SPECIALIZED_BOOL_CACHE.with(|c| {
+            let mut cache = c.borrow_mut();
+            if let Some((vec, dirty, _)) = cache.get_mut(&arr_key) {
+                if *dirty {
+                    let arr_mut = unsafe { &mut *arr.as_ptr() };
+                    if arr_mut.len() == vec.len() {
+                        for (val, &b) in arr_mut.iter_mut().zip(vec.iter()) {
+                            *val = Value::Bool(b != 0);
+                        }
+                    } else {
+                        *arr_mut = vec.iter().map(|&b| Value::Bool(b != 0)).collect();
+                    }
+                    *dirty = false;
+                    false
+                } else {
+                    unsafe { (*arr.as_ptr()).len() != vec.len() }
+                }
+            } else {
+                false
+            }
+        });
+        if remove_bool {
+            SPECIALIZED_BOOL_CACHE.with(|c| c.borrow_mut().remove(&arr_key));
+        }
+
+        let remove_int = SPECIALIZED_INT_CACHE.with(|c| {
+            let mut cache = c.borrow_mut();
+            if let Some((vec, dirty, _)) = cache.get_mut(&arr_key) {
+                if *dirty {
+                    let arr_mut = unsafe { &mut *arr.as_ptr() };
+                    if arr_mut.len() == vec.len() {
+                        for (val, &i) in arr_mut.iter_mut().zip(vec.iter()) {
+                            *val = Value::Int(i);
+                        }
+                    } else {
+                        *arr_mut = vec.iter().map(|&i| Value::Int(i)).collect();
+                    }
+                    *dirty = false;
+                    false
+                } else {
+                    unsafe { (*arr.as_ptr()).len() != vec.len() }
+                }
+            } else {
+                false
+            }
+        });
+        if remove_int {
+            SPECIALIZED_INT_CACHE.with(|c| c.borrow_mut().remove(&arr_key));
+        }
+
+        let remove_float = SPECIALIZED_FLOAT_CACHE.with(|c| {
+            let mut cache = c.borrow_mut();
+            if let Some((vec, dirty, _)) = cache.get_mut(&arr_key) {
+                if *dirty {
+                    let arr_mut = unsafe { &mut *arr.as_ptr() };
+                    if arr_mut.len() == vec.len() {
+                        for (val, &f) in arr_mut.iter_mut().zip(vec.iter()) {
+                            *val = Value::Float(f);
+                        }
+                    } else {
+                        *arr_mut = vec.iter().map(|&f| Value::Float(f)).collect();
+                    }
+                    *dirty = false;
+                    false
+                } else {
+                    unsafe { (*arr.as_ptr()).len() != vec.len() }
+                }
+            } else {
+                false
+            }
+        });
+        if remove_float {
+            SPECIALIZED_FLOAT_CACHE.with(|c| c.borrow_mut().remove(&arr_key));
+        }
+    }
+}
+
+pub fn sync_all_specialized_arrays() {
+    #[cfg(feature = "std")]
+    {
+        SPECIALIZED_BOOL_CACHE.with(|c| {
+            let mut cache = c.borrow_mut();
+            for (&_arr_key, (vec, dirty, weak)) in cache.iter_mut() {
+                if *dirty {
+                    if let Some(rc) = weak.upgrade() {
+                        let arr_mut = unsafe { &mut *rc.as_ptr() };
+                        if arr_mut.len() == vec.len() {
+                            for (val, &b) in arr_mut.iter_mut().zip(vec.iter()) {
+                                *val = Value::Bool(b != 0);
+                            }
+                        } else {
+                            *arr_mut = vec.iter().map(|&b| Value::Bool(b != 0)).collect();
+                        }
+                        *dirty = false;
+                    }
+                }
+            }
+        });
+        SPECIALIZED_INT_CACHE.with(|c| {
+            let mut cache = c.borrow_mut();
+            for (&_arr_key, (vec, dirty, weak)) in cache.iter_mut() {
+                if *dirty {
+                    if let Some(rc) = weak.upgrade() {
+                        let arr_mut = unsafe { &mut *rc.as_ptr() };
+                        if arr_mut.len() == vec.len() {
+                            for (val, &i) in arr_mut.iter_mut().zip(vec.iter()) {
+                                *val = Value::Int(i);
+                            }
+                        } else {
+                            *arr_mut = vec.iter().map(|&i| Value::Int(i)).collect();
+                        }
+                        *dirty = false;
+                    }
+                }
+            }
+        });
+        SPECIALIZED_FLOAT_CACHE.with(|c| {
+            let mut cache = c.borrow_mut();
+            for (&_arr_key, (vec, dirty, weak)) in cache.iter_mut() {
+                if *dirty {
+                    if let Some(rc) = weak.upgrade() {
+                        let arr_mut = unsafe { &mut *rc.as_ptr() };
+                        if arr_mut.len() == vec.len() {
+                            for (val, &f) in arr_mut.iter_mut().zip(vec.iter()) {
+                                *val = Value::Float(f);
+                            }
+                        } else {
+                            *arr_mut = vec.iter().map(|&f| Value::Float(f)).collect();
+                        }
+                        *dirty = false;
+                    }
+                }
+            }
+        });
+    }
 }
 
 /// Unbox `Array<int>` into `slot`: copy the elements into a `Vec<LustInt>`
 /// and keep a reference to the array. Whatever the slot held before (an
 /// earlier unbox in an unrolled iteration) is released first; on failure
 /// the slot is left empty. Returns 1 on success, 0 on failure.
-///
-/// # Safety
-/// `array_value_ptr` points at a live `Value` and `slot` at a slot that
-/// holds zeros or what an earlier call stored.
 #[cfg(feature = "std")]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn jit_unbox_array_int(
@@ -2071,28 +2485,28 @@ pub unsafe extern "C" fn jit_unbox_array_int(
             return 0;
         }
         let slot = &mut *slot;
-        drop(slot.take());
+        drop(slot.take_int());
 
         let Value::Array(arr_rc) = &*array_value_ptr else {
             return 0;
         };
-        // Copy the elements out; do NOT move them. Moving left the source
-        // array empty for the span of the trace, and anything that re-entered
-        // the runtime mid-trace (a nested `for elem in arr`) saw a hollowed-out
-        // array. A runtime re-entry mid-trace can still see values that
-        // predate pushes made by the trace; closing that hole needs escape
-        // analysis so such arrays are never specialized at all.
-        let vec_ref = &*arr_rc.as_ptr();
-        if vec_ref.iter().any(|value| !matches!(value, Value::Int(_))) {
-            return 0;
-        }
-        let mut specialized_vec: Vec<LustInt> = vec_ref
-            .iter()
-            .map(|value| match value {
-                Value::Int(value) => *value,
-                _ => unreachable!("array element types were validated above"),
-            })
-            .collect();
+        let arr_key = arr_rc.as_ptr() as usize;
+        let cached = SPECIALIZED_INT_CACHE.with(|c| c.borrow_mut().remove(&arr_key));
+        let mut specialized_vec = if let Some((vec, _dirty, _weak)) = cached {
+            vec
+        } else {
+            let vec_ref = &*arr_rc.as_ptr();
+            if vec_ref.iter().any(|value| !matches!(value, Value::Int(_))) {
+                return 0;
+            }
+            vec_ref
+                .iter()
+                .map(|value| match value {
+                    Value::Int(value) => *value,
+                    _ => unreachable!("array element types were validated above"),
+                })
+                .collect()
+        };
         slot.len = specialized_vec.len();
         slot.cap = specialized_vec.capacity();
         slot.ptr = specialized_vec.as_mut_ptr();
@@ -2102,13 +2516,95 @@ pub unsafe extern "C" fn jit_unbox_array_int(
     }
 }
 
-/// Rebox: write the slot's elements back into the array they were unboxed
-/// from and empty the slot. An empty slot (nothing unboxed on this path) is
-/// a no-op. Returns 1 on success, 0 on a malformed slot.
-///
-/// # Safety
-/// `slot` points at a slot that holds zeros or what `jit_unbox_array_int`
-/// stored.
+/// Unbox `Array<bool>` into `slot`: copy the elements into a `Vec<u8>` (1 byte per bool)
+/// and keep a reference to the array.
+#[cfg(feature = "std")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn jit_unbox_array_bool(
+    array_value_ptr: *const Value,
+    slot: *mut JitVecSlot,
+) -> u8 {
+    unsafe {
+        if array_value_ptr.is_null() || slot.is_null() {
+            return 0;
+        }
+        let slot = &mut *slot;
+        drop(slot.take_bool());
+
+        let Value::Array(arr_rc) = &*array_value_ptr else {
+            return 0;
+        };
+        let arr_key = arr_rc.as_ptr() as usize;
+        let cached = SPECIALIZED_BOOL_CACHE.with(|c| c.borrow_mut().remove(&arr_key));
+        let mut specialized_vec = if let Some((vec, _dirty, _weak)) = cached {
+            vec
+        } else {
+            let vec_ref = &*arr_rc.as_ptr();
+            if vec_ref.iter().any(|value| !matches!(value, Value::Bool(_))) {
+                return 0;
+            }
+            vec_ref
+                .iter()
+                .map(|value| match value {
+                    Value::Bool(b) => if *b { 1u8 } else { 0u8 },
+                    _ => unreachable!("array element types were validated above"),
+                })
+                .collect()
+        };
+        slot.len = specialized_vec.len();
+        slot.cap = specialized_vec.capacity();
+        slot.ptr = specialized_vec.as_mut_ptr() as *mut LustInt;
+        core::mem::forget(specialized_vec);
+        slot.array = Rc::into_raw(Rc::clone(arr_rc));
+        1
+    }
+}
+
+/// Unbox `Array<float>` into `slot`: copy the elements into a `Vec<LustFloat>`
+/// and keep a reference to the array.
+#[cfg(feature = "std")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn jit_unbox_array_float(
+    array_value_ptr: *const Value,
+    slot: *mut JitVecSlot,
+) -> u8 {
+    unsafe {
+        if array_value_ptr.is_null() || slot.is_null() {
+            return 0;
+        }
+        let slot = &mut *slot;
+        drop(slot.take_float());
+
+        let Value::Array(arr_rc) = &*array_value_ptr else {
+            return 0;
+        };
+        let arr_key = arr_rc.as_ptr() as usize;
+        let cached = SPECIALIZED_FLOAT_CACHE.with(|c| c.borrow_mut().remove(&arr_key));
+        let mut specialized_vec = if let Some((vec, _dirty, _weak)) = cached {
+            vec
+        } else {
+            let vec_ref = &*arr_rc.as_ptr();
+            if vec_ref.iter().any(|value| !matches!(value, Value::Float(_))) {
+                return 0;
+            }
+            vec_ref
+                .iter()
+                .map(|value| match value {
+                    Value::Float(f) => *f,
+                    _ => unreachable!("array element types were validated above"),
+                })
+                .collect()
+        };
+        slot.len = specialized_vec.len();
+        slot.cap = specialized_vec.capacity();
+        slot.ptr = specialized_vec.as_mut_ptr() as *mut LustInt;
+        core::mem::forget(specialized_vec);
+        slot.array = Rc::into_raw(Rc::clone(arr_rc));
+        1
+    }
+}
+
+/// Rebox Array<int>: keep slot's elements in cache dirty for zero-copy JIT/interpreter reuse.
 #[cfg(feature = "std")]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn jit_rebox_array_int(slot: *mut JitVecSlot) -> u8 {
@@ -2116,10 +2612,14 @@ pub unsafe extern "C" fn jit_rebox_array_int(slot: *mut JitVecSlot) -> u8 {
         if slot.is_null() {
             return 0;
         }
-        let (vec, array) = (*slot).take();
+        let (vec, array) = (*slot).take_int();
         match (vec, array) {
             (Some(vec), Some(array)) => {
-                *array.as_ptr() = vec.into_iter().map(Value::Int).collect();
+                let arr_key = array.as_ptr() as usize;
+                let weak = Rc::downgrade(&array);
+                SPECIALIZED_INT_CACHE.with(|c| {
+                    c.borrow_mut().insert(arr_key, (vec, true, weak));
+                });
                 1
             }
             (None, None) => 1,
@@ -2127,8 +2627,56 @@ pub unsafe extern "C" fn jit_rebox_array_int(slot: *mut JitVecSlot) -> u8 {
         }
     }
 }
+
+/// Rebox Array<bool>: keep slot's elements in cache dirty for zero-copy JIT/interpreter reuse.
+#[cfg(feature = "std")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn jit_rebox_array_bool(slot: *mut JitVecSlot) -> u8 {
+    unsafe {
+        if slot.is_null() {
+            return 0;
+        }
+        let (vec, array) = (*slot).take_bool();
+        match (vec, array) {
+            (Some(vec), Some(array)) => {
+                let arr_key = array.as_ptr() as usize;
+                let weak = Rc::downgrade(&array);
+                SPECIALIZED_BOOL_CACHE.with(|c| {
+                    c.borrow_mut().insert(arr_key, (vec, true, weak));
+                });
+                1
+            }
+            (None, None) => 1,
+            _ => 0,
+        }
+    }
+}
+
+/// Rebox Array<float>: keep slot's elements in cache dirty for zero-copy JIT/interpreter reuse.
+#[cfg(feature = "std")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn jit_rebox_array_float(slot: *mut JitVecSlot) -> u8 {
+    unsafe {
+        if slot.is_null() {
+            return 0;
+        }
+        let (vec, array) = (*slot).take_float();
+        match (vec, array) {
+            (Some(vec), Some(array)) => {
+                let arr_key = array.as_ptr() as usize;
+                let weak = Rc::downgrade(&array);
+                SPECIALIZED_FLOAT_CACHE.with(|c| {
+                    c.borrow_mut().insert(arr_key, (vec, true, weak));
+                });
+                1
+            }
+            (None, None) => 1,
+            _ => 0,
+        }
+    }
+}
+
 /// Specialized push operation for Vec<LustInt>
-/// Directly pushes LustInt to the specialized vector
 #[cfg(feature = "std")]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn jit_vec_int_push(
@@ -2146,21 +2694,15 @@ pub unsafe extern "C" fn jit_vec_int_push(
         let len = *vec_len;
         let cap = *vec_cap;
 
-        // Reconstruct Vec temporarily
         let mut vec = Vec::from_raw_parts(ptr, len, cap);
-
-        // Push the value
         vec.push(value);
 
-        // Extract new metadata
         let new_len = vec.len();
         let new_cap = vec.capacity();
         let new_ptr = vec.as_mut_ptr();
 
-        // Prevent drop
         core::mem::forget(vec);
 
-        // Update outputs
         ptr::write(vec_ptr, new_ptr);
         ptr::write(vec_len, new_len);
         ptr::write(vec_cap, new_cap);
@@ -2169,21 +2711,117 @@ pub unsafe extern "C" fn jit_vec_int_push(
     }
 }
 
-/// Drop a specialized Vec<LustInt> (cleanup for leaked specializations)
-/// WARNING: This should NOT be called! Specialized values that get invalidated
-/// during loop recording don't actually exist on the stack during execution.
+/// Specialized push operation for Vec<u8> (booleans)
 #[cfg(feature = "std")]
-/// Drop a specialized slot without publishing it (its value was
-/// invalidated during recording).
-///
-/// # Safety
-/// `slot` points at a slot that holds zeros or what `jit_unbox_array_int`
-/// stored.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn jit_vec_bool_push(
+    vec_ptr: *mut *mut u8,
+    vec_len: *mut usize,
+    vec_cap: *mut usize,
+    value: u8,
+) -> u8 {
+    unsafe {
+        if vec_ptr.is_null() || vec_len.is_null() || vec_cap.is_null() {
+            return 0;
+        }
+
+        let ptr = *vec_ptr;
+        let len = *vec_len;
+        let cap = *vec_cap;
+
+        let mut vec = Vec::from_raw_parts(ptr, len, cap);
+        vec.push(if value != 0 { 1u8 } else { 0u8 });
+
+        let new_len = vec.len();
+        let new_cap = vec.capacity();
+        let new_ptr = vec.as_mut_ptr();
+
+        core::mem::forget(vec);
+
+        ptr::write(vec_ptr, new_ptr);
+        ptr::write(vec_len, new_len);
+        ptr::write(vec_cap, new_cap);
+
+        1
+    }
+}
+
+/// Specialized push operation for Vec<LustFloat>
+#[cfg(feature = "std")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn jit_vec_float_push(
+    vec_ptr: *mut *mut LustFloat,
+    vec_len: *mut usize,
+    vec_cap: *mut usize,
+    value: LustFloat,
+) -> u8 {
+    unsafe {
+        if vec_ptr.is_null() || vec_len.is_null() || vec_cap.is_null() {
+            return 0;
+        }
+
+        let ptr = *vec_ptr;
+        let len = *vec_len;
+        let cap = *vec_cap;
+
+        let mut vec = Vec::from_raw_parts(ptr, len, cap);
+        vec.push(value);
+
+        let new_len = vec.len();
+        let new_cap = vec.capacity();
+        let new_ptr = vec.as_mut_ptr();
+
+        core::mem::forget(vec);
+
+        ptr::write(vec_ptr, new_ptr);
+        ptr::write(vec_len, new_len);
+        ptr::write(vec_cap, new_cap);
+
+        1
+    }
+}
+
+/// Drop a specialized Vec<LustInt> slot without publishing
+#[cfg(feature = "std")]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn jit_drop_vec_int(slot: *mut JitVecSlot) {
     unsafe {
         if !slot.is_null() {
-            drop((*slot).take());
+            let (vec, array) = (*slot).take_int();
+            if let Some(arr) = array {
+                SPECIALIZED_INT_CACHE.with(|c| c.borrow_mut().remove(&(arr.as_ptr() as usize)));
+            }
+            drop(vec);
+        }
+    }
+}
+
+/// Drop a specialized Vec<u8> slot without publishing
+#[cfg(feature = "std")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn jit_drop_vec_bool(slot: *mut JitVecSlot) {
+    unsafe {
+        if !slot.is_null() {
+            let (vec, array) = (*slot).take_bool();
+            if let Some(arr) = array {
+                SPECIALIZED_BOOL_CACHE.with(|c| c.borrow_mut().remove(&(arr.as_ptr() as usize)));
+            }
+            drop(vec);
+        }
+    }
+}
+
+/// Drop a specialized Vec<LustFloat> slot without publishing
+#[cfg(feature = "std")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn jit_drop_vec_float(slot: *mut JitVecSlot) {
+    unsafe {
+        if !slot.is_null() {
+            let (vec, array) = (*slot).take_float();
+            if let Some(arr) = array {
+                SPECIALIZED_FLOAT_CACHE.with(|c| c.borrow_mut().remove(&(arr.as_ptr() as usize)));
+            }
+            drop(vec);
         }
     }
 }
@@ -2735,7 +3373,7 @@ pub unsafe extern "C" fn jit_call_function_safe(
 
         match call_result {
             Ok(value) => {
-                vm.observe_value_graph(&value);
+                vm.observe_value(&value);
                 if !out.is_null() {
                     *out = value;
                     return 1;
@@ -2874,15 +3512,62 @@ pub unsafe extern "C" fn jit_new_enum_variant_safe(
             }
         }
 
-        let enum_name = enum_name_str.to_string();
-        let variant_name = variant_name_str.to_string();
+        #[cfg(feature = "std")]
+        thread_local! {
+            static OPTION_SOME: (Name, Name) = (Name::from("Option"), Name::from("Some"));
+            static OPTION_NONE: (Name, Name) = (Name::from("Option"), Name::from("None"));
+            static RESULT_OK: (Name, Name) = (Name::from("Result"), Name::from("Ok"));
+            static RESULT_ERR: (Name, Name) = (Name::from("Result"), Name::from("Err"));
+        }
+
+        #[cfg(feature = "std")]
+        let (enum_name, variant_name) = if enum_name_slice == b"Option" && variant_name_slice == b"Some" {
+            OPTION_SOME.with(|p| (p.0.clone(), p.1.clone()))
+        } else if enum_name_slice == b"Option" && variant_name_slice == b"None" {
+            OPTION_NONE.with(|p| (p.0.clone(), p.1.clone()))
+        } else if enum_name_slice == b"Result" && variant_name_slice == b"Ok" {
+            RESULT_OK.with(|p| (p.0.clone(), p.1.clone()))
+        } else if enum_name_slice == b"Result" && variant_name_slice == b"Err" {
+            RESULT_ERR.with(|p| (p.0.clone(), p.1.clone()))
+        } else {
+            (Name::from(enum_name_str), Name::from(variant_name_str))
+        };
+        #[cfg(not(feature = "std"))]
+        let (enum_name, variant_name) = (Name::from(enum_name_str), Name::from(variant_name_str));
         let mut values = Vec::with_capacity(value_count);
         for i in 0..value_count {
             let value = &*values_ptr.add(i);
             values.push(value.clone());
         }
 
-        let value = Value::enum_variant(enum_name, variant_name, values);
+        let value = Value::Enum(EnumObject::new(enum_name, variant_name, Some(values)));
+        replace_value(out, value);
+        1
+    }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn jit_new_option_some_fast(
+    _vm_ptr: *mut VM,
+    value_ptr: *const Value,
+    out: *mut Value,
+) -> u8 {
+    unsafe {
+        if value_ptr.is_null() || out.is_null() {
+            return 0;
+        }
+        #[cfg(feature = "std")]
+        thread_local! {
+            static OPTION_SOME: (Name, Name) = (Name::from("Option"), Name::from("Some"));
+        }
+        #[cfg(feature = "std")]
+        let (enum_name, variant_name) = OPTION_SOME.with(|p| (p.0.clone(), p.1.clone()));
+        #[cfg(not(feature = "std"))]
+        let (enum_name, variant_name) = (Name::from("Option"), Name::from("Some"));
+
+        let mut values = Vec::with_capacity(1);
+        values.push((*value_ptr).clone());
+        let value = Value::Enum(EnumObject::new(enum_name, variant_name, Some(values)));
         replace_value(out, value);
         1
     }
@@ -3542,6 +4227,91 @@ pub unsafe extern "C" fn jit_new_struct_safe(
     }
 }
 
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn jit_new_struct_cached(
+    vm_ptr: *mut VM,
+    site_ptr: *mut crate::jit::JitStructSite,
+    field_values_ptr: *const Value,
+    field_count: usize,
+    out: *mut Value,
+) -> u8 {
+    unsafe {
+        if vm_ptr.is_null() || site_ptr.is_null() || out.is_null() {
+            return 0;
+        }
+        if field_count > 0 && field_values_ptr.is_null() {
+            return 0;
+        }
+        let site = &mut *site_ptr;
+        let vm = &mut *vm_ptr;
+
+        if let Some(ref layout) = site.layout {
+            let layout = layout.clone();
+            let mut ordered = Vec::with_capacity(field_count);
+            for i in 0..field_count {
+                ordered.push((*field_values_ptr.add(i)).clone());
+            }
+            let struct_obj = StructObject::new(
+                layout.name_interned().clone(),
+                layout,
+                ordered,
+            );
+            vm.observe_struct_direct(&struct_obj);
+            replace_value(out, Value::Struct(struct_obj));
+            vm.record_struct_fast_path();
+            return 1;
+        }
+
+        // First call: resolve layout
+        if let Some(info) = vm.struct_metadata.get(&site.name) {
+            let layout_fields = info.layout.field_names();
+            if info.layout.name() == site.name.as_str()
+                && layout_fields.len() == field_count
+                && !info.layout.has_weak_fields()
+            {
+                let mut matched = true;
+                for i in 0..field_count {
+                    if site.field_names[i] != *layout_fields[i] {
+                        matched = false;
+                        break;
+                    }
+                }
+                if matched {
+                    site.layout = Some(info.layout.clone());
+                    let layout = info.layout.clone();
+                    let mut ordered = Vec::with_capacity(field_count);
+                    for i in 0..field_count {
+                        ordered.push((*field_values_ptr.add(i)).clone());
+                    }
+                    let struct_obj = StructObject::new(
+                        layout.name_interned().clone(),
+                        layout,
+                        ordered,
+                    );
+                    vm.observe_struct_direct(&struct_obj);
+                    replace_value(out, Value::Struct(struct_obj));
+                    vm.record_struct_fast_path();
+                    return 1;
+                }
+            }
+        }
+
+        // Fallback to general instantiation
+        let mut field_names_ptrs: Vec<*const u8> = site.field_names.iter().map(|s| s.as_ptr()).collect();
+        let mut field_name_lens: Vec<usize> = site.field_names.iter().map(|s| s.len()).collect();
+        jit_new_struct_safe(
+            vm_ptr,
+            site.name.as_ptr(),
+            site.name.len(),
+            field_names_ptrs.as_mut_ptr(),
+            field_name_lens.as_mut_ptr(),
+            field_values_ptr,
+            field_count,
+            out,
+        )
+    }
+}
+
 /// Take another reference to whatever the value owns (the counterpart of
 /// a bitwise copy generated code made of it).
 ///
@@ -3575,6 +4345,32 @@ pub unsafe extern "C" fn jit_move_safe(src_ptr: *const Value, dest_ptr: *mut Val
 
         let cloned_value = (&*src_ptr).clone();
         replace_value(dest_ptr, cloned_value);
+        1
+    }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn jit_set_global_safe(
+    vm_ptr: *mut VM,
+    name_ptr: *const u8,
+    name_len: usize,
+    value_ptr: *const Value,
+) -> u8 {
+    unsafe {
+        if vm_ptr.is_null() || name_ptr.is_null() || value_ptr.is_null() {
+            return 0;
+        }
+
+        let name_slice = slice::from_raw_parts(name_ptr, name_len);
+        let name_str = match str::from_utf8(name_slice) {
+            Ok(s) => s,
+            Err(_) => return 0,
+        };
+
+        let vm = &mut *vm_ptr;
+        let cloned_value = (&*value_ptr).clone();
+        vm.observe_value(&cloned_value);
+        vm.globals.insert(name_str.to_string(), cloned_value);
         1
     }
 }

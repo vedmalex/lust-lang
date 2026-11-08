@@ -29,9 +29,10 @@
 //! own frame, so pinning is suspended inside them.
 
 use super::*;
-use crate::jit::trace::Operand;
+use crate::jit::trace::{Operand, SpecializedOpKind};
 use hashbrown::HashMap;
 
+#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum PinClass {
     Carried,
@@ -79,8 +80,70 @@ fn scalar(ty: ValueType) -> Option<ValueType> {
     matches!(ty, ValueType::Int | ValueType::Float | ValueType::Bool).then_some(ty)
 }
 
+fn specialized_element_type(
+    layout: &crate::jit::specialization::SpecializedLayout,
+) -> Option<ValueType> {
+    use crate::jit::specialization::SpecializedLayout;
+    match layout {
+        SpecializedLayout::Vec {
+            element_layout,
+            element_size,
+        } => match &**element_layout {
+            SpecializedLayout::Scalar { size: 1, .. } => Some(ValueType::Bool),
+            SpecializedLayout::Scalar {
+                size,
+                is_float: false,
+                ..
+            } if *size == core::mem::size_of::<crate::number::LustInt>() => {
+                Some(ValueType::Int)
+            }
+            SpecializedLayout::Scalar {
+                size,
+                is_float: true,
+                ..
+            } if *size == core::mem::size_of::<crate::number::LustFloat>() => {
+                Some(ValueType::Float)
+            }
+            _ if *element_size == 1 => Some(ValueType::Bool),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+fn collect_spec_types<'a>(
+    ops: impl IntoIterator<Item = &'a TraceOp>,
+) -> HashMap<usize, ValueType> {
+    let mut map = HashMap::new();
+    for op in ops {
+        match op {
+            TraceOp::Unbox {
+                specialized_id,
+                layout,
+                ..
+            }
+            | TraceOp::Rebox {
+                specialized_id,
+                layout,
+                ..
+            }
+            | TraceOp::DropSpecialized {
+                specialized_id,
+                layout,
+                ..
+            } => {
+                if let Some(elem_ty) = specialized_element_type(layout) {
+                    map.insert(*specialized_id, elem_ty);
+                }
+            }
+            _ => {}
+        }
+    }
+    map
+}
+
 /// Static scalar-type environment, mirroring `update_scalar_registers`.
-fn env_update(env: &mut HashMap<u8, ValueType>, op: &TraceOp) {
+fn env_update(env: &mut HashMap<u8, ValueType>, op: &TraceOp, spec_types: &HashMap<usize, ValueType>) {
     let set = |env: &mut HashMap<u8, ValueType>, r: u8, ty: Option<ValueType>| match ty {
         Some(ty) => {
             env.insert(r, ty);
@@ -153,13 +216,30 @@ fn env_update(env: &mut HashMap<u8, ValueType>, op: &TraceOp) {
         TraceOp::ArrayIndexOk {
             value_dest,
             condition_dest,
+            value_type,
             ..
         } => {
-            env.remove(value_dest);
+            if let Some(ty) = value_type {
+                set(env, *value_dest, scalar(*ty));
+            } else {
+                env.remove(value_dest);
+            }
             env.insert(*condition_dest, ValueType::Bool);
         }
-        TraceOp::GetField { dest, .. }
-        | TraceOp::Concat { dest, .. }
+        TraceOp::GetField {
+            dest,
+            field_index,
+            value_type,
+            is_weak,
+            ..
+        } => {
+            if let (Some(_), Some(ty), false) = (field_index, value_type.and_then(scalar), is_weak) {
+                set(env, *dest, Some(ty));
+            } else {
+                env.remove(dest);
+            }
+        }
+        TraceOp::Concat { dest, .. }
         | TraceOp::GetIndex { dest, .. }
         | TraceOp::TryGetIndex { dest, .. }
         | TraceOp::CallNative { dest, .. }
@@ -174,21 +254,56 @@ fn env_update(env: &mut HashMap<u8, ValueType>, op: &TraceOp) {
         | TraceOp::GetEnumValue { dest, .. } => {
             env.remove(dest);
         }
-        TraceOp::BorrowField { dest, .. } | TraceOp::BorrowEnumValue { dest, .. } => {
+        TraceOp::BorrowField { dest, .. }
+        | TraceOp::BorrowEnumValue { dest, .. }
+        | TraceOp::BorrowFieldSome { dest, .. } => {
             set(env, *dest, Some(ValueType::Plain));
         }
         TraceOp::Rebox { dest_reg, .. } => {
             env.remove(dest_reg);
         }
-        TraceOp::SpecializedOp { operands, .. } => {
-            for operand in operands {
-                if let Operand::Register(r) = operand {
-                    env.remove(r);
+        TraceOp::SpecializedOp { op, operands } => match op {
+            SpecializedOpKind::VecLen => {
+                if let Some(Operand::Register(dest)) = operands.get(1) {
+                    set(env, *dest, Some(ValueType::Int));
                 }
             }
-        }
+            SpecializedOpKind::VecIndexOk => {
+                if let Some(Operand::Register(cond_dest)) = operands.get(1) {
+                    set(env, *cond_dest, Some(ValueType::Bool));
+                }
+                if let (Some(Operand::Register(val_dest)), Some(Operand::Specialized(vec_id))) =
+                    (operands.get(0), operands.get(2))
+                {
+                    set(env, *val_dest, spec_types.get(vec_id).copied());
+                } else if let Some(Operand::Register(val_dest)) = operands.get(0) {
+                    env.remove(val_dest);
+                }
+            }
+            SpecializedOpKind::VecGet => {
+                if let (Some(Operand::Register(dest)), Some(Operand::Specialized(vec_id))) =
+                    (operands.get(0), operands.get(1))
+                {
+                    set(env, *dest, spec_types.get(vec_id).copied());
+                } else if let Some(Operand::Register(dest)) = operands.get(0) {
+                    env.remove(dest);
+                }
+            }
+            SpecializedOpKind::VecPop => {
+                if let (Some(Operand::Register(dest)), Some(Operand::Specialized(vec_id))) =
+                    (operands.get(0), operands.get(1))
+                {
+                    set(env, *dest, spec_types.get(vec_id).copied());
+                } else if let Some(Operand::Register(dest)) = operands.get(0) {
+                    env.remove(dest);
+                }
+            }
+            SpecializedOpKind::VecPush | SpecializedOpKind::VecSet => {}
+            _ => {}
+        },
         TraceOp::ArrayPush { dest, .. } => set(env, *dest, Some(ValueType::Plain)),
         TraceOp::SetField { .. }
+        | TraceOp::StoreGlobal { .. }
         | TraceOp::RestoreField { .. }
         | TraceOp::SetIndex { .. }
         | TraceOp::GuardNativeFunction { .. }
@@ -204,6 +319,7 @@ fn env_update(env: &mut HashMap<u8, ValueType>, op: &TraceOp) {
         TraceOp::Select { dest, on_true, .. } => set(env, *dest, const_type(on_true)),
         TraceOp::SelectBitZero { dest, on_zero, .. } => set(env, *dest, const_type(on_zero)),
         TraceOp::ModImm { dest, .. } => set(env, *dest, Some(ValueType::Int)),
+        TraceOp::ConditionalHammock { acc_dest, .. } => set(env, *acc_dest, Some(ValueType::Int)),
     }
 }
 
@@ -247,7 +363,11 @@ struct Effects {
     guard: Option<(u8, ValueType)>,
 }
 
-fn effects(op: &TraceOp, env: &HashMap<u8, ValueType>) -> Effects {
+fn effects(
+    op: &TraceOp,
+    env: &HashMap<u8, ValueType>,
+    spec_types: &HashMap<usize, ValueType>,
+) -> Effects {
     let mut e = Effects {
         reads: Vec::new(),
         native_writes: Vec::new(),
@@ -406,12 +526,16 @@ fn effects(op: &TraceOp, env: &HashMap<u8, ValueType>) -> Effects {
             condition_dest,
             array,
             index,
-            ..
+            value_type,
         } => {
             e.reads.push((*array, None));
-            e.reads.push((*index, None));
-            e.helper_writes.push(*value_dest);
-            e.helper_writes.push(*condition_dest);
+            e.reads.push((*index, Some(ValueType::Int)));
+            if let Some(ty) = value_type {
+                e.native_writes.push((*value_dest, Some(*ty)));
+            } else {
+                e.helper_writes.push(*value_dest);
+            }
+            e.native_writes.push((*condition_dest, Some(ValueType::Bool)));
         }
         TraceOp::ArrayLen { dest, array } => {
             e.reads.push((*array, None));
@@ -460,9 +584,20 @@ fn effects(op: &TraceOp, env: &HashMap<u8, ValueType>) -> Effects {
             e.reads.extend(range(*first_arg, *arg_count));
             e.helper_writes.push(*dest);
         }
-        TraceOp::GetField { dest, object, .. } => {
+        TraceOp::GetField {
+            dest,
+            object,
+            field_index,
+            value_type,
+            is_weak,
+            ..
+        } => {
             e.reads.push((*object, None));
-            e.helper_writes.push(*dest);
+            if let (Some(_), Some(ty), false) = (field_index, value_type.and_then(scalar), is_weak) {
+                e.native_writes.push((*dest, Some(ty)));
+            } else {
+                e.helper_writes.push(*dest);
+            }
         }
         TraceOp::SetField { object, value, .. }
         | TraceOp::RestoreField { object, value, .. } => {
@@ -482,7 +617,7 @@ fn effects(op: &TraceOp, env: &HashMap<u8, ValueType>) -> Effects {
         TraceOp::ArrayPush { dest, array, value } => {
             e.reads.push((*array, None));
             e.reads.push((*value, None));
-            e.helper_writes.push(*dest);
+            e.native_writes.push((*dest, None));
         }
         TraceOp::NewArray {
             dest,
@@ -491,6 +626,9 @@ fn effects(op: &TraceOp, env: &HashMap<u8, ValueType>) -> Effects {
         } => {
             e.reads.extend(range(*first_element, *count));
             e.helper_writes.push(*dest);
+        }
+        TraceOp::StoreGlobal { src, .. } => {
+            e.reads.push((*src, None));
         }
         TraceOp::NewStruct {
             dest,
@@ -521,7 +659,8 @@ fn effects(op: &TraceOp, env: &HashMap<u8, ValueType>) -> Effects {
             e.reads.push((*enum_reg, None));
             e.helper_writes.push(*dest);
         }
-        TraceOp::BorrowField { dest, object, .. } => {
+        TraceOp::BorrowField { dest, object, .. }
+        | TraceOp::BorrowFieldSome { dest, object, .. } => {
             e.reads.push((*object, None));
             e.helper_writes.push(*dest);
         }
@@ -568,15 +707,104 @@ fn effects(op: &TraceOp, env: &HashMap<u8, ValueType>) -> Effects {
             e.reads.push((*src, src_ty));
             e.native_writes.push((*dest, Some(ValueType::Int)));
         }
-        TraceOp::SpecializedOp { operands, .. } => {
-            for operand in operands {
-                if let Operand::Register(r) = operand {
-                    // VecLen writes its register natively; VecPush reads.
-                    // Be conservative: treat as a helper write.
-                    e.helper_writes.push(*r);
+        TraceOp::ConditionalHammock {
+            condition_register,
+            acc_dest,
+            acc_src,
+            inner_loop_bypass,
+            ..
+        } => {
+            let cond_ty = env.get(condition_register).copied();
+            e.reads.push((*condition_register, cond_ty));
+            let src_ty = env.get(acc_src).copied();
+            e.reads.push((*acc_src, src_ty));
+            if let Some(bypass) = inner_loop_bypass {
+                let lhs_ty = env.get(&bypass.mul_lhs).copied();
+                e.reads.push((bypass.mul_lhs, lhs_ty));
+                let rhs_ty = env.get(&bypass.mul_rhs).copied();
+                e.reads.push((bypass.mul_rhs, rhs_ty));
+                let bnd_ty = env.get(&bypass.bound_reg).copied();
+                e.reads.push((bypass.bound_reg, bnd_ty));
+            }
+            e.native_writes.push((*acc_dest, Some(ValueType::Int)));
+        }
+        TraceOp::SpecializedOp { op, operands } => match op {
+            SpecializedOpKind::VecSet => {
+                if let Some(Operand::Register(index)) = operands.get(1) {
+                    e.reads.push((*index, Some(ValueType::Int)));
+                }
+                let elem_ty = operands.get(0).and_then(|op| match op {
+                    Operand::Specialized(id) => spec_types.get(id).copied(),
+                    _ => None,
+                });
+                if let Some(Operand::Register(value)) = operands.get(2) {
+                    e.reads.push((*value, elem_ty));
                 }
             }
-        }
+            SpecializedOpKind::VecPush => {
+                let elem_ty = operands.get(0).and_then(|op| match op {
+                    Operand::Specialized(id) => spec_types.get(id).copied(),
+                    _ => None,
+                });
+                if let Some(Operand::Register(value)) = operands.get(1) {
+                    e.reads.push((*value, elem_ty));
+                }
+            }
+            SpecializedOpKind::VecLen => {
+                if let Some(Operand::Register(dest)) = operands.get(1) {
+                    e.native_writes.push((*dest, Some(ValueType::Int)));
+                }
+            }
+            SpecializedOpKind::VecIndexOk => {
+                if let Some(Operand::Register(index)) = operands.get(3) {
+                    e.reads.push((*index, Some(ValueType::Int)));
+                }
+                let elem_ty = operands.get(2).and_then(|op| match op {
+                    Operand::Specialized(id) => spec_types.get(id).copied(),
+                    _ => None,
+                });
+                if let Some(Operand::Register(val_dest)) = operands.get(0) {
+                    if let Some(ty) = elem_ty {
+                        e.native_writes.push((*val_dest, Some(ty)));
+                    } else {
+                        e.helper_writes.push(*val_dest);
+                    }
+                }
+                if let Some(Operand::Register(cond_dest)) = operands.get(1) {
+                    e.native_writes.push((*cond_dest, Some(ValueType::Bool)));
+                }
+            }
+            SpecializedOpKind::VecGet => {
+                if let Some(Operand::Register(index)) = operands.get(2) {
+                    e.reads.push((*index, Some(ValueType::Int)));
+                }
+                let elem_ty = operands.get(1).and_then(|op| match op {
+                    Operand::Specialized(id) => spec_types.get(id).copied(),
+                    _ => None,
+                });
+                if let Some(Operand::Register(dest)) = operands.get(0) {
+                    if let Some(ty) = elem_ty {
+                        e.native_writes.push((*dest, Some(ty)));
+                    } else {
+                        e.helper_writes.push(*dest);
+                    }
+                }
+            }
+            SpecializedOpKind::VecPop => {
+                let elem_ty = operands.get(1).and_then(|op| match op {
+                    Operand::Specialized(id) => spec_types.get(id).copied(),
+                    _ => None,
+                });
+                if let Some(Operand::Register(dest)) = operands.get(0) {
+                    if let Some(ty) = elem_ty {
+                        e.native_writes.push((*dest, Some(ty)));
+                    } else {
+                        e.helper_writes.push(*dest);
+                    }
+                }
+            }
+            _ => {}
+        },
     }
     e
 }
@@ -587,13 +815,15 @@ pub(super) fn op_touches_register_memory(op: &TraceOp) -> bool {
     !matches!(
         op,
         TraceOp::At { .. }
-            | TraceOp::LoadConst {
-                value: Value::Int(_) | Value::Float(_) | Value::Bool(_),
-                ..
-            }
+            | TraceOp::Label { .. }
+            | TraceOp::Jump { .. }
+            | TraceOp::BranchIf { .. }
+            | TraceOp::Move { .. }
+            | TraceOp::LoadConst { .. }
             | TraceOp::Select { .. }
             | TraceOp::SelectBitZero { .. }
             | TraceOp::ModImm { .. }
+            | TraceOp::ConditionalHammock { .. }
             | TraceOp::Add { .. }
             | TraceOp::Sub { .. }
             | TraceOp::Mul { .. }
@@ -609,9 +839,18 @@ pub(super) fn op_touches_register_memory(op: &TraceOp) -> bool {
             | TraceOp::And { .. }
             | TraceOp::Or { .. }
             | TraceOp::Not { .. }
+            | TraceOp::ArrayLen { .. }
+            | TraceOp::ArrayIndexOk { value_type: Some(_), .. }
+            | TraceOp::ArrayPush { .. }
             | TraceOp::Guard { .. }
             | TraceOp::GuardGlobals { .. }
             | TraceOp::GuardLoopContinue { .. }
+            | TraceOp::GuardStructLayout { .. }
+            | TraceOp::BorrowFieldSome { .. }
+            | TraceOp::BorrowEnumValue { .. }
+            | TraceOp::BorrowField { .. }
+            | TraceOp::GetField { .. }
+            | TraceOp::SpecializedOp { .. }
             | TraceOp::Return { .. }
     )
 }
@@ -905,7 +1144,7 @@ pub(super) fn plan_function(body: &[TraceOp]) -> HashMap<u8, Pin> {
     if std::env::var_os("LUST_JIT_NOPIN").is_some() {
         return HashMap::new();
     }
-    // Pins cost a few saves and loads per call; only a loop repays them.
+    // Pins cost a few saves and loads per call; only loops or calls repay them.
     let mut labels_seen = hashbrown::HashSet::new();
     let has_loop = body.iter().any(|op| match op {
         TraceOp::Label { id, .. } => {
@@ -915,9 +1154,19 @@ pub(super) fn plan_function(body: &[TraceOp]) -> HashMap<u8, Pin> {
         TraceOp::Jump { label } | TraceOp::BranchIf { label, .. } => labels_seen.contains(label),
         _ => false,
     });
-    if !has_loop {
+    let has_calls = body.iter().any(|op| {
+        matches!(
+            op,
+            TraceOp::CallDirect { .. }
+                | TraceOp::CallFunction { .. }
+                | TraceOp::CallNative { .. }
+                | TraceOp::CallMethod { .. }
+        )
+    });
+    if !has_loop && !has_calls {
         return HashMap::new();
     }
+    let spec_types = collect_spec_types(body);
     let mut env: HashMap<u8, ValueType> = HashMap::new();
     let mut candidates: HashMap<u8, Candidate> = HashMap::new();
     for op in body {
@@ -925,7 +1174,7 @@ pub(super) fn plan_function(body: &[TraceOp]) -> HashMap<u8, Pin> {
             env = scalars.iter().copied().collect();
             continue;
         }
-        let e = effects(op, &env);
+        let e = effects(op, &env, &spec_types);
         for (r, _) in e.reads {
             candidates.entry(r).or_default().accesses += 1;
         }
@@ -937,7 +1186,7 @@ pub(super) fn plan_function(body: &[TraceOp]) -> HashMap<u8, Pin> {
         for r in e.helper_writes {
             candidates.entry(r).or_default().helper_write = true;
         }
-        env_update(&mut env, op);
+        env_update(&mut env, op, &spec_types);
     }
     let mut eligible: Vec<(u8, ValueType, usize)> = Vec::new();
     for (r, cand) in candidates {
@@ -958,29 +1207,74 @@ pub(super) fn plan_function(body: &[TraceOp]) -> HashMap<u8, Pin> {
             eligible.push((r, ty, cand.accesses));
         }
     }
-    eligible.sort_by(|a, b| b.2.cmp(&a.2).then(a.0.cmp(&b.0)));
     let live_in = carried_registers(body);
+    let (mut carried_eligible, mut local_eligible): (Vec<_>, Vec<_>) =
+        eligible.into_iter().partition(|(r, ..)| live_in.contains(r));
+    carried_eligible.sort_by(|a, b| b.2.cmp(&a.2).then(a.0.cmp(&b.0)));
+    local_eligible.sort_by(|a, b| b.2.cmp(&a.2).then(a.0.cmp(&b.0)));
+
+    let has_array_ops = body.iter().any(|op| {
+        matches!(
+            op,
+            TraceOp::SetIndex { .. }
+                | TraceOp::GetIndex { .. }
+                | TraceOp::TryGetIndex { .. }
+                | TraceOp::ArrayIndexOk { .. }
+                | TraceOp::ArrayPush { .. }
+        )
+    });
+
+    let max_int_pins = if has_array_ops {
+        INT_PIN_REGS.len().saturating_sub(3)
+    } else {
+        INT_PIN_REGS.len()
+    };
+
+    let mut int_allocated = 0;
     let mut ints = INT_PIN_REGS.iter();
     let mut floats = FLOAT_PIN_REGS.iter();
     let mut pins = HashMap::new();
-    for (r, ty, _) in eligible {
+
+    for (r, ty, _) in carried_eligible {
         let reg = match ty {
             ValueType::Float => floats.next(),
-            _ => ints.next(),
+            _ => {
+                int_allocated += 1;
+                ints.next()
+            }
         };
         let Some(reg) = reg else { continue };
-        let carried = live_in.contains(&r);
         pins.insert(
             r,
             Pin {
                 ty,
                 reg: *reg,
-                class: if carried {
-                    PinClass::Carried
+                class: PinClass::Carried,
+                proven_at_entry: true,
+            },
+        );
+    }
+
+    for (r, ty, _) in local_eligible {
+        let reg = match ty {
+            ValueType::Float => floats.next(),
+            _ => {
+                if int_allocated >= max_int_pins {
+                    None
                 } else {
-                    PinClass::Local
-                },
-                proven_at_entry: carried,
+                    int_allocated += 1;
+                    ints.next()
+                }
+            }
+        };
+        let Some(reg) = reg else { continue };
+        pins.insert(
+            r,
+            Pin {
+                ty,
+                reg: *reg,
+                class: PinClass::Carried,
+                proven_at_entry: false,
             },
         );
     }
@@ -992,6 +1286,7 @@ pub(super) fn plan_function(body: &[TraceOp]) -> HashMap<u8, Pin> {
 /// native op inside that loop. Their payload must survive the back-edge in
 /// a machine register; memory is stale until a flush.
 fn carried_registers(body: &[TraceOp]) -> hashbrown::HashSet<u8> {
+    let spec_types = collect_spec_types(body);
     let mut label_at: HashMap<usize, usize> = HashMap::new();
     for (index, op) in body.iter().enumerate() {
         if let TraceOp::Label { id, .. } = op {
@@ -1017,7 +1312,7 @@ fn carried_registers(body: &[TraceOp]) -> hashbrown::HashSet<u8> {
         let mut first: HashMap<u8, Access> = HashMap::new();
         let mut wrote = hashbrown::HashSet::new();
         for op in &body[start..=index] {
-            let effects = effects(op, &env);
+            let effects = effects(op, &env, &spec_types);
             if let Some((reg, ty)) = effects.guard {
                 first.entry(reg).or_insert(Access::Guard(ty));
             }
@@ -1031,7 +1326,7 @@ fn carried_registers(body: &[TraceOp]) -> hashbrown::HashSet<u8> {
             for reg in effects.helper_writes {
                 first.entry(reg).or_insert(Access::Write);
             }
-            env_update(&mut env, op);
+            env_update(&mut env, op, &spec_types);
         }
         for (reg, access) in first {
             if wrote.contains(&reg) && !matches!(access, Access::Write) {
@@ -1060,6 +1355,7 @@ pub(super) fn plan(
     {
         return HashMap::new();
     }
+    let spec_types = collect_spec_types(preamble.iter().chain(body.iter()));
     let mut entry_env: HashMap<u8, ValueType> = HashMap::new();
     for (dest, value) in hoisted_constants {
         match const_type(value) {
@@ -1072,7 +1368,7 @@ pub(super) fn plan(
         }
     }
     for op in preamble {
-        env_update(&mut entry_env, op);
+        env_update(&mut entry_env, op, &spec_types);
     }
 
     let mut env = entry_env.clone();
@@ -1085,7 +1381,7 @@ pub(super) fn plan(
         }
     };
     for op in body {
-        let e = effects(op, &env);
+        let e = effects(op, &env, &spec_types);
         if let Some((r, ty)) = e.guard {
             touch(&mut candidates, r, Access::Guard(ty));
             candidates.get_mut(&r).unwrap().guard_types.push(ty);
@@ -1105,11 +1401,11 @@ pub(super) fn plan(
             touch(&mut candidates, r, Access::Write);
             candidates.get_mut(&r).unwrap().helper_write = true;
         }
-        env_update(&mut env, op);
+        env_update(&mut env, op, &spec_types);
     }
 
     let mut eligible: Vec<(u8, Pin, usize)> = Vec::new();
-    for (r, cand) in candidates {
+    for (r, cand) in &candidates {
         if cand.helper_write {
             continue;
         }
@@ -1135,7 +1431,7 @@ pub(super) fn plan(
         }
         let Some(first) = cand.first else { continue };
         let (class, proven_at_entry) = match first {
-            Access::Write => (PinClass::Local, true),
+            Access::Write => (PinClass::Carried, false),
             Access::Guard(t) => {
                 // The body's guard proves the type each iteration.
                 if ty.is_some_and(|ty| ty != t) {
@@ -1147,7 +1443,7 @@ pub(super) fn plan(
             Access::Read => {
                 // The type at entry must already be proven: by the preamble,
                 // or by a typed read the recorder itself relies on.
-                let entry_ty = entry_env.get(&r).copied().or(cand.read_type);
+                let entry_ty = entry_env.get(r).copied().or(cand.read_type);
                 match (entry_ty, ty) {
                     (Some(a), Some(b)) if a != b => continue,
                     (None, _) => continue,
@@ -1160,7 +1456,7 @@ pub(super) fn plan(
             continue;
         };
         eligible.push((
-            r,
+            *r,
             Pin {
                 ty,
                 reg: 0,

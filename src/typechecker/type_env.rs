@@ -94,6 +94,9 @@ impl TypeEnv {
         self.register_builtin_type("LuaFunction");
         self.register_builtin_type("LuaUserdata");
         self.register_builtin_type("LuaThread");
+        self.register_builtin_type("Array");
+        self.register_builtin_type("Map");
+        self.register_builtin_type("Table");
         let task_status_type = Type::new(TypeKind::Named("TaskStatus".to_string()), dummy_span);
         let unknown_type = Type::new(TypeKind::Unknown, dummy_span);
         let option_unknown_type =
@@ -283,6 +286,7 @@ impl TypeEnv {
         );
         self.register_builtin_function_slice(builtins::base_functions(), dummy_span);
         self.register_builtin_function_slice(builtins::array_functions(), dummy_span);
+        self.register_builtin_function_slice(builtins::table_functions(), dummy_span);
         self.register_builtin_function_slice(builtins::map_functions(), dummy_span);
         self.register_builtin_function_slice(builtins::math_functions(), dummy_span);
         self.register_builtin_function_slice(builtins::string_functions(), dummy_span);
@@ -291,6 +295,10 @@ impl TypeEnv {
         if let Some(global_scope) = self.scopes.first_mut() {
             global_scope.insert(
                 "array".to_string(),
+                Type::new(TypeKind::Unknown, dummy_span),
+            );
+            global_scope.insert(
+                "table".to_string(),
                 Type::new(TypeKind::Unknown, dummy_span),
             );
             global_scope.insert("map".to_string(), Type::new(TypeKind::Unknown, dummy_span));
@@ -559,7 +567,81 @@ impl TypeEnv {
         self.refinements.pop();
     }
 
+    pub fn resolve_type(&self, ty: &Type) -> Type {
+        match &ty.kind {
+            TypeKind::GenericInstance { name, type_args } if name == "Table" => {
+                match type_args.len() {
+                    1 => Type::new(
+                        TypeKind::Array(Box::new(self.resolve_type(&type_args[0]))),
+                        ty.span,
+                    ),
+                    2 => Type::new(
+                        TypeKind::Map(
+                            Box::new(self.resolve_type(&type_args[0])),
+                            Box::new(self.resolve_type(&type_args[1])),
+                        ),
+                        ty.span,
+                    ),
+                    _ => ty.clone(),
+                }
+            }
+            TypeKind::Named(name) if name == "Table" => Type::new(
+                TypeKind::Array(Box::new(Type::new(TypeKind::Unknown, ty.span))),
+                ty.span,
+            ),
+            TypeKind::Array(inner) => {
+                Type::new(TypeKind::Array(Box::new(self.resolve_type(inner))), ty.span)
+            }
+            TypeKind::Map(k, v) => Type::new(
+                TypeKind::Map(
+                    Box::new(self.resolve_type(k)),
+                    Box::new(self.resolve_type(v)),
+                ),
+                ty.span,
+            ),
+            TypeKind::Option(inner) => {
+                Type::new(TypeKind::Option(Box::new(self.resolve_type(inner))), ty.span)
+            }
+            TypeKind::Result(ok, err) => Type::new(
+                TypeKind::Result(
+                    Box::new(self.resolve_type(ok)),
+                    Box::new(self.resolve_type(err)),
+                ),
+                ty.span,
+            ),
+            TypeKind::Ref(inner) => {
+                Type::new(TypeKind::Ref(Box::new(self.resolve_type(inner))), ty.span)
+            }
+            TypeKind::MutRef(inner) => {
+                Type::new(TypeKind::MutRef(Box::new(self.resolve_type(inner))), ty.span)
+            }
+            TypeKind::Tuple(types) => Type::new(
+                TypeKind::Tuple(types.iter().map(|t| self.resolve_type(t)).collect()),
+                ty.span,
+            ),
+            TypeKind::GenericInstance { name, type_args } => Type::new(
+                TypeKind::GenericInstance {
+                    name: name.clone(),
+                    type_args: type_args.iter().map(|t| self.resolve_type(t)).collect(),
+                },
+                ty.span,
+            ),
+            TypeKind::Function {
+                params,
+                return_type,
+            } => Type::new(
+                TypeKind::Function {
+                    params: params.iter().map(|p| self.resolve_type(p)).collect(),
+                    return_type: Box::new(self.resolve_type(return_type)),
+                },
+                ty.span,
+            ),
+            _ => ty.clone(),
+        }
+    }
+
     pub fn declare_variable(&mut self, name: String, ty: Type) -> Result<()> {
+        let ty = self.resolve_type(&ty);
         let scope = self
             .scopes
             .last_mut()
@@ -585,12 +667,14 @@ impl TypeEnv {
     }
 
     pub fn refine_variable_type(&mut self, name: String, refined_type: Type) {
+        let refined_type = self.resolve_type(&refined_type);
         if let Some(refinement_scope) = self.refinements.last_mut() {
             refinement_scope.insert(name, refined_type);
         }
     }
 
     pub fn register_constant(&mut self, name: String, ty: Type) -> Result<()> {
+        let ty = self.resolve_type(&ty);
         if let Some(existing) = self.constants.get(&name) {
             if existing != &ty {
                 return Err(LustError::TypeError {
@@ -618,6 +702,7 @@ impl TypeEnv {
         type_param: String,
         concrete_type: Type,
     ) {
+        let concrete_type = self.resolve_type(&concrete_type);
         self.generic_instances
             .entry(var_name)
             .or_default()
@@ -631,12 +716,14 @@ impl TypeEnv {
             .cloned()
     }
 
-    pub fn register_function(&mut self, name: String, sig: FunctionSignature) -> Result<()> {
+    pub fn register_function(&mut self, name: String, mut sig: FunctionSignature) -> Result<()> {
         if self.functions.contains_key(&name) {
             return Err(LustError::TypeError {
                 message: format!("Function '{}' is already defined", name),
             });
         }
+        sig.params = sig.params.iter().map(|p| self.resolve_type(p)).collect();
+        sig.return_type = self.resolve_type(&sig.return_type);
 
         self.functions.insert(name, sig);
         Ok(())
@@ -645,8 +732,10 @@ impl TypeEnv {
     pub fn register_or_update_function(
         &mut self,
         name: String,
-        sig: FunctionSignature,
+        mut sig: FunctionSignature,
     ) -> Result<()> {
+        sig.params = sig.params.iter().map(|p| self.resolve_type(p)).collect();
+        sig.return_type = self.resolve_type(&sig.return_type);
         if let Some(existing) = self.functions.get_mut(&name) {
             if existing.params != sig.params || existing.return_type != sig.return_type {
                 return Err(LustError::TypeError {
@@ -780,10 +869,11 @@ impl TypeEnv {
     }
 
     pub fn lookup_method(&self, type_name: &str, method_name: &str) -> Option<&FunctionDef> {
+        let effective_name = if type_name == "Table" { "Array" } else { type_name };
         for impl_block in &self.impls {
             if let TypeKind::Named(name) | TypeKind::GenericInstance { name, .. } =
                 &impl_block.target_type.kind
-                && name == type_name
+                && (name == type_name || name == effective_name)
             {
                 for method in &impl_block.methods {
                     if method.name.ends_with(&format!(":{}", method_name))
@@ -803,12 +893,13 @@ impl TypeEnv {
         type_name: &str,
         method_name: &str,
     ) -> Option<(&ImplBlock, &FunctionDef)> {
+        let effective_name = if type_name == "Table" { "Array" } else { type_name };
         for impl_block in &self.impls {
             let target_name = match &impl_block.target_type.kind {
-                TypeKind::Named(name) | TypeKind::GenericInstance { name, .. } => name,
+                TypeKind::Named(name) | TypeKind::GenericInstance { name, .. } => name.as_str(),
                 _ => continue,
             };
-            if target_name != type_name {
+            if target_name != type_name && target_name != effective_name {
                 continue;
             }
             if let Some(method) = impl_block.methods.iter().find(|method| {
@@ -832,12 +923,13 @@ impl TypeEnv {
     }
 
     pub fn type_implements_trait(&self, ty: &Type, trait_name: &str) -> bool {
+        let resolved_ty = self.resolve_type(ty);
         for impl_block in &self.impls {
             if let Some(impl_trait_name) = &impl_block.trait_name
                 && impl_trait_name == trait_name
             {
                 let mut bindings = HashMap::new();
-                if self.match_type_pattern(&impl_block.target_type, ty, &mut bindings) {
+                if self.match_type_pattern(&impl_block.target_type, &resolved_ty, &mut bindings) {
                     let bounds_satisfied = impl_block.where_clause.iter().all(|bound| {
                         bindings.get(&bound.type_param).is_some_and(|concrete| {
                             bound
@@ -862,6 +954,10 @@ impl TypeEnv {
         actual: &Type,
         bindings: &mut HashMap<String, Type>,
     ) -> bool {
+        let pattern_resolved = self.resolve_type(pattern);
+        let actual_resolved = self.resolve_type(actual);
+        let pattern = &pattern_resolved;
+        let actual = &actual_resolved;
         match (&pattern.kind, &actual.kind) {
             (TypeKind::Generic(name), _) => {
                 if let Some(existing) = bindings.get(name) {
@@ -904,6 +1000,10 @@ impl TypeEnv {
     }
 
     fn types_match(&self, type1: &Type, type2: &Type) -> bool {
+        let t1_resolved = self.resolve_type(type1);
+        let t2_resolved = self.resolve_type(type2);
+        let type1 = &t1_resolved;
+        let type2 = &t2_resolved;
         if type1.kind == type2.kind {
             return true;
         }
@@ -946,6 +1046,10 @@ impl TypeEnv {
     }
 
     fn types_overlap(&self, left: &Type, right: &Type) -> bool {
+        let l_resolved = self.resolve_type(left);
+        let r_resolved = self.resolve_type(right);
+        let left = &l_resolved;
+        let right = &r_resolved;
         if let (
             TypeKind::GenericInstance {
                 name: left_name, ..
@@ -959,5 +1063,74 @@ impl TypeEnv {
             return true;
         }
         self.types_match(left, right)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_table_type_aliases() {
+        let env = TypeEnv::new();
+        let dummy_span = Span::new(0, 0, 0, 0);
+
+        // Table<int> -> Array<int>
+        let table_int = Type::new(
+            TypeKind::GenericInstance {
+                name: "Table".to_string(),
+                type_args: vec![Type::new(TypeKind::Int, dummy_span)],
+            },
+            dummy_span,
+        );
+        let resolved_table_int = env.resolve_type(&table_int);
+        assert_eq!(
+            resolved_table_int.kind,
+            TypeKind::Array(Box::new(Type::new(TypeKind::Int, dummy_span)))
+        );
+
+        // Table<string, int> -> Map<string, int>
+        let table_map = Type::new(
+            TypeKind::GenericInstance {
+                name: "Table".to_string(),
+                type_args: vec![
+                    Type::new(TypeKind::String, dummy_span),
+                    Type::new(TypeKind::Int, dummy_span),
+                ],
+            },
+            dummy_span,
+        );
+        let resolved_table_map = env.resolve_type(&table_map);
+        assert_eq!(
+            resolved_table_map.kind,
+            TypeKind::Map(
+                Box::new(Type::new(TypeKind::String, dummy_span)),
+                Box::new(Type::new(TypeKind::Int, dummy_span))
+            )
+        );
+
+        // LuaTable remains LuaTable
+        let lua_table = Type::new(TypeKind::Named("LuaTable".to_string()), dummy_span);
+        let resolved_lua_table = env.resolve_type(&lua_table);
+        assert_eq!(resolved_lua_table.kind, TypeKind::Named("LuaTable".to_string()));
+
+        // types_match between Table<int> and Array<int>
+        let array_int = Type::new(
+            TypeKind::Array(Box::new(Type::new(TypeKind::Int, dummy_span))),
+            dummy_span,
+        );
+        assert!(env.types_match(&table_int, &array_int));
+        assert!(env.types_match(&array_int, &table_int));
+
+        // types_match between Table<string, int> and Map<string, int>
+        let map_str_int = Type::new(
+            TypeKind::Map(
+                Box::new(Type::new(TypeKind::String, dummy_span)),
+                Box::new(Type::new(TypeKind::Int, dummy_span)),
+            ),
+            dummy_span,
+        );
+        assert!(env.types_match(&table_map, &map_str_int));
+        assert!(env.types_match(&map_str_int, &table_map));
     }
 }

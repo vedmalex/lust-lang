@@ -1,7 +1,9 @@
 use super::*;
 impl JitCompiler {
     pub(super) fn compile_load_const(&mut self, dest: u8, value: &Value) -> Result<()> {
-        if self.scalar_regfile && matches!(value, Value::Function(_) | Value::Nil) {
+        if (self.scalar_regfile || (self.function_mode && !self.function_frame.1))
+            && matches!(value, Value::Function(_) | Value::Nil)
+        {
             // The direct-call ABI does not read the callee register, and a
             // Nil constant owns nothing. Leaving the slot untouched keeps
             // the regfile from materializing a `Value`.
@@ -9,6 +11,14 @@ impl JitCompiler {
         }
         match value {
             Value::Int(i) => {
+                if let Some(pin) = self.active_pin(dest) {
+                    if pin.class == pins::PinClass::Carried && pin.ty == ValueType::Int {
+                        self.ensure_pin_tag(dest, pin);
+                        self.mark_dirty(dest);
+                        self.emit_mov_imm64(pin.reg, *i as u64);
+                        return Ok(());
+                    }
+                }
                 self.emit_mov_imm64(0, *i as u64);
                 self.store_from_x0(dest, ValueTag::Int.as_u8());
                 Ok(())
@@ -23,6 +33,18 @@ impl JitCompiler {
             }
 
             Value::Bool(b) => {
+                if let Some(pin) = self.active_pin(dest) {
+                    if pin.class == pins::PinClass::Carried && pin.ty == ValueType::Bool {
+                        self.ensure_pin_tag(dest, pin);
+                        self.mark_dirty(dest);
+                        if *b {
+                            dynasm!(self.ops ; .arch aarch64 ; movz W(pin.reg), 1);
+                        } else {
+                            dynasm!(self.ops ; .arch aarch64 ; mov X(pin.reg), xzr);
+                        }
+                        return Ok(());
+                    }
+                }
                 let bool_val = u32::from(*b);
                 dynasm!(self.ops ; .arch aarch64 ; movz x0, #bool_val);
                 self.store_from_x0(dest, ValueTag::Bool.as_u8());
@@ -45,7 +67,9 @@ impl JitCompiler {
         // SAFETY: reading the first byte of a live `Value`.
         let tag = unsafe { *(value as *const Value as *const u8) } as u32;
         // A destination known to hold nothing owned is simply overwritten.
-        if self.scalar_registers.contains_key(&dest) {
+        if self.scalar_registers.contains_key(&dest)
+            || (self.function_mode && !self.function_frame.1)
+        {
             self.emit_mov_imm64(0, payload);
             self.store_tag_imm(dest, tag as u8);
             self.store_payload(dest, 0);
@@ -143,6 +167,51 @@ impl JitCompiler {
     }
 
     pub(super) fn compile_get_index(&mut self, dest: u8, array: u8, index: u8) -> Result<()> {
+        let index_is_int = self.scalar_registers.get(&index) == Some(&ValueType::Int)
+            || self.pins.get(&index).is_some_and(|p| p.ty == ValueType::Int);
+
+        if let Some(hoisted) = self.hoisted_array
+            && hoisted.array_reg == array
+            && index_is_int
+        {
+            let idx_reg = self.operand_x(index, 12);
+            let bounds_check_needed = hoisted.bounded_index != Some(index);
+            if bounds_check_needed {
+                if let Some(len_r) = hoisted.len_reg {
+                    dynasm!(self.ops
+                        ; .arch aarch64
+                        ; cmp X(idx_reg), X(len_r)
+                        ; b.hs >fail
+                    );
+                }
+            }
+            dynasm!(self.ops
+                ; .arch aarch64
+                ; add x10, X(hoisted.ptr_reg), X(idx_reg), lsl #4
+            );
+            self.emit_reg_addr(11, dest);
+            dynasm!(self.ops
+                ; .arch aarch64
+                ; ldp x0, x1, [x10]
+                ; stp x0, x1, [x11]
+            );
+            if let Some(pin) = self.pin_for_write(dest) {
+                match pin.ty {
+                    ValueType::Int => {
+                        dynasm!(self.ops ; .arch aarch64 ; mov X(pin.reg), x1);
+                    }
+                    ValueType::Bool => {
+                        dynasm!(self.ops ; .arch aarch64 ; uxtb W(pin.reg), w1);
+                    }
+                    ValueType::Float => {
+                        dynasm!(self.ops ; .arch aarch64 ; fmov D(pin.reg), x1);
+                    }
+                    _ => {}
+                }
+            }
+            return Ok(());
+        }
+
         let array_tag = ValueTag::Array.as_u8() as u32;
         let int_tag = ValueTag::Int.as_u8() as u32;
         unsafe extern "C" {
@@ -214,12 +283,15 @@ impl JitCompiler {
             && index_is_int
         {
             let idx_reg = self.operand_x(index, 12);
-            if let Some(len_r) = hoisted.len_reg {
-                dynasm!(self.ops
-                    ; .arch aarch64
-                    ; cmp X(idx_reg), X(len_r)
-                    ; b.hs >fail
-                );
+            let bounds_check_needed = hoisted.bounded_index != Some(index);
+            if bounds_check_needed {
+                if let Some(len_r) = hoisted.len_reg {
+                    dynasm!(self.ops
+                        ; .arch aarch64
+                        ; cmp X(idx_reg), X(len_r)
+                        ; b.hs >fail
+                    );
+                }
             }
             let val_ty = self
                 .scalar_registers
@@ -251,36 +323,78 @@ impl JitCompiler {
                     ValueType::Float => ValueTag::Float.as_u8(),
                     _ => ValueTag::Bool.as_u8(),
                 } as u32;
-                if let Some(const_val) = self.const_registers.get(&value) {
-                    match const_val {
-                        Value::Bool(false) => {
-                            dynasm!(self.ops ; .arch aarch64 ; mov x1, xzr);
+                let same_element_tag = element_type == Some(ty);
+                if same_element_tag {
+                    if let Some(pin) = self.active_pin(value) {
+                        dynasm!(self.ops ; .arch aarch64 ; str X(pin.reg), [x10, #8]);
+                    } else if let Some(const_val) = self.const_registers.get(&value) {
+                        match const_val {
+                            Value::Bool(false) => {
+                                dynasm!(self.ops ; .arch aarch64 ; str xzr, [x10, #8]);
+                            }
+                            Value::Bool(true) => {
+                                dynasm!(self.ops ; .arch aarch64 ; movz x1, 1 ; str x1, [x10, #8]);
+                            }
+                            Value::Int(0) => {
+                                dynasm!(self.ops ; .arch aarch64 ; str xzr, [x10, #8]);
+                            }
+                            Value::Int(i) => {
+                                self.emit_mov_imm64(1, *i as u64);
+                                dynasm!(self.ops ; .arch aarch64 ; str x1, [x10, #8]);
+                            }
+                            Value::Float(f) if f.to_bits() == 0 => {
+                                dynasm!(self.ops ; .arch aarch64 ; str xzr, [x10, #8]);
+                            }
+                            Value::Float(f) => {
+                                self.emit_mov_imm64(1, f.to_bits());
+                                dynasm!(self.ops ; .arch aarch64 ; str x1, [x10, #8]);
+                            }
+                            _ => {
+                                self.load_payload(1, value);
+                                dynasm!(self.ops ; .arch aarch64 ; str x1, [x10, #8]);
+                            }
                         }
-                        Value::Bool(true) => {
-                            dynasm!(self.ops ; .arch aarch64 ; movz x1, 1);
-                        }
-                        Value::Int(i) => {
-                            self.emit_mov_imm64(1, *i as u64);
-                        }
-                        Value::Float(f) => {
-                            self.emit_mov_imm64(1, f.to_bits());
-                        }
-                        _ => self.load_payload(1, value),
+                    } else if self.hot_x0_in == Some(value) {
+                        dynasm!(self.ops ; .arch aarch64 ; str x0, [x10, #8]);
+                    } else if ty == ValueType::Bool {
+                        self.load_bool_payload(1, value);
+                        dynasm!(self.ops ; .arch aarch64 ; str x1, [x10, #8]);
+                    } else {
+                        self.load_payload(1, value);
+                        dynasm!(self.ops ; .arch aarch64 ; str x1, [x10, #8]);
                     }
-                } else if let Some(pin) = self.active_pin(value) {
-                    dynasm!(self.ops ; .arch aarch64 ; mov X(1), X(pin.reg));
-                } else if self.hot_x0_in == Some(value) {
-                    dynasm!(self.ops ; .arch aarch64 ; mov x1, x0);
-                } else if ty == ValueType::Bool {
-                    self.load_bool_payload(1, value);
                 } else {
-                    self.load_payload(1, value);
+                    if let Some(pin) = self.active_pin(value) {
+                        dynasm!(self.ops ; .arch aarch64 ; mov X(1), X(pin.reg));
+                    } else if let Some(const_val) = self.const_registers.get(&value) {
+                        match const_val {
+                            Value::Bool(false) => {
+                                dynasm!(self.ops ; .arch aarch64 ; mov x1, xzr);
+                            }
+                            Value::Bool(true) => {
+                                dynasm!(self.ops ; .arch aarch64 ; movz x1, 1);
+                            }
+                            Value::Int(i) => {
+                                self.emit_mov_imm64(1, *i as u64);
+                            }
+                            Value::Float(f) => {
+                                self.emit_mov_imm64(1, f.to_bits());
+                            }
+                            _ => self.load_payload(1, value),
+                        }
+                    } else if self.hot_x0_in == Some(value) {
+                        dynasm!(self.ops ; .arch aarch64 ; mov x1, x0);
+                    } else if ty == ValueType::Bool {
+                        self.load_bool_payload(1, value);
+                    } else {
+                        self.load_payload(1, value);
+                    }
+                    dynasm!(self.ops
+                        ; .arch aarch64
+                        ; movz x0, #tag
+                        ; stp x0, x1, [x10]
+                    );
                 }
-                dynasm!(self.ops
-                    ; .arch aarch64
-                    ; movz x0, #tag
-                    ; stp x0, x1, [x10]
-                );
             } else {
                 self.load_tag_from_memory(13, value);
                 let scalar_max_tag = ValueTag::Float.as_u8() as u32;
@@ -319,7 +433,8 @@ impl JitCompiler {
             let _value_size = mem::size_of::<Value>() as u32;
             let done = self.ops.new_dynamic_label();
             let slow = self.ops.new_dynamic_label();
-            if !self.array_registers.contains(&array) {
+            let is_hoisted = self.hoisted_array.as_ref().is_some_and(|h| h.array_reg == array);
+            if !is_hoisted && !self.array_registers.contains(&array) {
                 self.load_tag(0, array);
                 dynasm!(self.ops
                     ; .arch aarch64
@@ -327,22 +442,47 @@ impl JitCompiler {
                     ; b.ne => slow
                 );
             }
-            self.load_payload(12, index);
-            self.emit_reg_addr(11, array);
+            if let Some(pin) = self.active_pin(index) {
+                dynasm!(self.ops ; .arch aarch64 ; mov X(12), X(pin.reg));
+            } else {
+                self.load_payload(12, index);
+            }
             // A monomorphic scalar array never holds an owned element, so
             // the old tag (and its rc_dec) can be skipped.
             let scalar_slot = element_type
                 .is_some_and(|ty| matches!(ty, ValueType::Int | ValueType::Float | ValueType::Bool))
                 && self.scalar_registers.get(&value) == element_type.as_ref();
-            dynasm!(self.ops
-                ; .arch aarch64
-                ; ldr x9, [x11, #rc_offset]
-                ; ldr x10, [x9, #len_offset]
-                ; cmp x12, x10
-                ; b.hs >fail
-                ; ldr x10, [x9, #ptr_offset]
-                ; add x10, x10, x12, lsl #4
-            );
+            if let Some(hoisted) = self.hoisted_array && hoisted.array_reg == array {
+                if let Some(len_r) = hoisted.len_reg {
+                    dynasm!(self.ops
+                        ; .arch aarch64
+                        ; cmp x12, X(len_r)
+                        ; b.hs >fail
+                        ; add x10, X(hoisted.ptr_reg), x12, lsl #4
+                    );
+                } else {
+                    self.emit_reg_addr(11, array);
+                    dynasm!(self.ops
+                        ; .arch aarch64
+                        ; ldr x9, [x11, #rc_offset]
+                        ; ldr x10, [x9, #len_offset]
+                        ; cmp x12, x10
+                        ; b.hs >fail
+                        ; add x10, X(hoisted.ptr_reg), x12, lsl #4
+                    );
+                }
+            } else {
+                self.emit_reg_addr(11, array);
+                dynasm!(self.ops
+                    ; .arch aarch64
+                    ; ldr x9, [x11, #rc_offset]
+                    ; ldr x10, [x9, #len_offset]
+                    ; cmp x12, x10
+                    ; b.hs >fail
+                    ; ldr x10, [x9, #ptr_offset]
+                    ; add x10, x10, x12, lsl #4
+                );
+            }
             if !scalar_slot {
                 dynasm!(self.ops
                     ; .arch aarch64
@@ -357,7 +497,27 @@ impl JitCompiler {
                     ValueType::Float => ValueTag::Float.as_u8(),
                     _ => ValueTag::Bool.as_u8(),
                 } as u32;
-                if ty == ValueType::Bool {
+                if let Some(pin) = self.active_pin(value) {
+                    dynasm!(self.ops ; .arch aarch64 ; mov X(1), X(pin.reg));
+                } else if let Some(const_val) = self.const_registers.get(&value) {
+                    match const_val {
+                        Value::Bool(false) => {
+                            dynasm!(self.ops ; .arch aarch64 ; mov x1, xzr);
+                        }
+                        Value::Bool(true) => {
+                            dynasm!(self.ops ; .arch aarch64 ; movz x1, 1);
+                        }
+                        Value::Int(i) => {
+                            self.emit_mov_imm64(1, *i as u64);
+                        }
+                        Value::Float(f) => {
+                            self.emit_mov_imm64(1, f.to_bits());
+                        }
+                        _ => self.load_payload(1, value),
+                    }
+                } else if self.hot_x0_in == Some(value) {
+                    dynasm!(self.ops ; .arch aarch64 ; mov x1, x0);
+                } else if ty == ValueType::Bool {
                     self.load_bool_payload(1, value);
                 } else {
                     self.load_payload(1, value);
@@ -497,26 +657,55 @@ impl JitCompiler {
             let done = self.ops.new_dynamic_label();
             let out_of_range = self.ops.new_dynamic_label();
             let slow = self.ops.new_dynamic_label();
-            if !self.array_registers.contains(&array) {
+            let is_hoisted = self.hoisted_array.as_ref().is_some_and(|h| h.array_reg == array);
+            if !is_hoisted && !self.array_registers.contains(&array) {
                 self.load_tag(0, array);
                 dynasm!(self.ops
                     ; .arch aarch64
                     ; cmp w0, #array_tag
                     ; b.ne => slow
                 );
+                self.array_registers.insert(array);
             }
-            self.load_payload(12, index);
-            self.emit_reg_addr(11, array);
-            dynasm!(self.ops
-                ; .arch aarch64
-                ; ldr x9, [x11, #rc_offset]
-                ; ldr x10, [x9, #len_offset]
-                ; cmp x12, x10
-                ; b.hs => out_of_range
-                ; ldr x10, [x9, #ptr_offset]
-                ; add x10, x10, x12, lsl #4
-                ; ldrb w9, [x10]
-            );
+            if let Some(pin) = self.active_pin(index) {
+                dynasm!(self.ops ; .arch aarch64 ; mov X(12), X(pin.reg));
+            } else {
+                self.load_payload(12, index);
+            }
+            if let Some(hoisted) = self.hoisted_array && hoisted.array_reg == array {
+                if let Some(len_r) = hoisted.len_reg {
+                    dynasm!(self.ops
+                        ; .arch aarch64
+                        ; cmp x12, X(len_r)
+                        ; b.hs => out_of_range
+                        ; add x10, X(hoisted.ptr_reg), x12, lsl #4
+                        ; ldrb w9, [x10]
+                    );
+                } else {
+                    self.emit_reg_addr(11, array);
+                    dynasm!(self.ops
+                        ; .arch aarch64
+                        ; ldr x9, [x11, #rc_offset]
+                        ; ldr x10, [x9, #len_offset]
+                        ; cmp x12, x10
+                        ; b.hs => out_of_range
+                        ; add x10, X(hoisted.ptr_reg), x12, lsl #4
+                        ; ldrb w9, [x10]
+                    );
+                }
+            } else {
+                self.emit_reg_addr(11, array);
+                dynasm!(self.ops
+                    ; .arch aarch64
+                    ; ldr x9, [x11, #rc_offset]
+                    ; ldr x10, [x9, #len_offset]
+                    ; cmp x12, x10
+                    ; b.hs => out_of_range
+                    ; ldr x10, [x9, #ptr_offset]
+                    ; add x10, x10, x12, lsl #4
+                    ; ldrb w9, [x10]
+                );
+            }
             if let Some(ty) = value_type {
                 // An element of the expected scalar type: a typed store,
                 // after which the destination is known to hold that type.
@@ -540,10 +729,12 @@ impl JitCompiler {
                     ValueType::Int => {
                         dynasm!(self.ops ; .arch aarch64 ; ldr x0, [x10, 8]);
                         self.store_from_x0(value_dest, ValueTag::Int.as_u8());
+                        self.hot_x0 = Some(value_dest);
                     }
                     _ => {
                         dynasm!(self.ops ; .arch aarch64 ; ldrb w0, [x10, 8]);
                         self.store_from_x0(value_dest, ValueTag::Bool.as_u8());
+                        self.hot_x0 = Some(value_dest);
                     }
                 }
                 self.pending_scalar = Some((value_dest, ty));
@@ -566,6 +757,20 @@ impl JitCompiler {
                     ; .arch aarch64
                     ; stp x0, x1, [x11]
                 );
+                if let Some(pin) = self.pin_for_write(value_dest) {
+                    match pin.ty {
+                        ValueType::Int => {
+                            dynasm!(self.ops ; .arch aarch64 ; mov X(pin.reg), x1);
+                        }
+                        ValueType::Bool => {
+                            dynasm!(self.ops ; .arch aarch64 ; uxtb W(pin.reg), w1);
+                        }
+                        ValueType::Float => {
+                            dynasm!(self.ops ; .arch aarch64 ; fmov D(pin.reg), x1);
+                        }
+                        _ => {}
+                    }
+                }
             }
             dynasm!(self.ops ; .arch aarch64 ; movz x0, 1);
             self.store_from_x0(condition_dest, ValueTag::Bool.as_u8());
@@ -588,6 +793,8 @@ impl JitCompiler {
             self.emit_reg_addr(3, condition_dest);
             self.emit_call(jit_array_index_ok_safe as *const ());
             self.emit_fail_if_w0_zero();
+            self.reload_pin_from_memory(value_dest);
+            self.reload_pin_from_memory(condition_dest);
             dynasm!(self.ops ; .arch aarch64 ; => done);
             return Ok(());
         }
@@ -598,7 +805,92 @@ impl JitCompiler {
         self.emit_reg_addr(3, condition_dest);
         self.emit_call(jit_array_index_ok_safe as *const ());
         self.emit_fail_if_w0_zero();
+        self.reload_pin_from_memory(value_dest);
+        self.reload_pin_from_memory(condition_dest);
         Ok(())
+    }
+
+    pub(super) fn compile_array_index_ok_branch(
+        &mut self,
+        value_dest: u8,
+        _condition_dest: u8,
+        array: u8,
+        index: u8,
+        value_type: Option<ValueType>,
+        expect_truthy: bool,
+        label: usize,
+        dead_condition: bool,
+    ) -> Result<bool> {
+        let index_is_int = self.scalar_registers.get(&index) == Some(&ValueType::Int)
+            || self.pins.get(&index).is_some_and(|p| p.ty == ValueType::Int);
+
+        if let Some(hoisted) = self.hoisted_array
+            && hoisted.array_reg == array
+            && index_is_int
+            && let Some(ty) = value_type
+            && let Some(len_r) = hoisted.len_reg
+            && dead_condition
+            && !expect_truthy
+        {
+            let target = self.function_label(label);
+            self.emit_back_edge_gas_check(label);
+            let idx_reg = self.operand_x(index, 12);
+            let bounds_check_needed = hoisted.bounded_index != Some(index);
+            if bounds_check_needed {
+                dynasm!(self.ops
+                    ; .arch aarch64
+                    ; cmp X(idx_reg), X(len_r)
+                    ; b.hs => target
+                );
+            }
+            dynasm!(self.ops
+                ; .arch aarch64
+                ; add x10, X(hoisted.ptr_reg), X(idx_reg), lsl #4
+                ; ldrb w9, [x10]
+            );
+            let expected_tag = match ty {
+                ValueType::Int => ValueTag::Int,
+                ValueType::Float => ValueTag::Float,
+                _ => ValueTag::Bool,
+            }
+            .as_u8() as u32;
+            dynasm!(self.ops
+                ; .arch aarch64
+                ; cmp w9, #expected_tag
+                ; b.ne >fail
+            );
+            match ty {
+                ValueType::Float => {
+                    if let Some(d) = self.direct_dest_d(value_dest) {
+                        dynasm!(self.ops ; .arch aarch64 ; ldr D(d), [x10, 8]);
+                    } else {
+                        dynasm!(self.ops ; .arch aarch64 ; ldr d0, [x10, 8]);
+                        self.store_d0_as_float(value_dest);
+                    }
+                }
+                ValueType::Int => {
+                    if let Some(d) = self.direct_dest_x(value_dest) {
+                        dynasm!(self.ops ; .arch aarch64 ; ldr X(d), [x10, 8]);
+                    } else {
+                        dynasm!(self.ops ; .arch aarch64 ; ldr x0, [x10, 8]);
+                        self.store_from_x0(value_dest, ValueTag::Int.as_u8());
+                        self.hot_x0 = Some(value_dest);
+                    }
+                }
+                _ => {
+                    if let Some(d) = self.direct_dest_x(value_dest) {
+                        dynasm!(self.ops ; .arch aarch64 ; ldrb W(d), [x10, 8]);
+                    } else {
+                        dynasm!(self.ops ; .arch aarch64 ; ldrb w0, [x10, 8]);
+                        self.store_from_x0(value_dest, ValueTag::Bool.as_u8());
+                        self.hot_x0 = Some(value_dest);
+                    }
+                }
+            }
+            self.pending_scalar = Some((value_dest, ty));
+            return Ok(true);
+        }
+        Ok(false)
     }
 
     pub(super) fn compile_array_len(&mut self, dest: u8, array: u8) -> Result<()> {
@@ -616,6 +908,8 @@ impl JitCompiler {
                 ; mov x0, X(len_r)
             );
             self.store_from_x0(dest, ValueTag::Int.as_u8());
+            self.hot_x0 = Some(dest);
+            self.pending_scalar = Some((dest, ValueType::Int));
             return Ok(());
         }
 
@@ -625,18 +919,6 @@ impl JitCompiler {
             ; cmp w0, #array_tag
             ; b.ne >fail
         );
-        if let Some(layout) = jit::layout::rc_vec_layout() {
-            let rc_offset = layout.array_rc_offset as u32;
-            let len_offset = layout.len_offset as u32;
-            self.emit_reg_addr(11, array);
-            dynasm!(self.ops
-                ; .arch aarch64
-                ; ldr x9, [x11, #rc_offset]
-                ; ldr x0, [x9, #len_offset]
-            );
-            self.store_from_x0(dest, ValueTag::Int.as_u8());
-            return Ok(());
-        }
         self.emit_reg_addr(0, array);
         self.emit_call(jit_array_len_safe as *const ());
         // `tbnz` only reaches ±32 KB; traces can be larger, so branch on
@@ -696,19 +978,30 @@ impl JitCompiler {
             let len_offset = layout.struct_len_offset as u32;
             let ptr_offset = layout.struct_ptr_offset as u32;
             let element = (index * mem::size_of::<Value>()) as i32;
-            self.load_tag(0, object);
-            dynasm!(self.ops
-                ; .arch aarch64
-                ; cmp w0, #struct_tag
-                ; b.ne >fail
-            );
+            let is_guarded = self.guarded_structs.contains(&object);
+            if !is_guarded {
+                self.load_tag(0, object);
+                dynasm!(self.ops
+                    ; .arch aarch64
+                    ; cmp w0, #struct_tag
+                    ; b.ne >fail
+                );
+            }
             self.emit_reg_addr(11, object);
             dynasm!(self.ops
                 ; .arch aarch64
                 ; ldr x9, [x11, #fields_offset]
-                ; ldr x10, [x9, #len_offset]
-                ; cmp x10, #index as u32
-                ; b.ls >fail
+            );
+            if !is_guarded {
+                dynasm!(self.ops
+                    ; .arch aarch64
+                    ; ldr x10, [x9, #len_offset]
+                    ; cmp x10, #index as u32
+                    ; b.ls >fail
+                );
+            }
+            dynasm!(self.ops
+                ; .arch aarch64
                 ; ldr x10, [x9, #ptr_offset]
             );
             self.emit_add_imm(10, 10, element);
@@ -747,19 +1040,30 @@ impl JitCompiler {
             let len_offset = layout.struct_len_offset as u32;
             let ptr_offset = layout.struct_ptr_offset as u32;
             let element = (index * mem::size_of::<Value>()) as i32;
-            self.load_tag(0, object);
-            dynasm!(self.ops
-                ; .arch aarch64
-                ; cmp w0, #struct_tag
-                ; b.ne >fail
-            );
+            let is_guarded = self.guarded_structs.contains(&object);
+            if !is_guarded {
+                self.load_tag(0, object);
+                dynasm!(self.ops
+                    ; .arch aarch64
+                    ; cmp w0, #struct_tag
+                    ; b.ne >fail
+                );
+            }
             self.emit_reg_addr(11, object);
             dynasm!(self.ops
                 ; .arch aarch64
                 ; ldr x9, [x11, #fields_offset]
-                ; ldr x10, [x9, #len_offset]
-                ; cmp x10, #index as u32
-                ; b.ls >fail
+            );
+            if !is_guarded {
+                dynasm!(self.ops
+                    ; .arch aarch64
+                    ; ldr x10, [x9, #len_offset]
+                    ; cmp x10, #index as u32
+                    ; b.ls >fail
+                );
+            }
+            dynasm!(self.ops
+                ; .arch aarch64
                 ; ldr x11, [x9, #ptr_offset]
             );
             self.emit_add_imm(11, 11, element);
@@ -1014,6 +1318,142 @@ impl JitCompiler {
             let _value_size = mem::size_of::<Value>() as u32;
             let done = self.ops.new_dynamic_label();
             let slow = self.ops.new_dynamic_label();
+
+            if let Some(hoisted) = self.hoisted_array
+                && hoisted.array_reg == array
+            {
+                let rc = hoisted.rc_reg;
+                let ptr = hoisted.ptr_reg;
+                let len_r_opt = hoisted.len_reg;
+                if let Some(len_r) = len_r_opt {
+                    dynasm!(self.ops
+                        ; .arch aarch64
+                        ; ldr x10, [X(rc), #cap_offset]
+                        ; cmp X(len_r), x10
+                        ; b.hs => slow
+                    );
+                } else {
+                    dynasm!(self.ops
+                        ; .arch aarch64
+                        ; ldr x12, [X(rc), #len_offset]
+                        ; ldr x10, [X(rc), #cap_offset]
+                        ; cmp x12, x10
+                        ; b.hs => slow
+                    );
+                }
+                if let Some(ty) = self.scalar_registers.get(&value).copied() {
+                    let tag = match ty {
+                        ValueType::Int => ValueTag::Int.as_u8(),
+                        ValueType::Float => ValueTag::Float.as_u8(),
+                        _ => ValueTag::Bool.as_u8(),
+                    } as u32;
+                    if let Some(pin) = self.active_pin(value) {
+                        dynasm!(self.ops ; .arch aarch64 ; mov X(1), X(pin.reg));
+                    } else if let Some(c) = self.const_registers.get(&value).cloned() {
+                        match c {
+                            Value::Bool(b) => {
+                                let b_val = if b { 1u32 } else { 0u32 };
+                                dynasm!(self.ops ; .arch aarch64 ; movz x1, #b_val);
+                            }
+                            Value::Int(i) => {
+                                self.emit_mov_imm64(1, i as u64);
+                            }
+                            Value::Float(f) => {
+                                self.emit_mov_imm64(1, f.to_bits());
+                            }
+                            _ => {
+                                if ty == ValueType::Bool {
+                                    self.load_bool_payload(1, value);
+                                } else {
+                                    self.load_payload(1, value);
+                                }
+                            }
+                        }
+                    } else if ty == ValueType::Bool {
+                        self.load_bool_payload(1, value);
+                    } else {
+                        self.load_payload(1, value);
+                    }
+                    if let Some(len_r) = len_r_opt {
+                        dynasm!(self.ops
+                            ; .arch aarch64
+                            ; movz x0, #tag
+                            ; add x10, X(ptr), X(len_r), lsl #4
+                            ; stp x0, x1, [x10]
+                            ; add XSP(len_r), XSP(len_r), 1
+                            ; b => done
+                            ; => slow
+                        );
+                    } else {
+                        dynasm!(self.ops
+                            ; .arch aarch64
+                            ; movz x0, #tag
+                            ; add x10, X(ptr), x12, lsl #4
+                            ; stp x0, x1, [x10]
+                            ; add x12, x12, #1
+                            ; str x12, [X(rc), #len_offset]
+                            ; b => done
+                            ; => slow
+                        );
+                    }
+                } else {
+                    self.load_tag_from_memory(13, value);
+                    dynasm!(self.ops
+                        ; .arch aarch64
+                        ; cmp w13, #scalar_max_tag
+                        ; b.hi => slow
+                    );
+                    self.emit_reg_addr(11, value);
+                    if let Some(len_r) = len_r_opt {
+                        dynasm!(self.ops
+                            ; .arch aarch64
+                            ; add x10, X(ptr), X(len_r), lsl #4
+                            ; ldp x0, x1, [x11]
+                            ; stp x0, x1, [x10]
+                            ; add XSP(len_r), XSP(len_r), 1
+                            ; b => done
+                            ; => slow
+                        );
+                    } else {
+                        dynasm!(self.ops
+                            ; .arch aarch64
+                            ; add x10, X(ptr), x12, lsl #4
+                            ; ldp x0, x1, [x11]
+                            ; stp x0, x1, [x10]
+                            ; add x12, x12, #1
+                            ; str x12, [X(rc), #len_offset]
+                            ; b => done
+                            ; => slow
+                        );
+                    }
+                }
+                if let Some(len_r) = len_r_opt {
+                    dynasm!(self.ops
+                        ; .arch aarch64
+                        ; str X(len_r), [X(rc), #len_offset]
+                    );
+                }
+                dynasm!(self.ops ; .arch aarch64 ; mov x0, x20);
+                self.emit_reg_addr(1, array);
+                self.emit_reg_addr(2, value);
+                self.emit_call(jit_array_push_safe as *const ());
+                self.emit_fail_if_w0_zero();
+                dynasm!(self.ops
+                    ; .arch aarch64
+                    ; ldr X(ptr), [X(rc), #ptr_offset]
+                );
+                if let Some(len_r) = len_r_opt {
+                    dynasm!(self.ops
+                        ; .arch aarch64
+                        ; ldr X(len_r), [X(rc), #len_offset]
+                    );
+                }
+                dynasm!(self.ops
+                    ; .arch aarch64
+                    ; => done
+                );
+                return Ok(());
+            }
             if !self.array_registers.contains(&array) {
                 self.load_tag(0, array);
                 dynasm!(self.ops
@@ -1021,6 +1461,7 @@ impl JitCompiler {
                     ; cmp w0, #array_tag
                     ; b.ne => slow
                 );
+                self.array_registers.insert(array);
             }
             self.emit_reg_addr(11, array);
             dynasm!(self.ops
@@ -1039,7 +1480,29 @@ impl JitCompiler {
                     ValueType::Float => ValueTag::Float.as_u8(),
                     _ => ValueTag::Bool.as_u8(),
                 } as u32;
-                if ty == ValueType::Bool {
+                if let Some(pin) = self.active_pin(value) {
+                    dynasm!(self.ops ; .arch aarch64 ; mov X(1), X(pin.reg));
+                } else if let Some(c) = self.const_registers.get(&value).cloned() {
+                    match c {
+                        Value::Bool(b) => {
+                            let b_val = if b { 1u32 } else { 0u32 };
+                            dynasm!(self.ops ; .arch aarch64 ; movz x1, #b_val);
+                        }
+                        Value::Int(i) => {
+                            self.emit_mov_imm64(1, i as u64);
+                        }
+                        Value::Float(f) => {
+                            self.emit_mov_imm64(1, f.to_bits());
+                        }
+                        _ => {
+                            if ty == ValueType::Bool {
+                                self.load_bool_payload(1, value);
+                            } else {
+                                self.load_payload(1, value);
+                            }
+                        }
+                    }
+                } else if ty == ValueType::Bool {
                     self.load_bool_payload(1, value);
                 } else {
                     self.load_payload(1, value);
@@ -1295,43 +1758,48 @@ impl JitCompiler {
         field_registers: &[u8],
     ) -> Result<()> {
         unsafe extern "C" {
-            fn jit_new_struct_safe(
+            fn jit_new_struct_cached(
                 vm_ptr: *mut crate::VM,
-                struct_name_ptr: *const u8,
-                struct_name_len: usize,
-                field_names_ptr: *const *const u8,
-                field_name_lens_ptr: *const usize,
+                site_ptr: *mut crate::jit::JitStructSite,
                 field_values_ptr: *const Value,
                 field_count: usize,
                 out: *mut Value,
             ) -> u8;
         }
 
-        let (struct_name_ptr, struct_name_len) = self.retain_string(struct_name);
+        let site_ptr = self.retain_struct_site(struct_name, field_names);
         let field_count = field_names.len();
-        let mut field_name_ptrs: Vec<*const u8> = Vec::new();
-        let mut field_name_lens: Vec<usize> = Vec::new();
-        for field_name in field_names {
-            let (field_name_ptr, field_name_len) = self.retain_string(field_name);
-            field_name_ptrs.push(field_name_ptr);
-            field_name_lens.push(field_name_len);
+        dynasm!(self.ops ; .arch aarch64 ; mov x0, x20);
+        self.emit_mov_imm64(1, site_ptr as usize as u64);
+        if let Some(first) = field_registers.first() {
+            self.emit_reg_addr(2, *first);
+        } else {
+            dynasm!(self.ops ; .arch aarch64 ; mov x2, xzr);
+        }
+        self.emit_mov_imm64(3, field_count as u64);
+        self.emit_reg_addr(4, dest);
+        self.emit_call(jit_new_struct_cached as *const ());
+        self.emit_fail_if_w0_zero();
+        self.emit_reload_registers_base();
+        Ok(())
+    }
+
+    pub(super) fn compile_store_global(&mut self, name: &str, src: u8) -> Result<()> {
+        unsafe extern "C" {
+            fn jit_set_global_safe(
+                vm_ptr: *mut crate::VM,
+                name_ptr: *const u8,
+                name_len: usize,
+                value_ptr: *const Value,
+            ) -> u8;
         }
 
-        let field_name_ptrs_ptr = self.retain_string_pointers(field_name_ptrs);
-        let field_name_lens_ptr = self.retain_string_lengths(field_name_lens);
+        let (name_ptr, name_len) = self.retain_string(name);
         dynasm!(self.ops ; .arch aarch64 ; mov x0, x20);
-        self.emit_mov_imm64(1, struct_name_ptr as usize as u64);
-        self.emit_mov_imm64(2, struct_name_len as u64);
-        self.emit_mov_imm64(3, field_name_ptrs_ptr as usize as u64);
-        self.emit_mov_imm64(4, field_name_lens_ptr as usize as u64);
-        if let Some(first) = field_registers.first() {
-            self.emit_reg_addr(5, *first);
-        } else {
-            dynasm!(self.ops ; .arch aarch64 ; mov x5, xzr);
-        }
-        self.emit_mov_imm64(6, field_count as u64);
-        self.emit_reg_addr(7, dest);
-        self.emit_call(jit_new_struct_safe as *const ());
+        self.emit_mov_imm64(1, name_ptr as usize as u64);
+        self.emit_mov_imm64(2, name_len as u64);
+        self.emit_reg_addr(3, src);
+        self.emit_call(jit_set_global_safe as *const ());
         self.emit_fail_if_w0_zero();
         self.emit_reload_registers_base();
         Ok(())
@@ -1358,6 +1826,22 @@ impl JitCompiler {
         variant_name: &str,
         value_registers: &[u8],
     ) -> Result<()> {
+        if enum_name == "Option" && variant_name == "Some" && value_registers.len() == 1 {
+            unsafe extern "C" {
+                fn jit_new_option_some_fast(
+                    vm_ptr: *mut crate::VM,
+                    value_ptr: *const Value,
+                    out: *mut Value,
+                ) -> u8;
+            }
+            dynasm!(self.ops ; .arch aarch64 ; mov x0, x20);
+            self.emit_reg_addr(1, value_registers[0]);
+            self.emit_reg_addr(2, dest);
+            self.emit_call(jit_new_option_some_fast as *const ());
+            self.emit_fail_if_w0_zero();
+            return Ok(());
+        }
+
         unsafe extern "C" {
             fn jit_new_enum_variant_safe(
                 vm_ptr: *mut crate::VM,
@@ -1466,6 +1950,58 @@ impl JitCompiler {
         Ok(false)
     }
 
+    pub(super) fn compile_is_enum_variant_branch(
+        &mut self,
+        dest: u8,
+        value: u8,
+        enum_name: &str,
+        variant_name: &str,
+        label: usize,
+        dead_dest: bool,
+    ) -> Result<bool> {
+        let Some(layout) = jit::layout::enum_layout() else {
+            return Ok(false);
+        };
+        let variant_ptr = self.retain_name(variant_name);
+        let enum_ptr = (!enum_name.is_empty()).then(|| self.retain_name(enum_name));
+        let tag = layout.tag as u32;
+        let object_offset = layout.object_offset as u32;
+        let variant_offset = layout.variant_offset as u32;
+        let enum_name_offset = layout.enum_name_offset as u32;
+        let target = self.function_label(label);
+
+        self.emit_back_edge_gas_check(label);
+        self.load_tag(0, value);
+        self.emit_reg_addr(11, value);
+        dynasm!(self.ops
+            ; .arch aarch64
+            ; cmp w0, #tag
+            ; b.ne => target
+            ; ldr x11, [x11, #object_offset]
+            ; ldr x9, [x11, #variant_offset]
+        );
+        self.emit_mov_imm64(10, variant_ptr as u64);
+        dynasm!(self.ops
+            ; .arch aarch64
+            ; cmp x9, x10
+            ; b.ne => target
+        );
+        if let Some(enum_ptr) = enum_ptr {
+            dynasm!(self.ops ; .arch aarch64 ; ldr x9, [x11, #enum_name_offset]);
+            self.emit_mov_imm64(10, enum_ptr as u64);
+            dynasm!(self.ops
+                ; .arch aarch64
+                ; cmp x9, x10
+                ; b.ne => target
+            );
+        }
+        if !dead_dest {
+            dynasm!(self.ops ; .arch aarch64 ; movz x0, 1);
+            self.store_from_x0(dest, ValueTag::Bool.as_u8());
+        }
+        Ok(true)
+    }
+
     pub(super) fn compile_type_is(&mut self, dest: u8, value: u8, type_name: &str) -> Result<()> {
         let direct_tag = match type_name {
             "nil" | "()" => Some(ValueTag::Nil),
@@ -1555,22 +2091,110 @@ impl JitCompiler {
         let len_offset = layout.struct_len_offset as u32;
         let ptr_offset = layout.struct_ptr_offset as u32;
         let element = (index * mem::size_of::<Value>()) as i32;
-        self.load_tag(0, object);
-        dynasm!(self.ops
-            ; .arch aarch64
-            ; cmp w0, #struct_tag
-            ; b.ne >fail
-        );
+        let is_guarded = self.guarded_structs.contains(&object);
+        if !is_guarded {
+            self.load_tag(0, object);
+            dynasm!(self.ops
+                ; .arch aarch64
+                ; cmp w0, #struct_tag
+                ; b.ne >fail
+            );
+        }
         self.emit_reg_addr(11, object);
         dynasm!(self.ops
             ; .arch aarch64
             ; ldr x9, [x11, #fields_offset]
-            ; ldr x10, [x9, #len_offset]
-            ; cmp x10, #index as u32
-            ; b.ls >fail
+        );
+        if !is_guarded {
+            dynasm!(self.ops
+                ; .arch aarch64
+                ; ldr x10, [x9, #len_offset]
+                ; cmp x10, #index as u32
+                ; b.ls >fail
+            );
+        }
+        dynasm!(self.ops
+            ; .arch aarch64
             ; ldr x11, [x9, #ptr_offset]
         );
         self.emit_add_imm(11, 11, element);
+        self.emit_reg_addr(9, dest);
+        self.emit_copy_x11_to_x9();
+        Ok(())
+    }
+
+    /// Read field `index` of `object`. If it is `Option::Some`, borrow its
+    /// payload[0] directly into `dest`. If not, branch to `label`.
+    pub(super) fn compile_borrow_field_some(
+        &mut self,
+        dest: u8,
+        object: u8,
+        index: usize,
+        label: usize,
+    ) -> Result<()> {
+        let Some(layout) = jit::layout::rc_vec_layout() else {
+            return Err(crate::LustError::RuntimeError {
+                message: "a borrow needs the measured struct layout".into(),
+            });
+        };
+        let Some(enum_layout) = jit::layout::enum_layout() else {
+            return Err(crate::LustError::RuntimeError {
+                message: "a borrow needs the measured enum layout".into(),
+            });
+        };
+        let struct_tag = ValueTag::Struct.as_u8() as u32;
+        let fields_offset = layout.struct_fields_offset as u32;
+        let len_offset = layout.struct_len_offset as u32;
+        let ptr_offset = layout.struct_ptr_offset as u32;
+        let element = (index * mem::size_of::<Value>()) as i32;
+
+        let enum_tag = enum_layout.tag as u32;
+        let enum_object_offset = enum_layout.object_offset as u32;
+        let variant_offset = enum_layout.variant_offset as u32;
+        let values_ptr_offset = enum_layout.values_ptr_offset as u32;
+        let variant_ptr = self.retain_name("Some");
+        let target = self.function_label(label);
+
+        self.emit_back_edge_gas_check(label);
+        let is_guarded = self.guarded_structs.contains(&object);
+        if !is_guarded {
+            self.load_tag(0, object);
+            dynasm!(self.ops
+                ; .arch aarch64
+                ; cmp w0, #struct_tag
+                ; b.ne => target
+            );
+        }
+        self.emit_reg_addr(11, object);
+        dynasm!(self.ops
+            ; .arch aarch64
+            ; ldr x9, [x11, #fields_offset]
+        );
+        if !is_guarded {
+            dynasm!(self.ops
+                ; .arch aarch64
+                ; ldr x10, [x9, #len_offset]
+                ; cmp x10, #index as u32
+                ; b.ls => target
+            );
+        }
+        dynasm!(self.ops
+            ; .arch aarch64
+            ; ldr x11, [x9, #ptr_offset]
+        );
+        self.emit_add_imm(11, 11, element);
+        self.emit_mov_imm64(12, variant_ptr as u64);
+        dynasm!(self.ops
+            ; .arch aarch64
+            ; ldrb w0, [x11]
+            ; cmp w0, #enum_tag
+            ; b.ne => target
+            ; ldr x10, [x11, #enum_object_offset]
+            ; ldr x13, [x10, #variant_offset]
+            ; cmp x13, x12
+            ; b.ne => target
+            ; ldr x11, [x10, #values_ptr_offset]
+        );
         self.emit_reg_addr(9, dest);
         self.emit_copy_x11_to_x9();
         Ok(())
@@ -1615,13 +2239,13 @@ impl JitCompiler {
                 ; .arch aarch64
                 ; cmp x10, x12
                 ; b.eq >fail
+                ; ldr x10, [x9, #len_offset]
+                ; cmp x10, #index as u32
+                ; b.ls >fail
             );
         }
         dynasm!(self.ops
             ; .arch aarch64
-            ; ldr x10, [x9, #len_offset]
-            ; cmp x10, #index as u32
-            ; b.ls >fail
             ; ldr x11, [x9, #ptr_offset]
         );
         self.emit_add_imm(11, 11, element);

@@ -112,9 +112,9 @@ impl Parser {
     }
 
     fn parse_range(&mut self) -> Result<Expr> {
-        let expr = self.parse_concat()?;
+        let expr = self.parse_bit_or()?;
         if self.match_token(&[TokenKind::DoubleDot]) {
-            let end = self.parse_concat()?;
+            let end = self.parse_bit_or()?;
             let span = self.span_through_previous(expr.span);
             return Ok(Expr::new(
                 ExprKind::Range {
@@ -129,26 +129,116 @@ impl Parser {
         Ok(expr)
     }
 
+    fn parse_bit_or(&mut self) -> Result<Expr> {
+        let mut expr = self.parse_bit_xor()?;
+        while self.match_token(&[TokenKind::Pipe]) {
+            let right = self.parse_bit_xor()?;
+            let span = self.span_through_previous(expr.span);
+            expr = Expr::new(
+                ExprKind::Binary {
+                    left: Box::new(expr),
+                    op: BinaryOp::BitOr,
+                    right: Box::new(right),
+                },
+                span,
+            );
+        }
+
+        Ok(expr)
+    }
+
+    fn parse_bit_xor(&mut self) -> Result<Expr> {
+        let mut expr = self.parse_bit_and()?;
+        while self.match_token(&[TokenKind::DoubleCaret, TokenKind::Tilde]) {
+            let right = self.parse_bit_and()?;
+            let span = self.span_through_previous(expr.span);
+            expr = Expr::new(
+                ExprKind::Binary {
+                    left: Box::new(expr),
+                    op: BinaryOp::BitXor,
+                    right: Box::new(right),
+                },
+                span,
+            );
+        }
+
+        Ok(expr)
+    }
+
+    fn parse_bit_and(&mut self) -> Result<Expr> {
+        let mut expr = self.parse_shift()?;
+        while self.match_token(&[TokenKind::Ampersand]) {
+            let right = self.parse_shift()?;
+            let span = self.span_through_previous(expr.span);
+            expr = Expr::new(
+                ExprKind::Binary {
+                    left: Box::new(expr),
+                    op: BinaryOp::BitAnd,
+                    right: Box::new(right),
+                },
+                span,
+            );
+        }
+
+        Ok(expr)
+    }
+
+    fn parse_shift(&mut self) -> Result<Expr> {
+        let mut expr = self.parse_concat()?;
+        while self.match_token(&[TokenKind::DoubleLess, TokenKind::DoubleGreater]) {
+            let op = match self.tokens[self.current - 1].kind {
+                TokenKind::DoubleLess => BinaryOp::Shl,
+                TokenKind::DoubleGreater => BinaryOp::Shr,
+                _ => unreachable!(),
+            };
+            let right = self.parse_concat()?;
+            let span = self.span_through_previous(expr.span);
+            expr = Expr::new(
+                ExprKind::Binary {
+                    left: Box::new(expr),
+                    op,
+                    right: Box::new(right),
+                },
+                span,
+            );
+        }
+
+        Ok(expr)
+    }
+
+    fn is_string_like_expr(expr: &Expr) -> bool {
+        match &expr.kind {
+            ExprKind::Literal(Literal::String(_)) => true,
+            ExprKind::Binary {
+                op: BinaryOp::Concat,
+                ..
+            } => true,
+            _ => false,
+        }
+    }
+
     fn parse_concat(&mut self) -> Result<Expr> {
-        let mut expr = self.parse_term()?;
-        while self.check(TokenKind::DoubleDot) {
-            if let Some(next) = self.peek_ahead(1)
-                && matches!(next.kind, TokenKind::Integer | TokenKind::Float)
-            {
-                break;
+        let expr = self.parse_term()?;
+        if self.check(TokenKind::DoubleDot) {
+            if !Self::is_string_like_expr(&expr) {
+                if let Some(next) = self.peek_ahead(1)
+                    && matches!(next.kind, TokenKind::Integer | TokenKind::Float)
+                {
+                    return Ok(expr);
+                }
             }
 
             self.advance();
-            let right = self.parse_term()?;
+            let right = self.parse_concat()?;
             let span = self.span_through_previous(expr.span);
-            expr = Expr::new(
+            return Ok(Expr::new(
                 ExprKind::Binary {
                     left: Box::new(expr),
                     op: BinaryOp::Concat,
                     right: Box::new(right),
                 },
                 span,
-            );
+            ));
         }
 
         Ok(expr)
@@ -178,15 +268,21 @@ impl Parser {
     }
 
     fn parse_factor(&mut self) -> Result<Expr> {
-        let mut expr = self.parse_power()?;
-        while self.match_token(&[TokenKind::Star, TokenKind::Slash, TokenKind::Percent]) {
+        let mut expr = self.parse_unary()?;
+        while self.match_token(&[
+            TokenKind::Star,
+            TokenKind::Slash,
+            TokenKind::DoubleSlash,
+            TokenKind::Percent,
+        ]) {
             let op = match self.tokens[self.current - 1].kind {
                 TokenKind::Star => BinaryOp::Mul,
                 TokenKind::Slash => BinaryOp::Div,
+                TokenKind::DoubleSlash => BinaryOp::FloorDiv,
                 TokenKind::Percent => BinaryOp::Mod,
                 _ => unreachable!(),
             };
-            let right = self.parse_power()?;
+            let right = self.parse_unary()?;
             let span = self.span_through_previous(expr.span);
             expr = Expr::new(
                 ExprKind::Binary {
@@ -201,30 +297,13 @@ impl Parser {
         Ok(expr)
     }
 
-    fn parse_power(&mut self) -> Result<Expr> {
-        let expr = self.parse_unary()?;
-        if self.match_token(&[TokenKind::Caret]) {
-            let right = self.parse_power()?;
-            let span = self.span_through_previous(expr.span);
-            return Ok(Expr::new(
-                ExprKind::Binary {
-                    left: Box::new(expr),
-                    op: BinaryOp::Pow,
-                    right: Box::new(right),
-                },
-                span,
-            ));
-        }
-
-        Ok(expr)
-    }
-
     fn parse_unary(&mut self) -> Result<Expr> {
-        if self.match_token(&[TokenKind::Minus, TokenKind::Not]) {
+        if self.match_token(&[TokenKind::Minus, TokenKind::Not, TokenKind::Tilde]) {
             let start_token = self.tokens[self.current - 1].clone();
             let op = match start_token.kind {
                 TokenKind::Minus => UnaryOp::Neg,
                 TokenKind::Not => UnaryOp::Not,
+                TokenKind::Tilde => UnaryOp::BitNot,
                 _ => unreachable!(),
             };
             let operand = self.parse_unary()?;
@@ -238,7 +317,25 @@ impl Parser {
             ));
         }
 
-        self.parse_postfix()
+        self.parse_power()
+    }
+
+    fn parse_power(&mut self) -> Result<Expr> {
+        let expr = self.parse_postfix()?;
+        if self.match_token(&[TokenKind::Caret]) {
+            let right = self.parse_unary()?;
+            let span = self.span_through_previous(expr.span);
+            return Ok(Expr::new(
+                ExprKind::Binary {
+                    left: Box::new(expr),
+                    op: BinaryOp::Pow,
+                    right: Box::new(right),
+                },
+                span,
+            ));
+        }
+
+        Ok(expr)
     }
 
     #[inline(never)]
@@ -307,7 +404,7 @@ impl Parser {
                             types.push(self.parse_type()?);
                         }
 
-                        self.consume(TokenKind::Greater, "Expected '>' after type arguments")?;
+                        self.consume_closing_angle_bracket("Expected '>' after type arguments")?;
                         Some(types)
                     } else {
                         None
@@ -503,6 +600,18 @@ impl Parser {
                         return false;
                     }
                     depth -= 1;
+                    if depth == 0 {
+                        return self
+                            .tokens
+                            .get(index + 1)
+                            .is_some_and(|next| next.kind == TokenKind::LeftParen);
+                    }
+                }
+                TokenKind::DoubleGreater => {
+                    if depth < 2 {
+                        return false;
+                    }
+                    depth -= 2;
                     if depth == 0 {
                         return self
                             .tokens
@@ -970,5 +1079,242 @@ impl Parser {
             },
             self.make_span(&start_token, &end_token),
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::ast::{BinaryOp, ExprKind, Literal, UnaryOp};
+    use crate::intern::Interner;
+    use crate::lexer::Lexer;
+    use crate::parser::Parser;
+
+    fn parse_expression(src: &str) -> crate::ast::Expr {
+        let mut interner = Interner::new();
+        let mut lexer = Lexer::new(src, &mut interner);
+        let tokens = lexer.tokenize().expect("tokenize");
+        let mut parser = Parser::new(tokens);
+        parser.parse_expr().expect("parse_expr")
+    }
+
+    #[test]
+    fn test_power_precedence_and_associativity() {
+        // -2 ^ 2 => -(2 ^ 2)
+        let expr = parse_expression("-2 ^ 2");
+        match &expr.kind {
+            ExprKind::Unary {
+                op: UnaryOp::Neg,
+                operand,
+            } => match &operand.kind {
+                ExprKind::Binary {
+                    left,
+                    op: BinaryOp::Pow,
+                    right,
+                } => {
+                    assert!(matches!(left.kind, ExprKind::Literal(Literal::Integer(2))));
+                    assert!(matches!(right.kind, ExprKind::Literal(Literal::Integer(2))));
+                }
+                other => panic!("expected Binary Pow, got {:?}", other),
+            },
+            other => panic!("expected Unary Neg, got {:?}", other),
+        }
+
+        // 2 ^ 3 ^ 2 => 2 ^ (3 ^ 2)
+        let expr = parse_expression("2 ^ 3 ^ 2");
+        match &expr.kind {
+            ExprKind::Binary {
+                left,
+                op: BinaryOp::Pow,
+                right,
+            } => {
+                assert!(matches!(left.kind, ExprKind::Literal(Literal::Integer(2))));
+                match &right.kind {
+                    ExprKind::Binary {
+                        left: l2,
+                        op: BinaryOp::Pow,
+                        right: r2,
+                    } => {
+                        assert!(matches!(l2.kind, ExprKind::Literal(Literal::Integer(3))));
+                        assert!(matches!(r2.kind, ExprKind::Literal(Literal::Integer(2))));
+                    }
+                    other => panic!("expected nested Binary Pow, got {:?}", other),
+                }
+            }
+            other => panic!("expected Binary Pow, got {:?}", other),
+        }
+
+        // 2 ^ -2 => 2 ^ (-2)
+        let expr = parse_expression("2 ^ -2");
+        match &expr.kind {
+            ExprKind::Binary {
+                left,
+                op: BinaryOp::Pow,
+                right,
+            } => {
+                assert!(matches!(left.kind, ExprKind::Literal(Literal::Integer(2))));
+                match &right.kind {
+                    ExprKind::Unary {
+                        op: UnaryOp::Neg,
+                        operand,
+                    } => {
+                        assert!(matches!(operand.kind, ExprKind::Literal(Literal::Integer(2))));
+                    }
+                    other => panic!("expected Unary Neg on right operand, got {:?}", other),
+                }
+            }
+            other => panic!("expected Binary Pow, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_bitwise_and_floor_div_parsing() {
+        // // floor div
+        let expr = parse_expression("10 // 3");
+        assert!(matches!(
+            expr.kind,
+            ExprKind::Binary {
+                op: BinaryOp::FloorDiv,
+                ..
+            }
+        ));
+
+        // & bit and
+        let expr = parse_expression("a & b");
+        assert!(matches!(
+            expr.kind,
+            ExprKind::Binary {
+                op: BinaryOp::BitAnd,
+                ..
+            }
+        ));
+
+        // | bit or
+        let expr = parse_expression("a | b");
+        assert!(matches!(
+            expr.kind,
+            ExprKind::Binary {
+                op: BinaryOp::BitOr,
+                ..
+            }
+        ));
+
+        // ^^ bit xor
+        let expr = parse_expression("a ^^ b");
+        assert!(matches!(
+            expr.kind,
+            ExprKind::Binary {
+                op: BinaryOp::BitXor,
+                ..
+            }
+        ));
+
+        // ~ bit xor (binary)
+        let expr = parse_expression("a ~ b");
+        assert!(matches!(
+            expr.kind,
+            ExprKind::Binary {
+                op: BinaryOp::BitXor,
+                ..
+            }
+        ));
+
+        // ~ bit not (unary)
+        let expr = parse_expression("~a");
+        assert!(matches!(
+            expr.kind,
+            ExprKind::Unary {
+                op: UnaryOp::BitNot,
+                ..
+            }
+        ));
+
+        // << and >> shift
+        let expr = parse_expression("1 << 4");
+        assert!(matches!(
+            expr.kind,
+            ExprKind::Binary {
+                op: BinaryOp::Shl,
+                ..
+            }
+        ));
+
+        let expr = parse_expression("16 >> 2");
+        assert!(matches!(
+            expr.kind,
+            ExprKind::Binary {
+                op: BinaryOp::Shr,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn test_precedence_hierarchy() {
+        // a + b << c => (a + b) << c
+        let expr = parse_expression("a + b << c");
+        match &expr.kind {
+            ExprKind::Binary {
+                left,
+                op: BinaryOp::Shl,
+                ..
+            } => {
+                assert!(matches!(left.kind, ExprKind::Binary { op: BinaryOp::Add, .. }));
+            }
+            other => panic!("expected Shift with Add left, got {:?}", other),
+        }
+
+        // x & y | z => (x & y) | z
+        let expr = parse_expression("x & y | z");
+        match &expr.kind {
+            ExprKind::Binary {
+                left,
+                op: BinaryOp::BitOr,
+                ..
+            } => {
+                assert!(matches!(left.kind, ExprKind::Binary { op: BinaryOp::BitAnd, .. }));
+            }
+            other => panic!("expected BitOr with BitAnd left, got {:?}", other),
+        }
+
+        // x << y == z => (x << y) == z
+        let expr = parse_expression("x << y == z");
+        match &expr.kind {
+            ExprKind::Binary {
+                left,
+                op: BinaryOp::Eq,
+                ..
+            } => {
+                assert!(matches!(left.kind, ExprKind::Binary { op: BinaryOp::Shl, .. }));
+            }
+            other => panic!("expected Eq with Shl left, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_string_concat_vs_range() {
+        let expr = parse_expression("\"str\" .. 10");
+        match &expr.kind {
+            ExprKind::Binary {
+                op: BinaryOp::Concat,
+                ..
+            } => {}
+            other => panic!("expected Concat for \"str\" .. 10, got {:?}", other),
+        }
+
+        let expr = parse_expression("1..10");
+        match &expr.kind {
+            ExprKind::Range { .. } => {}
+            other => panic!("expected Range for 1..10, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_nested_generics_in_statements() {
+        let mut interner = Interner::new();
+        let mut lexer = Lexer::new("local x: Array<Array<int>> = [[1]]", &mut interner);
+        let tokens = lexer.tokenize().expect("tokenize");
+        let mut parser = Parser::new(tokens);
+        let items = parser.parse().expect("parse items");
+        assert_eq!(items.len(), 1);
     }
 }

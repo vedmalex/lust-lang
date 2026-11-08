@@ -16,6 +16,8 @@ pub enum Instruction {
     Mul(Register, Register, Register),
     Div(Register, Register, Register),
     Mod(Register, Register, Register),
+    Pow(Register, Register, Register),
+    FloorDiv(Register, Register, Register),
     Neg(Register, Register),
     Eq(Register, Register, Register),
     Ne(Register, Register, Register),
@@ -28,6 +30,8 @@ pub enum Instruction {
     MulInt(Register, Register, Register),
     DivInt(Register, Register, Register),
     ModInt(Register, Register, Register),
+    PowInt(Register, Register, Register),
+    FloorDivInt(Register, Register, Register),
     NegInt(Register, Register),
     EqInt(Register, Register, Register),
     NeInt(Register, Register, Register),
@@ -40,6 +44,8 @@ pub enum Instruction {
     MulFloat(Register, Register, Register),
     DivFloat(Register, Register, Register),
     ModFloat(Register, Register, Register),
+    PowFloat(Register, Register, Register),
+    FloorDivFloat(Register, Register, Register),
     NegFloat(Register, Register),
     EqFloat(Register, Register, Register),
     NeFloat(Register, Register, Register),
@@ -50,6 +56,12 @@ pub enum Instruction {
     And(Register, Register, Register),
     Or(Register, Register, Register),
     Not(Register, Register),
+    BitAnd(Register, Register, Register),
+    BitOr(Register, Register, Register),
+    BitXor(Register, Register, Register),
+    Shl(Register, Register, Register),
+    Shr(Register, Register, Register),
+    BitNot(Register, Register),
     Jump(JumpOffset),
     JumpIf(Register, JumpOffset),
     JumpIfNot(Register, JumpOffset),
@@ -68,6 +80,7 @@ pub enum Instruction {
     SetField(Register, ConstIndex, Register),
     GetIndex(Register, Register, Register),
     TryGetIndex(Register, Register, Register),
+    ArrayIndexOk(Register, Register, Register, Register),
     ArrayLen(Register, Register),
     SetIndex(Register, Register, Register),
     Concat(Register, Register, Register),
@@ -92,6 +105,8 @@ pub enum OpCode {
     Mul,
     Div,
     Mod,
+    Pow,
+    FloorDiv,
     Neg,
     Eq,
     Ne,
@@ -104,6 +119,8 @@ pub enum OpCode {
     MulInt,
     DivInt,
     ModInt,
+    PowInt,
+    FloorDivInt,
     NegInt,
     EqInt,
     NeInt,
@@ -116,6 +133,8 @@ pub enum OpCode {
     MulFloat,
     DivFloat,
     ModFloat,
+    PowFloat,
+    FloorDivFloat,
     NegFloat,
     EqFloat,
     NeFloat,
@@ -126,6 +145,12 @@ pub enum OpCode {
     And,
     Or,
     Not,
+    BitAnd,
+    BitOr,
+    BitXor,
+    Shl,
+    Shr,
+    BitNot,
     Jump,
     JumpIf,
     JumpIfNot,
@@ -144,6 +169,7 @@ pub enum OpCode {
     SetField,
     GetIndex,
     TryGetIndex,
+    ArrayIndexOk,
     ArrayLen,
     SetIndex,
     Concat,
@@ -169,6 +195,8 @@ impl Instruction {
             Instruction::Mul(_, _, _) => OpCode::Mul,
             Instruction::Div(_, _, _) => OpCode::Div,
             Instruction::Mod(_, _, _) => OpCode::Mod,
+            Instruction::Pow(_, _, _) => OpCode::Pow,
+            Instruction::FloorDiv(_, _, _) => OpCode::FloorDiv,
             Instruction::Neg(_, _) => OpCode::Neg,
             Instruction::Eq(_, _, _) => OpCode::Eq,
             Instruction::Ne(_, _, _) => OpCode::Ne,
@@ -181,6 +209,8 @@ impl Instruction {
             Instruction::MulInt(_, _, _) => OpCode::MulInt,
             Instruction::DivInt(_, _, _) => OpCode::DivInt,
             Instruction::ModInt(_, _, _) => OpCode::ModInt,
+            Instruction::PowInt(_, _, _) => OpCode::PowInt,
+            Instruction::FloorDivInt(_, _, _) => OpCode::FloorDivInt,
             Instruction::NegInt(_, _) => OpCode::NegInt,
             Instruction::EqInt(_, _, _) => OpCode::EqInt,
             Instruction::NeInt(_, _, _) => OpCode::NeInt,
@@ -193,6 +223,8 @@ impl Instruction {
             Instruction::MulFloat(_, _, _) => OpCode::MulFloat,
             Instruction::DivFloat(_, _, _) => OpCode::DivFloat,
             Instruction::ModFloat(_, _, _) => OpCode::ModFloat,
+            Instruction::PowFloat(_, _, _) => OpCode::PowFloat,
+            Instruction::FloorDivFloat(_, _, _) => OpCode::FloorDivFloat,
             Instruction::NegFloat(_, _) => OpCode::NegFloat,
             Instruction::EqFloat(_, _, _) => OpCode::EqFloat,
             Instruction::NeFloat(_, _, _) => OpCode::NeFloat,
@@ -203,6 +235,12 @@ impl Instruction {
             Instruction::And(_, _, _) => OpCode::And,
             Instruction::Or(_, _, _) => OpCode::Or,
             Instruction::Not(_, _) => OpCode::Not,
+            Instruction::BitAnd(_, _, _) => OpCode::BitAnd,
+            Instruction::BitOr(_, _, _) => OpCode::BitOr,
+            Instruction::BitXor(_, _, _) => OpCode::BitXor,
+            Instruction::Shl(_, _, _) => OpCode::Shl,
+            Instruction::Shr(_, _, _) => OpCode::Shr,
+            Instruction::BitNot(_, _) => OpCode::BitNot,
             Instruction::Jump(_) => OpCode::Jump,
             Instruction::JumpIf(_, _) => OpCode::JumpIf,
             Instruction::JumpIfNot(_, _) => OpCode::JumpIfNot,
@@ -221,6 +259,7 @@ impl Instruction {
             Instruction::SetField(_, _, _) => OpCode::SetField,
             Instruction::GetIndex(_, _, _) => OpCode::GetIndex,
             Instruction::TryGetIndex(_, _, _) => OpCode::TryGetIndex,
+            Instruction::ArrayIndexOk(_, _, _, _) => OpCode::ArrayIndexOk,
             Instruction::ArrayLen(_, _) => OpCode::ArrayLen,
             Instruction::SetIndex(_, _, _) => OpCode::SetIndex,
             Instruction::Concat(_, _, _) => OpCode::Concat,
@@ -245,6 +284,8 @@ impl Instruction {
             | Instruction::Mul(dest, _, _)
             | Instruction::Div(dest, _, _)
             | Instruction::Mod(dest, _, _)
+            | Instruction::Pow(dest, _, _)
+            | Instruction::FloorDiv(dest, _, _)
             | Instruction::Neg(dest, _)
             | Instruction::Eq(dest, _, _)
             | Instruction::Ne(dest, _, _)
@@ -257,6 +298,8 @@ impl Instruction {
             | Instruction::MulInt(dest, _, _)
             | Instruction::DivInt(dest, _, _)
             | Instruction::ModInt(dest, _, _)
+            | Instruction::PowInt(dest, _, _)
+            | Instruction::FloorDivInt(dest, _, _)
             | Instruction::NegInt(dest, _)
             | Instruction::EqInt(dest, _, _)
             | Instruction::NeInt(dest, _, _)
@@ -269,6 +312,8 @@ impl Instruction {
             | Instruction::MulFloat(dest, _, _)
             | Instruction::DivFloat(dest, _, _)
             | Instruction::ModFloat(dest, _, _)
+            | Instruction::PowFloat(dest, _, _)
+            | Instruction::FloorDivFloat(dest, _, _)
             | Instruction::NegFloat(dest, _)
             | Instruction::EqFloat(dest, _, _)
             | Instruction::NeFloat(dest, _, _)
@@ -279,6 +324,12 @@ impl Instruction {
             | Instruction::And(dest, _, _)
             | Instruction::Or(dest, _, _)
             | Instruction::Not(dest, _)
+            | Instruction::BitAnd(dest, _, _)
+            | Instruction::BitOr(dest, _, _)
+            | Instruction::BitXor(dest, _, _)
+            | Instruction::Shl(dest, _, _)
+            | Instruction::Shr(dest, _, _)
+            | Instruction::BitNot(dest, _)
             | Instruction::Call(_, _, _, dest)
             | Instruction::NewArray(dest, _, _)
             | Instruction::NewMap(dest)
@@ -306,6 +357,7 @@ impl Instruction {
             | Instruction::Return(_)
             | Instruction::SetField(_, _, _)
             | Instruction::SetIndex(_, _, _)
+            | Instruction::ArrayIndexOk(_, _, _, _)
             | Instruction::StoreUpvalue(_, _) => None,
         }
     }
@@ -320,6 +372,7 @@ impl Instruction {
             | Instruction::NegInt(_, src)
             | Instruction::NegFloat(_, src)
             | Instruction::Not(_, src)
+            | Instruction::BitNot(_, src)
             | Instruction::JumpIf(src, _)
             | Instruction::JumpIfNot(src, _)
             | Instruction::Return(src)
@@ -333,6 +386,8 @@ impl Instruction {
             | Instruction::Mul(_, lhs, rhs)
             | Instruction::Div(_, lhs, rhs)
             | Instruction::Mod(_, lhs, rhs)
+            | Instruction::Pow(_, lhs, rhs)
+            | Instruction::FloorDiv(_, lhs, rhs)
             | Instruction::Eq(_, lhs, rhs)
             | Instruction::Ne(_, lhs, rhs)
             | Instruction::Lt(_, lhs, rhs)
@@ -344,6 +399,8 @@ impl Instruction {
             | Instruction::MulInt(_, lhs, rhs)
             | Instruction::DivInt(_, lhs, rhs)
             | Instruction::ModInt(_, lhs, rhs)
+            | Instruction::PowInt(_, lhs, rhs)
+            | Instruction::FloorDivInt(_, lhs, rhs)
             | Instruction::EqInt(_, lhs, rhs)
             | Instruction::NeInt(_, lhs, rhs)
             | Instruction::LtInt(_, lhs, rhs)
@@ -355,6 +412,8 @@ impl Instruction {
             | Instruction::MulFloat(_, lhs, rhs)
             | Instruction::DivFloat(_, lhs, rhs)
             | Instruction::ModFloat(_, lhs, rhs)
+            | Instruction::PowFloat(_, lhs, rhs)
+            | Instruction::FloorDivFloat(_, lhs, rhs)
             | Instruction::EqFloat(_, lhs, rhs)
             | Instruction::NeFloat(_, lhs, rhs)
             | Instruction::LtFloat(_, lhs, rhs)
@@ -363,8 +422,14 @@ impl Instruction {
             | Instruction::GeFloat(_, lhs, rhs)
             | Instruction::And(_, lhs, rhs)
             | Instruction::Or(_, lhs, rhs)
+            | Instruction::BitAnd(_, lhs, rhs)
+            | Instruction::BitOr(_, lhs, rhs)
+            | Instruction::BitXor(_, lhs, rhs)
+            | Instruction::Shl(_, lhs, rhs)
+            | Instruction::Shr(_, lhs, rhs)
             | Instruction::GetIndex(_, lhs, rhs)
             | Instruction::TryGetIndex(_, lhs, rhs)
+            | Instruction::ArrayIndexOk(_, _, lhs, rhs)
             | Instruction::Concat(_, lhs, rhs) => register == lhs || register == rhs,
             Instruction::SetIndex(collection, index, value) => {
                 register == collection || register == index || register == value
@@ -406,6 +471,8 @@ impl Instruction {
             (Self::Mul(d, l, r), Int) => Self::MulInt(d, l, r),
             (Self::Div(d, l, r), Int) => Self::DivInt(d, l, r),
             (Self::Mod(d, l, r), Int) => Self::ModInt(d, l, r),
+            (Self::Pow(d, l, r), Int) => Self::PowInt(d, l, r),
+            (Self::FloorDiv(d, l, r), Int) => Self::FloorDivInt(d, l, r),
             (Self::Neg(d, s), Int) => Self::NegInt(d, s),
             (Self::Eq(d, l, r), Int) => Self::EqInt(d, l, r),
             (Self::Ne(d, l, r), Int) => Self::NeInt(d, l, r),
@@ -418,6 +485,8 @@ impl Instruction {
             (Self::Mul(d, l, r), Float) => Self::MulFloat(d, l, r),
             (Self::Div(d, l, r), Float) => Self::DivFloat(d, l, r),
             (Self::Mod(d, l, r), Float) => Self::ModFloat(d, l, r),
+            (Self::Pow(d, l, r), Float) => Self::PowFloat(d, l, r),
+            (Self::FloorDiv(d, l, r), Float) => Self::FloorDivFloat(d, l, r),
             (Self::Neg(d, s), Float) => Self::NegFloat(d, s),
             (Self::Eq(d, l, r), Float) => Self::EqFloat(d, l, r),
             (Self::Ne(d, l, r), Float) => Self::NeFloat(d, l, r),
@@ -477,6 +546,8 @@ impl fmt::Display for Instruction {
             Instruction::Mul(d, l, r) => write!(f, "Mul R{}, R{}, R{}", d, l, r),
             Instruction::Div(d, l, r) => write!(f, "Div R{}, R{}, R{}", d, l, r),
             Instruction::Mod(d, l, r) => write!(f, "Mod R{}, R{}, R{}", d, l, r),
+            Instruction::Pow(d, l, r) => write!(f, "Pow R{}, R{}, R{}", d, l, r),
+            Instruction::FloorDiv(d, l, r) => write!(f, "FloorDiv R{}, R{}, R{}", d, l, r),
             Instruction::Neg(d, s) => write!(f, "Neg R{}, R{}", d, s),
             Instruction::Eq(d, l, r) => write!(f, "Eq R{}, R{}, R{}", d, l, r),
             Instruction::Ne(d, l, r) => write!(f, "Ne R{}, R{}, R{}", d, l, r),
@@ -489,6 +560,8 @@ impl fmt::Display for Instruction {
             Instruction::MulInt(d, l, r) => write!(f, "MulInt R{}, R{}, R{}", d, l, r),
             Instruction::DivInt(d, l, r) => write!(f, "DivInt R{}, R{}, R{}", d, l, r),
             Instruction::ModInt(d, l, r) => write!(f, "ModInt R{}, R{}, R{}", d, l, r),
+            Instruction::PowInt(d, l, r) => write!(f, "PowInt R{}, R{}, R{}", d, l, r),
+            Instruction::FloorDivInt(d, l, r) => write!(f, "FloorDivInt R{}, R{}, R{}", d, l, r),
             Instruction::NegInt(d, s) => write!(f, "NegInt R{}, R{}", d, s),
             Instruction::EqInt(d, l, r) => write!(f, "EqInt R{}, R{}, R{}", d, l, r),
             Instruction::NeInt(d, l, r) => write!(f, "NeInt R{}, R{}, R{}", d, l, r),
@@ -501,6 +574,8 @@ impl fmt::Display for Instruction {
             Instruction::MulFloat(d, l, r) => write!(f, "MulFloat R{}, R{}, R{}", d, l, r),
             Instruction::DivFloat(d, l, r) => write!(f, "DivFloat R{}, R{}, R{}", d, l, r),
             Instruction::ModFloat(d, l, r) => write!(f, "ModFloat R{}, R{}, R{}", d, l, r),
+            Instruction::PowFloat(d, l, r) => write!(f, "PowFloat R{}, R{}, R{}", d, l, r),
+            Instruction::FloorDivFloat(d, l, r) => write!(f, "FloorDivFloat R{}, R{}, R{}", d, l, r),
             Instruction::NegFloat(d, s) => write!(f, "NegFloat R{}, R{}", d, s),
             Instruction::EqFloat(d, l, r) => write!(f, "EqFloat R{}, R{}, R{}", d, l, r),
             Instruction::NeFloat(d, l, r) => write!(f, "NeFloat R{}, R{}, R{}", d, l, r),
@@ -511,6 +586,12 @@ impl fmt::Display for Instruction {
             Instruction::And(d, l, r) => write!(f, "And R{}, R{}, R{}", d, l, r),
             Instruction::Or(d, l, r) => write!(f, "Or R{}, R{}, R{}", d, l, r),
             Instruction::Not(d, s) => write!(f, "Not R{}, R{}", d, s),
+            Instruction::BitAnd(d, l, r) => write!(f, "BitAnd R{}, R{}, R{}", d, l, r),
+            Instruction::BitOr(d, l, r) => write!(f, "BitOr R{}, R{}, R{}", d, l, r),
+            Instruction::BitXor(d, l, r) => write!(f, "BitXor R{}, R{}, R{}", d, l, r),
+            Instruction::Shl(d, l, r) => write!(f, "Shl R{}, R{}, R{}", d, l, r),
+            Instruction::Shr(d, l, r) => write!(f, "Shr R{}, R{}, R{}", d, l, r),
+            Instruction::BitNot(d, s) => write!(f, "BitNot R{}, R{}", d, s),
             Instruction::Jump(offset) => write!(f, "Jump {}", offset),
             Instruction::JumpIf(r, offset) => write!(f, "JumpIf R{}, {}", r, offset),
             Instruction::JumpIfNot(r, offset) => write!(f, "JumpIfNot R{}, {}", r, offset),
@@ -614,6 +695,9 @@ impl fmt::Display for Instruction {
             Instruction::GetIndex(d, arr, idx) => write!(f, "GetIndex R{}, R{}, R{}", d, arr, idx),
             Instruction::TryGetIndex(d, arr, idx) => {
                 write!(f, "TryGetIndex R{}, R{}, R{}", d, arr, idx)
+            }
+            Instruction::ArrayIndexOk(v, c, arr, idx) => {
+                write!(f, "ArrayIndexOk R{}, R{}, R{}, R{}", v, c, arr, idx)
             }
             Instruction::ArrayLen(d, arr) => write!(f, "ArrayLen R{}, R{}", d, arr),
             Instruction::SetIndex(arr, idx, val) => {

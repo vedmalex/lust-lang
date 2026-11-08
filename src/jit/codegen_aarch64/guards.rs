@@ -279,6 +279,12 @@ impl JitCompiler {
             let object_offset = measured.struct_fields_offset as u32;
             let layout_offset = measured.struct_layout_offset as u32;
             let inner = (layout as usize).wrapping_sub(16) as u64;
+            if self.function_mode && register == 0 {
+                dynasm!(self.ops
+                    ; .arch aarch64
+                    ; cbnz x21, >guard_ok
+                );
+            }
             self.load_tag(0, register);
             self.emit_reg_addr(11, register);
             dynasm!(self.ops
@@ -470,6 +476,115 @@ impl JitCompiler {
             fail_count: 0,
         })
     }
+
+    pub(super) fn compile_conditional_hammock(
+        &mut self,
+        condition_register: u8,
+        expect_truthy: bool,
+        bailout_ip: usize,
+        acc_dest: u8,
+        acc_src: u8,
+        acc_imm: i64,
+        inner_loop_bypass: &Option<crate::jit::trace::InnerLoopBypass>,
+        guard_index: usize,
+    ) -> Result<Guard> {
+        let guard_return_value = (guard_index + 1) as i32;
+
+        // 1. Load condition into w0
+        self.load_bool_payload(0, condition_register);
+
+        if let Some(bypass) = inner_loop_bypass {
+            // Guarded bypass mode (like sieve):
+            // When condition matches expect_truthy (f == false, composite):
+            // skip the hammock entirely.
+            if expect_truthy {
+                dynasm!(self.ops ; .arch aarch64 ; cbnz w0, >rejoin);
+            } else {
+                dynasm!(self.ops ; .arch aarch64 ; cbz w0, >rejoin);
+            }
+
+            // Cold path (f == true, prime):
+            // Check if inner loop needs to run: (mul_lhs * mul_rhs) <= bound_reg
+            self.load_payload(10, bypass.mul_lhs);
+            self.load_payload(11, bypass.mul_rhs);
+            dynasm!(self.ops ; .arch aarch64 ; mul x10, x10, x11);
+
+            self.load_payload(11, bypass.bound_reg);
+            dynasm!(self.ops ; .arch aarch64 ; cmp x10, x11);
+
+            // If <= bound, bail out to interpreter
+            dynasm!(self.ops ; .arch aarch64 ; b.le >bailout);
+
+            // If > bound, update accumulator
+            self.load_payload(10, acc_src);
+            if acc_imm == 1 {
+                dynasm!(self.ops ; .arch aarch64 ; add x10, x10, #1);
+            } else if acc_imm > 0 && acc_imm <= 4095 {
+                let imm = acc_imm as u32;
+                dynasm!(self.ops ; .arch aarch64 ; add x10, x10, #imm);
+            } else if acc_imm < 0 && -acc_imm <= 4095 {
+                let imm = (-acc_imm) as u32;
+                dynasm!(self.ops ; .arch aarch64 ; sub x10, x10, #imm);
+            } else {
+                let imm = (acc_imm as u32) & 0xffff;
+                dynasm!(self.ops ; .arch aarch64 ; movz x11, #imm ; add x10, x10, x11);
+            }
+
+            // Store result into acc_dest
+            if let Some(d) = self.direct_dest_x(acc_dest) {
+                dynasm!(self.ops ; .arch aarch64 ; mov X(d), x10);
+            } else {
+                dynasm!(self.ops ; .arch aarch64 ; mov x0, x10);
+                self.store_from_x0(acc_dest, ValueTag::Int.as_u8());
+            }
+
+            dynasm!(self.ops ; .arch aarch64 ; b >rejoin);
+
+            dynasm!(self.ops ; .arch aarch64 ; bailout:);
+            self.emit_guard_exit(guard_return_value);
+
+            dynasm!(self.ops ; .arch aarch64 ; rejoin:);
+        } else {
+            // Pure accumulator update:
+            if expect_truthy {
+                dynasm!(self.ops ; .arch aarch64 ; cbnz w0, >rejoin);
+            } else {
+                dynasm!(self.ops ; .arch aarch64 ; cbz w0, >rejoin);
+            }
+
+            self.load_payload(10, acc_src);
+            if acc_imm == 1 {
+                dynasm!(self.ops ; .arch aarch64 ; add x10, x10, #1);
+            } else if acc_imm > 0 && acc_imm <= 4095 {
+                let imm = acc_imm as u32;
+                dynasm!(self.ops ; .arch aarch64 ; add x10, x10, #imm);
+            } else if acc_imm < 0 && -acc_imm <= 4095 {
+                let imm = (-acc_imm) as u32;
+                dynasm!(self.ops ; .arch aarch64 ; sub x10, x10, #imm);
+            }
+
+            if let Some(d) = self.direct_dest_x(acc_dest) {
+                dynasm!(self.ops ; .arch aarch64 ; mov X(d), x10);
+            } else {
+                dynasm!(self.ops ; .arch aarch64 ; mov x0, x10);
+                self.store_from_x0(acc_dest, ValueTag::Int.as_u8());
+            }
+
+            dynasm!(self.ops ; .arch aarch64 ; rejoin:);
+        }
+
+        let kind = if expect_truthy {
+            GuardKind::Truthy { register: condition_register }
+        } else {
+            GuardKind::Falsy { register: condition_register }
+        };
+        Ok(Guard {
+            index: guard_index,
+            bailout_ip,
+            kind,
+            fail_count: 0,
+        })
+    }
 }
 
 // ── Function code: branches, native calls, returns ─────────────────────
@@ -511,6 +626,7 @@ impl JitCompiler {
         first_arg: u8,
         arg_count: u8,
         result_type: Option<ValueType>,
+        dead_dest: bool,
     ) -> Result<()> {
         let entry = self
             .function_self
@@ -550,18 +666,37 @@ impl JitCompiler {
             ; b.ne => epilogue
         );
         if let Some(ty) = result_type {
+            let pin = self.active_pin(dest);
             match ty {
                 ValueType::Float => {
                     dynasm!(self.ops ; .arch aarch64 ; fmov d0, x1);
-                    self.store_d0_as_float(dest);
+                    if let Some(pin) = pin {
+                        dynasm!(self.ops ; .arch aarch64 ; fmov D(pin.reg), d0);
+                        self.mark_dirty(dest);
+                    } else if !dead_dest {
+                        self.store_d0_as_float(dest);
+                    }
+                    self.hot_d0 = Some(dest);
                 }
                 ValueType::Int => {
                     dynasm!(self.ops ; .arch aarch64 ; mov x0, x1);
-                    self.store_from_x0(dest, ValueTag::Int.as_u8());
+                    if let Some(pin) = pin {
+                        dynasm!(self.ops ; .arch aarch64 ; mov X(pin.reg), x0);
+                        self.mark_dirty(dest);
+                    } else if !dead_dest {
+                        self.store_from_x0(dest, ValueTag::Int.as_u8());
+                    }
+                    self.hot_x0 = Some(dest);
                 }
                 _ => {
                     dynasm!(self.ops ; .arch aarch64 ; mov x0, x1);
-                    self.store_from_x0(dest, ValueTag::Bool.as_u8());
+                    if let Some(pin) = pin {
+                        dynasm!(self.ops ; .arch aarch64 ; mov X(pin.reg), x0);
+                        self.mark_dirty(dest);
+                    } else if !dead_dest {
+                        self.store_from_x0(dest, ValueTag::Bool.as_u8());
+                    }
+                    self.hot_x0 = Some(dest);
                 }
             }
         }
@@ -589,6 +724,7 @@ impl JitCompiler {
         resume_ip: usize,
         alias_mask: u64,
         result_type: Option<ValueType>,
+        dead_dest: bool,
         guard_index: &mut i32,
         guards: &mut Vec<Guard>,
     ) -> Result<()> {
@@ -601,6 +737,7 @@ impl JitCompiler {
                 first_arg,
                 arg_count,
                 result_type,
+                dead_dest,
             );
         }
         let value_size = mem::size_of::<Value>() as i32;
@@ -665,11 +802,22 @@ impl JitCompiler {
             caller_resume_ip: resume_ip,
         });
         self.emit_mov_imm64(0, site as u64);
-        dynasm!(self.ops
-            ; .arch aarch64
-            ; stp x19, x21, [sp, #-(INLINE_METADATA_SIZE)]!
-            ; str x0, [sp, 16]
-        );
+        let total_alloc = (frame_size + INLINE_METADATA_SIZE) as u32;
+        if total_alloc <= 4095 {
+            dynasm!(self.ops
+                ; .arch aarch64
+                ; sub sp, sp, #total_alloc
+                ; stp x19, x21, [sp, #frame_size as i32]
+                ; str x0, [sp, #(frame_size + 16) as u32]
+            );
+        } else {
+            dynasm!(self.ops
+                ; .arch aarch64
+                ; stp x19, x21, [sp, #-(INLINE_METADATA_SIZE)]!
+                ; str x0, [sp, 16]
+            );
+            self.emit_sub_sp(frame_size);
+        }
 
         // The callee frame: every register Nil (tag 0) — except those the
         // arguments below overwrite whole (a helper-copied argument reads
@@ -681,17 +829,23 @@ impl JitCompiler {
                     Some(ValueType::Int | ValueType::Bool | ValueType::Float)
                 )
         };
-        self.emit_sub_sp(frame_size);
         dynasm!(self.ops ; .arch aarch64 ; mov x11, sp);
-        for reg in 0..callee_registers {
-            if sources
-                .get(usize::from(reg))
-                .is_some_and(|src| copied_whole(self, usize::from(reg), *src))
-            {
-                continue;
+        let callee_may_own = if self.function_self.is_some_and(|(idx, _)| idx == function_idx) {
+            self.function_frame.1
+        } else {
+            true
+        };
+        if callee_may_own {
+            for reg in 0..callee_registers {
+                if sources
+                    .get(usize::from(reg))
+                    .is_some_and(|src| copied_whole(self, usize::from(reg), *src))
+                {
+                    continue;
+                }
+                let offset = super::registers::reg_offset(reg) as u32;
+                dynasm!(self.ops ; .arch aarch64 ; strb wzr, [x11, #offset]);
             }
-            let offset = super::registers::reg_offset(reg) as u32;
-            dynasm!(self.ops ; .arch aarch64 ; strb wzr, [x11, #offset]);
         }
         // x16 (the entry) survives the argument moves unless one calls a
         // helper; then it is reloaded.
@@ -799,20 +953,40 @@ impl JitCompiler {
         dynasm!(self.ops ; .arch aarch64 ; => done);
         if let Some(ty) = result_type {
             // The callee returned its declared scalar result in x1.
+            let pin = self.active_pin(dest);
             match ty {
                 ValueType::Float => {
                     dynasm!(self.ops ; .arch aarch64 ; fmov d0, x1);
-                    self.store_d0_as_float(dest);
+                    if let Some(pin) = pin {
+                        dynasm!(self.ops ; .arch aarch64 ; fmov D(pin.reg), d0);
+                        self.mark_dirty(dest);
+                    } else if !dead_dest {
+                        self.store_d0_as_float(dest);
+                    }
+                    self.hot_d0 = Some(dest);
                 }
                 ValueType::Int => {
                     dynasm!(self.ops ; .arch aarch64 ; mov x0, x1);
-                    self.store_from_x0(dest, ValueTag::Int.as_u8());
+                    if let Some(pin) = pin {
+                        dynasm!(self.ops ; .arch aarch64 ; mov X(pin.reg), x0);
+                        self.mark_dirty(dest);
+                    } else if !dead_dest {
+                        self.store_from_x0(dest, ValueTag::Int.as_u8());
+                    }
+                    self.hot_x0 = Some(dest);
                 }
                 _ => {
                     dynasm!(self.ops ; .arch aarch64 ; mov x0, x1);
-                    self.store_from_x0(dest, ValueTag::Bool.as_u8());
+                    if let Some(pin) = pin {
+                        dynasm!(self.ops ; .arch aarch64 ; mov X(pin.reg), x0);
+                        self.mark_dirty(dest);
+                    } else if !dead_dest {
+                        self.store_from_x0(dest, ValueTag::Bool.as_u8());
+                    }
+                    self.hot_x0 = Some(dest);
                 }
             }
+            self.pending_scalar = Some((dest, ty));
         }
         Ok(())
     }
@@ -896,7 +1070,13 @@ impl JitCompiler {
             if may_own {
                 self.emit_drop_frame(register_count);
             }
-            if still_in_register {
+            if let Some(pin) = self.active_pin(reg) {
+                if ty == ValueType::Float {
+                    dynasm!(self.ops ; .arch aarch64 ; fmov x1, D(pin.reg));
+                } else {
+                    dynasm!(self.ops ; .arch aarch64 ; mov x1, X(pin.reg));
+                }
+            } else if still_in_register {
                 if ty == ValueType::Float {
                     dynasm!(self.ops ; .arch aarch64 ; fmov x1, d0);
                 } else {

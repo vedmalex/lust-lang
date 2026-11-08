@@ -325,8 +325,9 @@ const ARRAY_RUNTIME_SRC: &str = r#"pub fn LustArray(comptime T: type) type {
 
         pub fn pop(self: *@This()) ?T {
             if (self.items.len == 0) return null;
+            const item = self.items[self.items.len - 1];
             self.items.len -= 1;
-            return self.items[self.items.len];
+            return item;
         }
 
         pub fn clear(self: *@This()) void {
@@ -429,6 +430,29 @@ const ARRAY_RUNTIME_SRC: &str = r#"pub fn LustArray(comptime T: type) type {
                 try res.push(item);
             }
             return res;
+        }
+
+        pub fn concat(self: *const @This(), sep: []const u8) ![]const u8 {
+            if (self.items.len == 0) return "";
+            var total_len: usize = 0;
+            const str_list = try self.allocator.alloc([]const u8, self.items.len);
+            defer self.allocator.free(str_list);
+            for (self.items, 0..) |item, idx| {
+                str_list[idx] = try __lust_tostring(item);
+                total_len += str_list[idx].len;
+            }
+            total_len += sep.len * (self.items.len - 1);
+            const buf = try self.allocator.alloc(u8, total_len);
+            var offset: usize = 0;
+            for (str_list, 0..) |s, idx| {
+                if (idx > 0 and sep.len > 0) {
+                    @memcpy(buf[offset..offset + sep.len], sep);
+                    offset += sep.len;
+                }
+                @memcpy(buf[offset..offset + s.len], s);
+                offset += s.len;
+            }
+            return buf;
         }
     };
 }
@@ -612,31 +636,162 @@ pub fn __lust_string_split(s: []const u8, delim: []const u8) !LustArray([]const 
     }
     return res;
 }
-"#;
 
-const POW_RUNTIME_SRC: &str = r#"pub fn __lust_pow(a: anytype, b: anytype) f64 {
-    const fa: f64 = switch (@typeInfo(@TypeOf(a))) {
-        .int, .comptime_int => @as(f64, @floatFromInt(a)),
-        .float, .comptime_float => @as(f64, @floatCast(a)),
-        else => 0.0,
-    };
-    const fb: f64 = switch (@typeInfo(@TypeOf(b))) {
-        .int, .comptime_int => @as(f64, @floatFromInt(b)),
-        .float, .comptime_float => @as(f64, @floatCast(b)),
-        else => 0.0,
-    };
-    return std.math.pow(f64, fa, fb);
+pub fn __lust_string_slice(s: []const u8, start: i64, end: i64) []const u8 {
+    const len_i64: i64 = @as(i64, @intCast(s.len));
+    var st = start;
+    if (st < 0) st = 0;
+    if (st > len_i64) st = len_i64;
+    var ed = end;
+    if (ed < 0) ed = 0;
+    if (ed > len_i64) ed = len_i64;
+    if (st > ed) return "";
+    const u_start: usize = @as(usize, @intCast(st));
+    const u_end: usize = @as(usize, @intCast(ed));
+    return s[u_start..u_end];
+}
+
+pub fn __lust_string_index_of(s: []const u8, needle: []const u8) ?i64 {
+    if (std.mem.indexOf(u8, s, needle)) |idx| {
+        return @as(i64, @intCast(idx));
+    }
+    return null;
 }
 "#;
 
-const MATH_RUNTIME_SRC: &str = r#"pub fn __lust_div(a: anytype, b: anytype) @TypeOf(a) {
-    const T = @TypeOf(a);
-    if (@typeInfo(T) == .int or @typeInfo(T) == .comptime_int) {
-        if (b == 0) return 0;
-        return @divTrunc(a, b);
+const POW_RUNTIME_SRC: &str = r#"fn __lust_pow_return_type(comptime Ta: type, comptime Tb: type) type {
+    const is_int_a = (@typeInfo(Ta) == .int or @typeInfo(Ta) == .comptime_int);
+    const is_int_b = (@typeInfo(Tb) == .int or @typeInfo(Tb) == .comptime_int);
+    return if (is_int_a and is_int_b) i64 else f64;
+}
+
+pub fn __lust_pow(a: anytype, b: anytype) __lust_pow_return_type(@TypeOf(a), @TypeOf(b)) {
+    const Ta = @TypeOf(a);
+    const Tb = @TypeOf(b);
+    const is_int_a = (@typeInfo(Ta) == .int or @typeInfo(Ta) == .comptime_int);
+    const is_int_b = (@typeInfo(Tb) == .int or @typeInfo(Tb) == .comptime_int);
+    if (is_int_a and is_int_b) {
+        const ia: i64 = @as(i64, @intCast(a));
+        const ib: i64 = @as(i64, @intCast(b));
+        if (ib < 0) {
+            @panic("Negative exponent in integer power");
+        }
+        var base: i64 = ia;
+        var exp: u64 = @as(u64, @intCast(ib));
+        var acc: i64 = 1;
+        while (exp > 0) {
+            if ((exp & 1) == 1) {
+                acc *%= base;
+            }
+            base *%= base;
+            exp >>= 1;
+        }
+        return acc;
     } else {
-        return a / b;
+        const fa: f64 = switch (@typeInfo(Ta)) {
+            .int, .comptime_int => @as(f64, @floatFromInt(a)),
+            .float, .comptime_float => @as(f64, @floatCast(a)),
+            else => 0.0,
+        };
+        const fb: f64 = switch (@typeInfo(Tb)) {
+            .int, .comptime_int => @as(f64, @floatFromInt(b)),
+            .float, .comptime_float => @as(f64, @floatCast(b)),
+            else => 0.0,
+        };
+        return std.math.pow(f64, fa, fb);
     }
+}
+"#;
+
+const MATH_RUNTIME_SRC: &str = r#"fn __lust_math_return_type(comptime Ta: type, comptime Tb: type) type {
+    const is_int_a = (@typeInfo(Ta) == .int or @typeInfo(Ta) == .comptime_int);
+    const is_int_b = (@typeInfo(Tb) == .int or @typeInfo(Tb) == .comptime_int);
+    return if (is_int_a and is_int_b) i64 else f64;
+}
+
+pub fn __lust_div(a: anytype, b: anytype) __lust_math_return_type(@TypeOf(a), @TypeOf(b)) {
+    const Ta = @TypeOf(a);
+    const Tb = @TypeOf(b);
+    const is_int_a = (@typeInfo(Ta) == .int or @typeInfo(Ta) == .comptime_int);
+    const is_int_b = (@typeInfo(Tb) == .int or @typeInfo(Tb) == .comptime_int);
+    if (is_int_a and is_int_b) {
+        const ia: i64 = @as(i64, @intCast(a));
+        const ib: i64 = @as(i64, @intCast(b));
+        if (ib == 0) @panic("Division by zero");
+        if (ia == std.math.minInt(i64) and ib == -1) return ia;
+        return @divTrunc(ia, ib);
+    } else {
+        const fa: f64 = switch (@typeInfo(Ta)) {
+            .int, .comptime_int => @as(f64, @floatFromInt(a)),
+            .float, .comptime_float => @as(f64, @floatCast(a)),
+            else => 0.0,
+        };
+        const fb: f64 = switch (@typeInfo(Tb)) {
+            .int, .comptime_int => @as(f64, @floatFromInt(b)),
+            .float, .comptime_float => @as(f64, @floatCast(b)),
+            else => 0.0,
+        };
+        if (fb == 0.0) @panic("Division by zero");
+        return fa / fb;
+    }
+}
+
+pub fn __lust_floordiv(a: anytype, b: anytype) __lust_math_return_type(@TypeOf(a), @TypeOf(b)) {
+    const Ta = @TypeOf(a);
+    const Tb = @TypeOf(b);
+    const is_int_a = (@typeInfo(Ta) == .int or @typeInfo(Ta) == .comptime_int);
+    const is_int_b = (@typeInfo(Tb) == .int or @typeInfo(Tb) == .comptime_int);
+    if (is_int_a and is_int_b) {
+        const ia: i64 = @as(i64, @intCast(a));
+        const ib: i64 = @as(i64, @intCast(b));
+        if (ib == 0) @panic("Division by zero");
+        if (ia == std.math.minInt(i64) and ib == -1) return ia;
+        return @divFloor(ia, ib);
+    } else {
+        const fa: f64 = switch (@typeInfo(Ta)) {
+            .int, .comptime_int => @as(f64, @floatFromInt(a)),
+            .float, .comptime_float => @as(f64, @floatCast(a)),
+            else => 0.0,
+        };
+        const fb: f64 = switch (@typeInfo(Tb)) {
+            .int, .comptime_int => @as(f64, @floatFromInt(b)),
+            .float, .comptime_float => @as(f64, @floatCast(b)),
+            else => 0.0,
+        };
+        if (fb == 0.0) @panic("Division by zero");
+        return @floor(fa / fb);
+    }
+}
+
+pub fn __lust_mod(a: anytype, b: anytype) __lust_math_return_type(@TypeOf(a), @TypeOf(b)) {
+    const Ta = @TypeOf(a);
+    const Tb = @TypeOf(b);
+    const is_int_a = (@typeInfo(Ta) == .int or @typeInfo(Ta) == .comptime_int);
+    const is_int_b = (@typeInfo(Tb) == .int or @typeInfo(Tb) == .comptime_int);
+    if (is_int_a and is_int_b) {
+        const ia: i64 = @as(i64, @intCast(a));
+        const ib: i64 = @as(i64, @intCast(b));
+        if (ib == 0) @panic("Modulo by zero");
+        if (ia == std.math.minInt(i64) and ib == -1) return 0;
+        return @rem(ia, ib);
+    } else {
+        const fa: f64 = switch (@typeInfo(Ta)) {
+            .int, .comptime_int => @as(f64, @floatFromInt(a)),
+            .float, .comptime_float => @as(f64, @floatCast(a)),
+            else => 0.0,
+        };
+        const fb: f64 = switch (@typeInfo(Tb)) {
+            .int, .comptime_int => @as(f64, @floatFromInt(b)),
+            .float, .comptime_float => @as(f64, @floatCast(b)),
+            else => 0.0,
+        };
+        if (fb == 0.0) @panic("Modulo by zero");
+        return @rem(fa, fb);
+    }
+}
+
+pub fn __lust_math_mod(a: anytype, b: anytype) @TypeOf(a) {
+    return __lust_mod(a, b);
 }
 
 pub fn __lust_math_abs(x: anytype) @TypeOf(x) {

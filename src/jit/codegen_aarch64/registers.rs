@@ -242,7 +242,7 @@ impl JitCompiler {
     /// Publish the pin's tag the first time this slot is written. Later
     /// carried writes leave the tag alone. A slot the environment already
     /// knows to hold the pin's type is already tagged.
-    fn ensure_pin_tag(&mut self, vm_reg: u8, pin: pins::Pin) {
+    pub(super) fn ensure_pin_tag(&mut self, vm_reg: u8, pin: pins::Pin) {
         let bit = 1u64 << vm_reg;
         if self.pin_tag_ready & bit != 0 {
             return;
@@ -498,6 +498,25 @@ impl JitCompiler {
         dynasm!(self.ops ; .arch aarch64 ; ldr X(x), [x19, #offset]);
     }
 
+    /// Reload the value from VM memory into pin if vm_reg is pinned.
+    pub(super) fn reload_pin_from_memory(&mut self, vm_reg: u8) {
+        if let Some(pin) = self.pin_for_write(vm_reg) {
+            let offset = self.payload_disp(vm_reg);
+            self.emit_add_imm(10, 19, offset);
+            match pin.ty {
+                ValueType::Float => {
+                    dynasm!(self.ops ; .arch aarch64 ; ldr D(pin.reg), [x10]);
+                }
+                ValueType::Bool => {
+                    dynasm!(self.ops ; .arch aarch64 ; ldrb W(pin.reg), [x10]);
+                }
+                _ => {
+                    dynasm!(self.ops ; .arch aarch64 ; ldr X(pin.reg), [x10]);
+                }
+            }
+        }
+    }
+
     /// registers[vm_reg].payload = X(x)
     pub(super) fn store_payload(&mut self, vm_reg: u8, x: u8) {
         if self.scalar_regfile {
@@ -559,6 +578,7 @@ impl JitCompiler {
         self.hot_x0_in = None;
         self.hot_d0_in = None;
         self.cached_select_imms = None;
+        self.cached_specialized_vec = None;
         self.emit_mov_imm64(16, function as usize as u64);
         dynasm!(self.ops ; .arch aarch64 ; blr x16);
     }

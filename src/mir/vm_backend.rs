@@ -4,6 +4,12 @@ use crate::number::{LustFloat, LustInt};
 use alloc::vec::Vec;
 use hashbrown::HashMap;
 
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum MirVmBackendError {
+    #[error("Binary operator '{0:?}' is not supported by MIR VM backend")]
+    UnsupportedBinaryOp(MirBinaryOp),
+}
+
 pub struct MirToBytecodeCompiler<'a> {
     func: &'a MirFunction,
     chunk: Chunk,
@@ -15,7 +21,7 @@ pub struct MirToBytecodeCompiler<'a> {
 }
 
 impl<'a> MirToBytecodeCompiler<'a> {
-    pub fn compile(func: &'a MirFunction) -> Function {
+    pub fn compile(func: &'a MirFunction) -> Result<Function, MirVmBackendError> {
         let param_count = func.params.len() as u8;
         let mut bytecode_fn = Function::new(func.signature.name.clone(), param_count, false);
 
@@ -29,12 +35,12 @@ impl<'a> MirToBytecodeCompiler<'a> {
             pending_jumps: Vec::new(),
         };
 
-        compiler.compile_blocks();
+        compiler.compile_blocks()?;
         compiler.patch_all_jumps();
 
         bytecode_fn.chunk = compiler.chunk;
         bytecode_fn.register_count = (func.locals.len() + compiler.max_scratch) as u8;
-        bytecode_fn
+        Ok(bytecode_fn)
     }
 
     fn next_scratch(&mut self) -> Register {
@@ -50,14 +56,14 @@ impl<'a> MirToBytecodeCompiler<'a> {
         self.scratch_count = 0;
     }
 
-    fn compile_blocks(&mut self) {
+    fn compile_blocks(&mut self) -> Result<(), MirVmBackendError> {
         for block in &self.func.blocks {
             let pc = self.chunk.instructions.len();
             self.block_pcs.insert(block.id, pc);
 
             for stmt in &block.statements {
                 self.reset_scratch();
-                self.compile_statement(stmt);
+                self.compile_statement(stmt)?;
             }
 
             self.reset_scratch();
@@ -65,17 +71,32 @@ impl<'a> MirToBytecodeCompiler<'a> {
                 self.compile_terminator(term);
             }
         }
+        Ok(())
     }
 
     fn operand_to_reg(&mut self, op: &Operand, line: usize) -> Register {
         match op {
             Operand::Copy(Place::Local(loc)) | Operand::Move(Place::Local(loc)) => loc.0 as Register,
+            Operand::Copy(Place::Index(base, idx)) | Operand::Move(Place::Index(base, idx)) => {
+                let reg = self.next_scratch();
+                let base_reg = self.place_to_reg(base);
+                let idx_reg = idx.0 as Register;
+                self.chunk.emit(Instruction::GetIndex(reg, base_reg, idx_reg), line);
+                reg
+            }
+            Operand::Copy(Place::Field(base, f)) | Operand::Move(Place::Field(base, f)) => {
+                let reg = self.next_scratch();
+                let base_reg = self.place_to_reg(base);
+                let idx_reg = self.next_scratch();
+                self.load_constant_into_reg(&MirConstant::Int(*f as i64), idx_reg, line);
+                self.chunk.emit(Instruction::GetIndex(reg, base_reg, idx_reg), line);
+                reg
+            }
             Operand::Constant(c) => {
                 let reg = self.next_scratch();
                 self.load_constant_into_reg(c, reg, line);
                 reg
             }
-            _ => 0,
         }
     }
 
@@ -110,96 +131,152 @@ impl<'a> MirToBytecodeCompiler<'a> {
         }
     }
 
-    fn compile_statement(&mut self, stmt: &Statement) {
-        match stmt {
-            Statement::Assign(Place::Local(dst), rvalue, span) => {
-                let dst_reg = dst.0 as Register;
-                let line = span.start_line;
-                match rvalue {
-                    Rvalue::Use(op) => {
-                        match op {
-                            Operand::Copy(Place::Local(src)) | Operand::Move(Place::Local(src)) => {
-                                if dst_reg != src.0 as Register {
-                                    self.chunk.emit(Instruction::Move(dst_reg, src.0 as Register), line);
-                                }
+    fn compile_rvalue(&mut self, rvalue: &Rvalue, dst_reg: Register, line: usize) -> Result<(), MirVmBackendError> {
+        match rvalue {
+            Rvalue::Use(op) => {
+                match op {
+                    Operand::Copy(Place::Local(src)) | Operand::Move(Place::Local(src)) => {
+                        if dst_reg != src.0 as Register {
+                            self.chunk.emit(Instruction::Move(dst_reg, src.0 as Register), line);
+                        }
+                    }
+                    Operand::Copy(Place::Index(base, idx)) | Operand::Move(Place::Index(base, idx)) => {
+                        let base_reg = self.place_to_reg(base);
+                        let idx_reg = idx.0 as Register;
+                        self.chunk.emit(Instruction::GetIndex(dst_reg, base_reg, idx_reg), line);
+                    }
+                    Operand::Copy(Place::Field(base, f)) | Operand::Move(Place::Field(base, f)) => {
+                        let base_reg = self.place_to_reg(base);
+                        let idx_reg = self.next_scratch();
+                        self.load_constant_into_reg(&MirConstant::Int(*f as i64), idx_reg, line);
+                        self.chunk.emit(Instruction::GetIndex(dst_reg, base_reg, idx_reg), line);
+                    }
+                    Operand::Constant(c) => {
+                        self.load_constant_into_reg(c, dst_reg, line);
+                    }
+                }
+            }
+            Rvalue::BinaryOp(binop, lhs, rhs) => {
+                let r_lhs = self.operand_to_reg(lhs, line);
+                let r_rhs = self.operand_to_reg(rhs, line);
+                self.compile_binop(*binop, dst_reg, r_lhs, r_rhs, line)?;
+            }
+            Rvalue::UnaryOp(unop, op) => {
+                let r_op = self.operand_to_reg(op, line);
+                match unop {
+                    MirUnaryOp::Neg => {
+                        self.chunk.emit(Instruction::NegInt(dst_reg, r_op), line);
+                    }
+                    MirUnaryOp::Not => {
+                        self.chunk.emit(Instruction::Not(dst_reg, r_op), line);
+                    }
+                    MirUnaryOp::BitNot => {
+                        self.chunk.emit(Instruction::BitNot(dst_reg, r_op), line);
+                    }
+                    MirUnaryOp::Len => {
+                        self.chunk.emit(Instruction::ArrayLen(dst_reg, r_op), line);
+                    }
+                }
+            }
+            Rvalue::Aggregate(MirType::Array(_) | MirType::Tuple(_) | MirType::Struct(_), elements) => {
+                let count = elements.len() as u8;
+                if count == 0 {
+                    self.chunk.emit(Instruction::NewArray(dst_reg, 0, 0), line);
+                } else {
+                    let scratch_base = (self.scratch_start + self.scratch_count) as Register;
+                    self.scratch_count += elements.len();
+                    if self.scratch_count > self.max_scratch {
+                        self.max_scratch = self.scratch_count;
+                    }
+                    for (i, elem) in elements.iter().enumerate() {
+                        let target_reg = scratch_base + i as u8;
+                        match elem {
+                            Operand::Copy(Place::Local(loc)) | Operand::Move(Place::Local(loc)) => {
+                                self.chunk.emit(Instruction::Move(target_reg, loc.0 as Register), line);
                             }
                             Operand::Copy(Place::Index(base, idx)) | Operand::Move(Place::Index(base, idx)) => {
                                 let base_reg = self.place_to_reg(base);
                                 let idx_reg = idx.0 as Register;
-                                self.chunk.emit(Instruction::GetIndex(dst_reg, base_reg, idx_reg), line);
+                                self.chunk.emit(Instruction::GetIndex(target_reg, base_reg, idx_reg), line);
+                            }
+                            Operand::Copy(Place::Field(base, f)) | Operand::Move(Place::Field(base, f)) => {
+                                let base_reg = self.place_to_reg(base);
+                                let idx_reg = self.next_scratch();
+                                self.load_constant_into_reg(&MirConstant::Int(*f as i64), idx_reg, line);
+                                self.chunk.emit(Instruction::GetIndex(target_reg, base_reg, idx_reg), line);
                             }
                             Operand::Constant(c) => {
-                                self.load_constant_into_reg(c, dst_reg, line);
-                            }
-                            _ => {}
-                        }
-                    }
-                    Rvalue::BinaryOp(binop, lhs, rhs) => {
-                        let r_lhs = self.operand_to_reg(lhs, line);
-                        let r_rhs = self.operand_to_reg(rhs, line);
-                        self.compile_binop(*binop, dst_reg, r_lhs, r_rhs, line);
-                    }
-                    Rvalue::UnaryOp(unop, op) => {
-                        let r_op = self.operand_to_reg(op, line);
-                        match unop {
-                            MirUnaryOp::Neg => {
-                                self.chunk.emit(Instruction::NegInt(dst_reg, r_op), line);
-                            }
-                            MirUnaryOp::Not => {
-                                self.chunk.emit(Instruction::Not(dst_reg, r_op), line);
-                            }
-                            MirUnaryOp::Len => {
-                                self.chunk.emit(Instruction::ArrayLen(dst_reg, r_op), line);
+                                self.load_constant_into_reg(c, target_reg, line);
                             }
                         }
                     }
-                    Rvalue::Aggregate(MirType::Array(_), elements) => {
-                        let count = elements.len() as u8;
-                        if count == 0 {
-                            self.chunk.emit(Instruction::NewArray(dst_reg, 0, 0), line);
-                        } else {
-                            let scratch_base = (self.scratch_start + self.scratch_count) as Register;
-                            self.scratch_count += elements.len();
-                            for (i, elem) in elements.iter().enumerate() {
-                                let target_reg = scratch_base + i as u8;
-                                match elem {
-                                    Operand::Copy(Place::Local(loc)) | Operand::Move(Place::Local(loc)) => {
-                                        self.chunk.emit(Instruction::Move(target_reg, loc.0 as Register), line);
-                                    }
-                                    Operand::Constant(c) => {
-                                        self.load_constant_into_reg(c, target_reg, line);
-                                    }
-                                    _ => {}
-                                }
-                            }
-                            self.chunk.emit(Instruction::NewArray(dst_reg, scratch_base, count), line);
-                        }
-                    }
-                    _ => {}
+                    self.chunk.emit(Instruction::NewArray(dst_reg, scratch_base, count), line);
                 }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    fn compile_statement(&mut self, stmt: &Statement) -> Result<(), MirVmBackendError> {
+        match stmt {
+            Statement::Assign(Place::Local(dst), rvalue, span) => {
+                let dst_reg = dst.0 as Register;
+                let line = span.start_line;
+                self.compile_rvalue(rvalue, dst_reg, line)?;
             }
             Statement::Assign(Place::Index(base, idx), rvalue, span) => {
                 let line = span.start_line;
                 let val_reg = match rvalue {
-                    Rvalue::Use(op) => self.operand_to_reg(op, line),
-                    _ => 0,
+                    Rvalue::Use(Operand::Copy(Place::Local(src)) | Operand::Move(Place::Local(src))) => {
+                        src.0 as Register
+                    }
+                    _ => {
+                        let temp_reg = self.next_scratch();
+                        self.compile_rvalue(rvalue, temp_reg, line)?;
+                        temp_reg
+                    }
                 };
                 let base_reg = self.place_to_reg(base);
                 let idx_reg = idx.0 as Register;
                 self.chunk.emit(Instruction::SetIndex(base_reg, idx_reg, val_reg), line);
             }
+            Statement::Assign(Place::Field(base, f), rvalue, span) => {
+                let line = span.start_line;
+                let val_reg = match rvalue {
+                    Rvalue::Use(Operand::Copy(Place::Local(src)) | Operand::Move(Place::Local(src))) => {
+                        src.0 as Register
+                    }
+                    _ => {
+                        let temp_reg = self.next_scratch();
+                        self.compile_rvalue(rvalue, temp_reg, line)?;
+                        temp_reg
+                    }
+                };
+                let base_reg = self.place_to_reg(base);
+                let idx_reg = self.next_scratch();
+                self.load_constant_into_reg(&MirConstant::Int(*f as i64), idx_reg, line);
+                self.chunk.emit(Instruction::SetIndex(base_reg, idx_reg, val_reg), line);
+            }
             Statement::StorageLive(_, _) | Statement::StorageDead(_, _) | Statement::ResourceCheck(_, _, _) => {}
-            _ => {}
         }
+        Ok(())
     }
 
-    fn compile_binop(&mut self, op: MirBinaryOp, dst: Register, lhs: Register, rhs: Register, line: usize) {
+    fn compile_binop(&mut self, op: MirBinaryOp, dst: Register, lhs: Register, rhs: Register, line: usize) -> Result<(), MirVmBackendError> {
         let instr = match op {
             MirBinaryOp::Add => Instruction::AddInt(dst, lhs, rhs),
             MirBinaryOp::Sub => Instruction::SubInt(dst, lhs, rhs),
             MirBinaryOp::Mul => Instruction::MulInt(dst, lhs, rhs),
             MirBinaryOp::Div => Instruction::DivInt(dst, lhs, rhs),
             MirBinaryOp::Mod => Instruction::ModInt(dst, lhs, rhs),
+            MirBinaryOp::FloorDiv => Instruction::FloorDivInt(dst, lhs, rhs),
+            MirBinaryOp::Pow => Instruction::PowInt(dst, lhs, rhs),
+            MirBinaryOp::BitAnd => Instruction::BitAnd(dst, lhs, rhs),
+            MirBinaryOp::BitOr => Instruction::BitOr(dst, lhs, rhs),
+            MirBinaryOp::BitXor => Instruction::BitXor(dst, lhs, rhs),
+            MirBinaryOp::Shl => Instruction::Shl(dst, lhs, rhs),
+            MirBinaryOp::Shr => Instruction::Shr(dst, lhs, rhs),
             MirBinaryOp::Eq => Instruction::EqInt(dst, lhs, rhs),
             MirBinaryOp::NotEq => Instruction::NeInt(dst, lhs, rhs),
             MirBinaryOp::Lt => Instruction::LtInt(dst, lhs, rhs),
@@ -208,9 +285,9 @@ impl<'a> MirToBytecodeCompiler<'a> {
             MirBinaryOp::GtEq => Instruction::GeInt(dst, lhs, rhs),
             MirBinaryOp::And => Instruction::And(dst, lhs, rhs),
             MirBinaryOp::Or => Instruction::Or(dst, lhs, rhs),
-            _ => Instruction::AddInt(dst, lhs, rhs),
         };
         self.chunk.emit(instr, line);
+        Ok(())
     }
 
     fn compile_terminator(&mut self, term: &Terminator) {
@@ -226,6 +303,23 @@ impl<'a> MirToBytecodeCompiler<'a> {
 
                 let jump_then = self.chunk.emit(Instruction::Jump(0), span.start_line);
                 self.pending_jumps.push((jump_then, *then_block));
+            }
+            Terminator::Switch { discr, cases, default, span } => {
+                let line = span.start_line;
+                let discr_reg = self.operand_to_reg(discr, line);
+                for (val, target_bb) in cases {
+                    let val_reg = self.next_scratch();
+                    self.load_constant_into_reg(&MirConstant::Int(*val), val_reg, line);
+                    let cmp_reg = self.next_scratch();
+                    self.chunk.emit(Instruction::EqInt(cmp_reg, discr_reg, val_reg), line);
+                    let jump_next_case = self.chunk.emit(Instruction::JumpIfNot(cmp_reg, 0), line);
+                    let jump_target = self.chunk.emit(Instruction::Jump(0), line);
+                    self.pending_jumps.push((jump_target, *target_bb));
+                    let next_pc = self.chunk.instructions.len();
+                    self.chunk.patch_jump(jump_next_case, next_pc);
+                }
+                let default_jump = self.chunk.emit(Instruction::Jump(0), line);
+                self.pending_jumps.push((default_jump, *default));
             }
             Terminator::Return(opt_op, span) => {
                 let r_ret = if let Some(op) = opt_op {
@@ -254,10 +348,15 @@ impl<'a> MirToBytecodeCompiler<'a> {
                                 let idx_reg = idx.0 as Register;
                                 self.chunk.emit(Instruction::GetIndex(target_reg, base_reg, idx_reg), line);
                             }
+                            Operand::Copy(Place::Field(base, f)) | Operand::Move(Place::Field(base, f)) => {
+                                let base_reg = self.place_to_reg(base);
+                                let idx_reg = self.next_scratch();
+                                self.load_constant_into_reg(&MirConstant::Int(*f as i64), idx_reg, line);
+                                self.chunk.emit(Instruction::GetIndex(target_reg, base_reg, idx_reg), line);
+                            }
                             Operand::Constant(c) => {
                                 self.load_constant_into_reg(c, target_reg, line);
                             }
-                            _ => {}
                         }
                     }
                     scratch_base

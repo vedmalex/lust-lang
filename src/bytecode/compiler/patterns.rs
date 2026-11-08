@@ -1,5 +1,68 @@
 use super::*;
 impl Compiler {
+    pub(super) fn try_unwrap_checked_array_pattern<'a>(
+        &self,
+        condition: &'a Expr,
+    ) -> Option<(&'a Expr, &'a Expr, Option<String>)> {
+        let (expr, pattern) = Self::direct_is_pattern(condition)?;
+        let mut index_expr = expr;
+        while let ExprKind::Paren(inner) = &index_expr.kind {
+            index_expr = inner;
+        }
+        if !self.is_checked_array_index(index_expr.span) {
+            return None;
+        }
+        let ExprKind::Index { object, index } = &index_expr.kind else {
+            return None;
+        };
+        let crate::ast::Pattern::Enum {
+            enum_name,
+            variant,
+            bindings,
+        } = pattern
+        else {
+            return None;
+        };
+        let is_ok_variant = (enum_name.is_empty() || enum_name == "Result" || enum_name == "Option")
+            && (variant == "Ok" || variant == "Some");
+        if !is_ok_variant {
+            return None;
+        }
+        let binding_name = if bindings.is_empty() {
+            None
+        } else if bindings.len() == 1 {
+            match &bindings[0] {
+                crate::ast::Pattern::Identifier(name) => Some(name.clone()),
+                crate::ast::Pattern::Wildcard => None,
+                _ => return None,
+            }
+        } else {
+            return None;
+        };
+        Some((object.as_ref(), index.as_ref(), binding_name))
+    }
+
+    pub(super) fn bind_local_variable(&mut self, name: &str) -> Register {
+        let mut max_local_reg: i32 = -1;
+        for sc in &self.scopes {
+            for &(reg, _) in sc.locals.values() {
+                if (reg as i32) > max_local_reg {
+                    max_local_reg = reg as i32;
+                }
+            }
+        }
+        let value_reg: Register =
+            ((max_local_reg + 1).max(i32::from(self.next_register))) as u8;
+        self.next_register = value_reg + 1;
+        if value_reg > self.max_register {
+            self.max_register = value_reg;
+        }
+        if let Some(scope) = self.scopes.last_mut() {
+            scope.locals.insert(name.to_string(), (value_reg, false));
+        }
+        value_reg
+    }
+
     pub(super) fn direct_is_pattern(expr: &Expr) -> Option<(&Expr, &crate::ast::Pattern)> {
         match &expr.kind {
             ExprKind::IsPattern { expr, pattern } => Some((expr, pattern)),

@@ -134,6 +134,7 @@ pub enum BinaryOp {
     Mul,
     Div,
     Mod,
+    FloorDiv,
     Pow,
     Eq,
     Ne,
@@ -143,6 +144,11 @@ pub enum BinaryOp {
     Ge,
     And,
     Or,
+    BitAnd,
+    BitOr,
+    BitXor,
+    Shl,
+    Shr,
     Concat,
     Range,
 }
@@ -151,6 +157,7 @@ pub enum BinaryOp {
 pub enum UnaryOp {
     Neg,
     Not,
+    BitNot,
 }
 
 impl fmt::Display for BinaryOp {
@@ -161,6 +168,7 @@ impl fmt::Display for BinaryOp {
             BinaryOp::Mul => "*",
             BinaryOp::Div => "/",
             BinaryOp::Mod => "%",
+            BinaryOp::FloorDiv => "//",
             BinaryOp::Pow => "^",
             BinaryOp::Eq => "==",
             BinaryOp::Ne => "!=",
@@ -170,6 +178,11 @@ impl fmt::Display for BinaryOp {
             BinaryOp::Ge => ">=",
             BinaryOp::And => "and",
             BinaryOp::Or => "or",
+            BinaryOp::BitAnd => "&",
+            BinaryOp::BitOr => "|",
+            BinaryOp::BitXor => "^^",
+            BinaryOp::Shl => "<<",
+            BinaryOp::Shr => ">>",
             BinaryOp::Concat => "..",
             BinaryOp::Range => "..",
         };
@@ -182,6 +195,7 @@ impl fmt::Display for UnaryOp {
         match self {
             UnaryOp::Neg => write!(f, "-"),
             UnaryOp::Not => write!(f, "not"),
+            UnaryOp::BitNot => write!(f, "~"),
         }
     }
 }

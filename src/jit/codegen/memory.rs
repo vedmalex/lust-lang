@@ -1232,6 +1232,44 @@ impl JitCompiler {
         Ok(())
     }
 
+    pub(super) fn compile_store_global(&mut self, name: &str, src: u8) -> Result<()> {
+        let src_offset = (src as i32) * (mem::size_of::<Value>() as i32);
+        unsafe extern "C" {
+            fn jit_set_global_safe(
+                vm_ptr: *mut crate::VM,
+                name_ptr: *const u8,
+                name_len: usize,
+                value_ptr: *const Value,
+            ) -> u8;
+            fn jit_current_registers(vm_ptr: *mut crate::VM) -> *mut Value;
+        }
+
+        let (name_ptr, name_len) = self.retain_string(name);
+        dynasm!(self.ops
+            ; .arch x64
+            ; mov rdi, r13
+            ; mov rsi, QWORD name_ptr as usize as _
+            ; mov rdx, QWORD name_len as _
+            ; lea rcx, [r12 + src_offset]
+            ; mov rax, QWORD jit_set_global_safe as usize as _
+            ; call rax
+            ; test al, al
+            ; jz >fail
+        );
+        if self.inline_depth == 0 && !self.function_mode {
+            dynasm!(self.ops
+                ; .arch x64
+                ; mov rdi, r13
+                ; mov rax, QWORD jit_current_registers as *const () as _
+                ; call rax
+                ; test rax, rax
+                ; jz >fail
+                ; mov r12, rax
+            );
+        }
+        Ok(())
+    }
+
     pub(super) fn compile_new_enum_unit(
         &mut self,
         dest: u8,
@@ -1485,6 +1523,68 @@ impl JitCompiler {
             dynasm!(self.ops
                 ; .arch x64
                 ; mov rax, [r10 + element + word]
+                ; mov [r12 + dest_offset + word], rax
+            );
+        }
+        Ok(())
+    }
+
+    pub(super) fn compile_borrow_field_some(
+        &mut self,
+        dest: u8,
+        object: u8,
+        index: usize,
+        label: usize,
+    ) -> Result<()> {
+        let Some(layout) = jit::layout::rc_vec_layout() else {
+            return Err(crate::LustError::RuntimeError {
+                message: "a borrow needs the measured struct layout".into(),
+            });
+        };
+        let Some(enum_layout) = jit::layout::enum_layout() else {
+            return Err(crate::LustError::RuntimeError {
+                message: "a borrow needs the measured enum layout".into(),
+            });
+        };
+        let value_size = mem::size_of::<Value>() as i32;
+        let object_offset = (object as i32) * value_size;
+        let dest_offset = (dest as i32) * value_size;
+        let struct_tag = ValueTag::Struct.as_u8() as i8;
+        let fields_offset = layout.struct_fields_offset as i32;
+        let ptr_offset = layout.struct_ptr_offset as i32;
+        let field_element = (index * mem::size_of::<Value>()) as i32;
+
+        let enum_tag = enum_layout.tag as i8;
+        let enum_object_offset = enum_layout.object_offset as i32;
+        let variant_offset = enum_layout.variant_offset as i32;
+        let enum_name_offset = enum_layout.enum_name_offset as i32;
+        let values_ptr_offset = enum_layout.values_ptr_offset as i32;
+        let variant_ptr = self.retain_name("Some");
+        let enum_ptr = self.retain_name("Option");
+        let target = self.function_label(label);
+
+        dynasm!(self.ops
+            ; .arch x64
+            ; cmp BYTE [r12 + object_offset], struct_tag
+            ; jne => target
+            ; mov r9, [r12 + object_offset + fields_offset]
+            ; mov r10, [r9 + ptr_offset]
+            ; lea r11, [r10 + field_element]
+            ; cmp BYTE [r11], enum_tag
+            ; jne => target
+            ; mov r9, [r11 + enum_object_offset]
+            ; mov rax, QWORD variant_ptr as i64
+            ; cmp [r9 + variant_offset], rax
+            ; jne => target
+            ; mov rax, QWORD enum_ptr as i64
+            ; cmp [r9 + enum_name_offset], rax
+            ; jne => target
+            ; mov r10, [r9 + values_ptr_offset]
+        );
+        for word in (0..value_size).step_by(8) {
+            dynasm!(self.ops
+                ; .arch x64
+                ; mov rax, [r10 + word]
                 ; mov [r12 + dest_offset + word], rax
             );
         }

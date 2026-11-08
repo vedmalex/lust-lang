@@ -110,19 +110,90 @@ impl Compiler {
             }
 
             StmtKind::CompoundAssign { target, op, value } => {
-                let (target_reg, target_is_local, target_name) = match &target.kind {
+                match &target.kind {
                     ExprKind::Identifier(name) => {
-                        if let Ok(local_reg) = self.resolve_local(name) {
-                            (local_reg, true, name.clone())
-                        } else if self.is_module_level_identifier(name) {
-                            let reg = self.allocate_register();
-                            self.emit_load_module_global(name, reg)?;
-                            (reg, false, name.clone())
+                        let (target_reg, target_is_local, target_name) =
+                            if let Ok(local_reg) = self.resolve_local(name) {
+                                (local_reg, true, name.clone())
+                            } else if self.is_module_level_identifier(name) {
+                                let reg = self.allocate_register();
+                                self.emit_load_module_global(name, reg)?;
+                                (reg, false, name.clone())
+                            } else {
+                                return Err(LustError::CompileError(
+                                    "Invalid compound assignment target".to_string(),
+                                ));
+                            };
+                        let value_reg = self.compile_expr(value)?;
+                        let result_reg = self.allocate_register();
+                        let expression_start = self.current_chunk().instructions.len();
+                        self.compile_binary_op(
+                            *op,
+                            result_reg,
+                            target_reg,
+                            value_reg,
+                            (target.span, value.span),
+                        )?;
+                        if target_is_local {
+                            if result_reg != target_reg {
+                                self.move_result(target_reg, result_reg, expression_start);
+                                self.free_register(result_reg);
+                            }
+
+                            if self.should_sync_module_local(&target_name) {
+                                self.emit_store_module_global(&target_name, target_reg);
+                            }
+
+                            self.free_register(value_reg);
                         } else {
-                            return Err(LustError::CompileError(
-                                "Invalid compound assignment target".to_string(),
-                            ));
+                            self.emit_store_module_global(&target_name, result_reg);
+                            self.free_register(result_reg);
+                            self.free_register(value_reg);
+                            self.free_register(target_reg);
                         }
+                    }
+
+                    ExprKind::FieldAccess { object, field } => {
+                        let obj_reg = self.compile_expr(object)?;
+                        let field_idx = self.add_string_constant(field);
+                        let cur_reg = self.allocate_register();
+                        self.emit(Instruction::GetField(cur_reg, obj_reg, field_idx), 0);
+                        let val_reg = self.compile_expr(value)?;
+                        let res_reg = self.allocate_register();
+                        self.compile_binary_op(
+                            *op,
+                            res_reg,
+                            cur_reg,
+                            val_reg,
+                            (target.span, value.span),
+                        )?;
+                        self.emit(Instruction::SetField(obj_reg, field_idx, res_reg), 0);
+                        self.free_register(res_reg);
+                        self.free_register(val_reg);
+                        self.free_register(cur_reg);
+                        self.free_register(obj_reg);
+                    }
+
+                    ExprKind::Index { object, index } => {
+                        let obj_reg = self.compile_expr(object)?;
+                        let idx_reg = self.compile_expr(index)?;
+                        let cur_reg = self.allocate_register();
+                        self.emit(Instruction::GetIndex(cur_reg, obj_reg, idx_reg), 0);
+                        let val_reg = self.compile_expr(value)?;
+                        let res_reg = self.allocate_register();
+                        self.compile_binary_op(
+                            *op,
+                            res_reg,
+                            cur_reg,
+                            val_reg,
+                            (target.span, value.span),
+                        )?;
+                        self.emit(Instruction::SetIndex(obj_reg, idx_reg, res_reg), 0);
+                        self.free_register(res_reg);
+                        self.free_register(val_reg);
+                        self.free_register(cur_reg);
+                        self.free_register(idx_reg);
+                        self.free_register(obj_reg);
                     }
 
                     _ => {
@@ -130,33 +201,6 @@ impl Compiler {
                             "Invalid compound assignment target".to_string(),
                         ));
                     }
-                };
-                let value_reg = self.compile_expr(value)?;
-                let result_reg = self.allocate_register();
-                let expression_start = self.current_chunk().instructions.len();
-                self.compile_binary_op(
-                    *op,
-                    result_reg,
-                    target_reg,
-                    value_reg,
-                    (target.span, value.span),
-                )?;
-                if target_is_local {
-                    if result_reg != target_reg {
-                        self.move_result(target_reg, result_reg, expression_start);
-                        self.free_register(result_reg);
-                    }
-
-                    if self.should_sync_module_local(&target_name) {
-                        self.emit_store_module_global(&target_name, target_reg);
-                    }
-
-                    self.free_register(value_reg);
-                } else {
-                    self.emit_store_module_global(&target_name, result_reg);
-                    self.free_register(result_reg);
-                    self.free_register(value_reg);
-                    self.free_register(target_reg);
                 }
             }
 
@@ -266,7 +310,28 @@ impl Compiler {
     ) -> Result<()> {
         self.begin_scope();
         let mut tested_scrutinee = None;
-        let cond_reg = if let Some((expr, pattern)) = Self::direct_is_pattern(condition) {
+        let cond_reg = if let Some((obj_expr, idx_expr, binding_name)) =
+            self.try_unwrap_checked_array_pattern(condition)
+        {
+            let obj_reg = self.compile_expr(obj_expr)?;
+            let idx_reg = self.compile_expr(idx_expr)?;
+            let val_reg = if let Some(name) = &binding_name {
+                self.bind_local_variable(name)
+            } else {
+                self.allocate_register()
+            };
+            let cond_reg = self.allocate_register();
+            self.emit(
+                Instruction::ArrayIndexOk(val_reg, cond_reg, obj_reg, idx_reg),
+                0,
+            );
+            self.free_register(obj_reg);
+            self.free_register(idx_reg);
+            if binding_name.is_none() {
+                self.free_register(val_reg);
+            }
+            cond_reg
+        } else if let Some((expr, pattern)) = Self::direct_is_pattern(condition) {
             if self.extract_all_pattern_bindings(condition).is_empty() {
                 self.compile_expr(condition)?
             } else {
@@ -296,23 +361,43 @@ impl Compiler {
         self.current_chunk_mut()
             .patch_jump(jump_to_else, next_branch_start);
         for (elseif_cond, elseif_body) in elseif_branches {
+            self.begin_scope();
             let mut tested_scrutinee = None;
-            let elseif_cond_reg =
-                if let Some((expr, pattern)) = Self::direct_is_pattern(elseif_cond) {
-                    if self.extract_all_pattern_bindings(elseif_cond).is_empty() {
-                        self.compile_expr(elseif_cond)?
-                    } else {
-                        let scrutinee_reg = self.compile_expr(expr)?;
-                        let result_reg = self.compile_is_pattern(scrutinee_reg, pattern)?;
-                        tested_scrutinee = Some((scrutinee_reg, pattern));
-                        result_reg
-                    }
+            let elseif_cond_reg = if let Some((obj_expr, idx_expr, binding_name)) =
+                self.try_unwrap_checked_array_pattern(elseif_cond)
+            {
+                let obj_reg = self.compile_expr(obj_expr)?;
+                let idx_reg = self.compile_expr(idx_expr)?;
+                let val_reg = if let Some(name) = &binding_name {
+                    self.bind_local_variable(name)
                 } else {
-                    self.compile_expr(elseif_cond)?
+                    self.allocate_register()
                 };
+                let cond_reg = self.allocate_register();
+                self.emit(
+                    Instruction::ArrayIndexOk(val_reg, cond_reg, obj_reg, idx_reg),
+                    0,
+                );
+                self.free_register(obj_reg);
+                self.free_register(idx_reg);
+                if binding_name.is_none() {
+                    self.free_register(val_reg);
+                }
+                cond_reg
+            } else if let Some((expr, pattern)) = Self::direct_is_pattern(elseif_cond) {
+                if self.extract_all_pattern_bindings(elseif_cond).is_empty() {
+                    self.compile_expr(elseif_cond)?
+                } else {
+                    let scrutinee_reg = self.compile_expr(expr)?;
+                    let result_reg = self.compile_is_pattern(scrutinee_reg, pattern)?;
+                    tested_scrutinee = Some((scrutinee_reg, pattern));
+                    result_reg
+                }
+            } else {
+                self.compile_expr(elseif_cond)?
+            };
             let jump_to_next = self.emit(Instruction::JumpIfNot(elseif_cond_reg, 0), 0);
             self.free_register(elseif_cond_reg);
-            self.begin_scope();
             if let Some((enum_reg, pattern)) = tested_scrutinee {
                 self.bind_pattern_variables(enum_reg, pattern)?;
                 self.free_register(enum_reg);

@@ -24,10 +24,13 @@ impl TraceOptimizer {
         self.eliminate_dead_stores_before_select(trace);
         self.optimize_modulo_select(trace);
         self.optimize_constant_modulo(trace);
-        self.isolate_conflicting_types(trace);
         self.isolate_loop_constants(trace);
         self.hoist_constants(trace);
+        self.isolate_conflicting_types(trace);
+        self.hoist_invariants(trace);
+        self.eliminate_dead_moves(trace);
         self.unroll_loop(trace, crate::jit::UNROLL_FACTOR);
+        self.eliminate_dead_moves(trace);
         self.forward_struct_fields(trace);
         self.hoist_entry_guards(trace);
         self.eliminate_redundant_type_guards(trace);
@@ -42,6 +45,16 @@ impl TraceOptimizer {
             )
         });
         self.hoisted_constants.clone()
+    }
+
+    pub fn optimize_function(&mut self, trace: &mut Trace) -> u8 {
+        self.fuse_try_get_index_patterns(trace);
+        self.fuse_try_cast_patterns(trace);
+        self.fuse_borrow_field_some_patterns(trace);
+        self.eliminate_dead_stores_before_select(trace);
+        self.optimize_modulo_select(trace);
+        self.optimize_constant_modulo(trace);
+        self.isolate_conflicting_types(trace)
     }
 
     fn forward_struct_fields(&mut self, trace: &mut Trace) {
@@ -317,6 +330,62 @@ impl TraceOptimizer {
         trace.ops = ops;
     }
 
+    /// `if node.field is Some(v)` lowers through a field borrow, enum variant test,
+    /// branch, and payload borrow. In whole functions where the field borrow is
+    /// unobserved elsewhere, reading directly into the payload register eliminates
+    /// 3 memory stores and 4 loads per branch.
+    fn fuse_borrow_field_some_patterns(&mut self, trace: &mut Trace) {
+        let (bare, markers) = Self::split_markers(&trace.ops);
+        let mut ops = Vec::with_capacity(trace.ops.len());
+        let mut i = 0;
+        while i < bare.len() {
+            Self::push_marker(&mut ops, markers[i]);
+            if i + 3 < bare.len()
+                && let (
+                    TraceOp::BorrowField {
+                        dest: field_reg,
+                        object,
+                        field_index,
+                    },
+                    TraceOp::IsEnumVariant {
+                        dest: condition_reg,
+                        value: tested_reg,
+                        enum_name,
+                        variant_name,
+                    },
+                    TraceOp::BranchIf {
+                        condition_register,
+                        expect_truthy: false,
+                        label,
+                    },
+                    TraceOp::BorrowEnumValue {
+                        dest: payload_reg,
+                        enum_reg,
+                        index: 0,
+                    },
+                ) = (&bare[i], &bare[i + 1], &bare[i + 2], &bare[i + 3])
+                && tested_reg == field_reg
+                && condition_register == condition_reg
+                && enum_reg == field_reg
+                && enum_name == "Option"
+                && variant_name == "Some"
+            {
+                ops.push(TraceOp::BorrowFieldSome {
+                    dest: *payload_reg,
+                    object: *object,
+                    field_index: *field_index,
+                    label: *label,
+                });
+                i += 4;
+                continue;
+            }
+
+            ops.push(bare[i].clone());
+            i += 1;
+        }
+        trace.ops = ops;
+    }
+
     fn remap_op_reads(op: &mut TraceOp, from: Register, to: Register) {
         match op {
             TraceOp::Move { src, .. }
@@ -348,6 +417,13 @@ impl TraceOptimizer {
                     *rhs = to;
                 }
             }
+            TraceOp::BranchIf {
+                condition_register, ..
+            } => {
+                if *condition_register == from {
+                    *condition_register = to;
+                }
+            }
             TraceOp::Guard { register, .. } => {
                 if *register == from {
                     *register = to;
@@ -365,6 +441,30 @@ impl TraceOptimizer {
                     *condition_register = to;
                 }
             }
+            TraceOp::ConditionalHammock {
+                condition_register,
+                acc_src,
+                inner_loop_bypass,
+                ..
+            } => {
+                if *condition_register == from {
+                    *condition_register = to;
+                }
+                if *acc_src == from {
+                    *acc_src = to;
+                }
+                if let Some(bypass) = inner_loop_bypass {
+                    if bypass.mul_lhs == from {
+                        bypass.mul_lhs = to;
+                    }
+                    if bypass.mul_rhs == from {
+                        bypass.mul_rhs = to;
+                    }
+                    if bypass.bound_reg == from {
+                        bypass.bound_reg = to;
+                    }
+                }
+            }
             TraceOp::SetField { value, .. } => {
                 if *value == from {
                     *value = to;
@@ -378,19 +478,122 @@ impl TraceOptimizer {
                     *value = to;
                 }
             }
+            TraceOp::ArrayPush { array, value, .. } => {
+                if *array == from {
+                    *array = to;
+                }
+                if *value == from {
+                    *value = to;
+                }
+            }
+            TraceOp::GetIndex { array, index, .. }
+            | TraceOp::TryGetIndex { array, index, .. } => {
+                if *array == from {
+                    *array = to;
+                }
+                if *index == from {
+                    *index = to;
+                }
+            }
+            TraceOp::ArrayIndexOk { array, index, .. } => {
+                if *array == from {
+                    *array = to;
+                }
+                if *index == from {
+                    *index = to;
+                }
+            }
+            TraceOp::StoreGlobal { src, .. } => {
+                if *src == from {
+                    *src = to;
+                }
+            }
+            TraceOp::ArrayLen { array, .. } => {
+                if *array == from {
+                    *array = to;
+                }
+            }
+            TraceOp::BorrowFieldSome { object, .. } => {
+                if *object == from {
+                    *object = to;
+                }
+            }
+            TraceOp::SpecializedOp { op, operands } => match op {
+                crate::jit::trace::SpecializedOpKind::VecIndexOk => {
+                    if let Some(crate::jit::trace::Operand::Register(idx)) = operands.get_mut(3) {
+                        if *idx == from {
+                            *idx = to;
+                        }
+                    }
+                }
+                crate::jit::trace::SpecializedOpKind::VecGet => {
+                    if let Some(crate::jit::trace::Operand::Register(idx)) = operands.get_mut(2) {
+                        if *idx == from {
+                            *idx = to;
+                        }
+                    }
+                }
+                crate::jit::trace::SpecializedOpKind::VecSet => {
+                    if let Some(crate::jit::trace::Operand::Register(idx)) = operands.get_mut(1) {
+                        if *idx == from {
+                            *idx = to;
+                        }
+                    }
+                    if let Some(crate::jit::trace::Operand::Register(val)) = operands.get_mut(2) {
+                        if *val == from {
+                            *val = to;
+                        }
+                    }
+                }
+                crate::jit::trace::SpecializedOpKind::VecPush => {
+                    if let Some(crate::jit::trace::Operand::Register(val)) = operands.get_mut(1) {
+                        if *val == from {
+                            *val = to;
+                        }
+                    }
+                }
+                _ => {}
+            },
             _ => {}
         }
     }
 
     fn isolate_loop_constants(&mut self, trace: &mut Trace) {
-        if trace.ops.iter().any(|op| {
+        let mut loop_start = None;
+        let mut loop_end = 0;
+        let mut labels_seen = HashSet::new();
+        for (i, op) in trace.ops.iter().enumerate() {
+            match op {
+                TraceOp::Label { id, .. } => {
+                    labels_seen.insert(*id);
+                }
+                TraceOp::Jump { label } | TraceOp::BranchIf { label, .. } => {
+                    if labels_seen.contains(label) {
+                        loop_end = i;
+                        for (idx, prev) in trace.ops[..i].iter().enumerate() {
+                            if let TraceOp::Label { id, .. } = prev && id == label {
+                                loop_start = Some(idx);
+                                break;
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        let (start, loop_end) = if let Some(start) = loop_start {
+            (start, loop_end)
+        } else if trace.ops.iter().any(|op| matches!(op, TraceOp::GuardLoopContinue { .. })) {
+            (0, trace.ops.len().saturating_sub(1))
+        } else {
+            return;
+        };
+        if trace.ops[start..=loop_end].iter().any(|op| {
             matches!(
                 op,
                 TraceOp::NestedLoopCall { .. }
                     | TraceOp::CallFunction { .. }
-                    | TraceOp::CallNative { .. }
                     | TraceOp::CallMethod { .. }
-                    | TraceOp::InlineCall { .. }
             )
         }) {
             return;
@@ -482,8 +685,37 @@ impl TraceOptimizer {
         }
     }
 
-    fn isolate_conflicting_types(&mut self, trace: &mut Trace) {
-        if trace.ops.iter().any(|op| {
+    pub fn isolate_conflicting_types(&mut self, trace: &mut Trace) -> u8 {
+        let mut loop_start = None;
+        let mut loop_end = 0;
+        let mut labels_seen = HashSet::new();
+        for (i, op) in trace.ops.iter().enumerate() {
+            match op {
+                TraceOp::Label { id, .. } => {
+                    labels_seen.insert(*id);
+                }
+                TraceOp::Jump { label } | TraceOp::BranchIf { label, .. } => {
+                    if labels_seen.contains(label) {
+                        loop_end = i;
+                        for (idx, prev) in trace.ops[..i].iter().enumerate() {
+                            if let TraceOp::Label { id, .. } = prev && id == label {
+                                loop_start = Some(idx);
+                                break;
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        let (start, loop_end) = if let Some(start) = loop_start {
+            (start, loop_end)
+        } else if trace.ops.iter().any(|op| matches!(op, TraceOp::GuardLoopContinue { .. })) {
+            (0, trace.ops.len().saturating_sub(1))
+        } else {
+            return 0;
+        };
+        if trace.ops[start..=loop_end].iter().any(|op| {
             matches!(
                 op,
                 TraceOp::NestedLoopCall { .. }
@@ -491,8 +723,44 @@ impl TraceOptimizer {
                     | TraceOp::CallMethod { .. }
             )
         }) {
-            return;
+            return 0;
         }
+
+        let spec_types = {
+            use crate::jit::specialization::SpecializedLayout;
+            let mut map = HashMap::new();
+            for op in trace.preamble.iter().chain(&trace.ops) {
+                match op {
+                    TraceOp::Unbox { specialized_id, layout, .. }
+                    | TraceOp::Rebox { specialized_id, layout, .. }
+                    | TraceOp::DropSpecialized { specialized_id, layout, .. } => {
+                        let elem_ty = match layout {
+                            SpecializedLayout::Vec { element_layout, element_size } => match &**element_layout {
+                                SpecializedLayout::Scalar { size: 1, .. } => Some(ValueType::Bool),
+                                SpecializedLayout::Scalar { size, is_float: false, .. }
+                                    if *size == core::mem::size_of::<crate::number::LustInt>() =>
+                                {
+                                    Some(ValueType::Int)
+                                }
+                                SpecializedLayout::Scalar { size, is_float: true, .. }
+                                    if *size == core::mem::size_of::<crate::number::LustFloat>() =>
+                                {
+                                    Some(ValueType::Float)
+                                }
+                                _ if *element_size == 1 => Some(ValueType::Bool),
+                                _ => None,
+                            },
+                            _ => None,
+                        };
+                        if let Some(ty) = elem_ty {
+                            map.insert(*specialized_id, ty);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            map
+        };
 
         let mut max_reg = 0;
         for op in trace
@@ -512,7 +780,7 @@ impl TraceOptimizer {
             }
         }
 
-        fn op_write_type(op: &TraceOp) -> Option<(Register, ValueType)> {
+        let op_write_type = |op: &TraceOp| -> Option<(Register, ValueType)> {
             match op {
                 TraceOp::Lt { dest, .. }
                 | TraceOp::Le { dest, .. }
@@ -520,6 +788,12 @@ impl TraceOptimizer {
                 | TraceOp::Ge { dest, .. }
                 | TraceOp::Eq { dest, .. }
                 | TraceOp::Ne { dest, .. } => Some((*dest, ValueType::Bool)),
+                TraceOp::LoadConst { dest, value } => match value {
+                    Value::Bool(_) => Some((*dest, ValueType::Bool)),
+                    Value::Int(_) => Some((*dest, ValueType::Int)),
+                    Value::Float(_) => Some((*dest, ValueType::Float)),
+                    _ => None,
+                },
                 TraceOp::Add { dest, lhs_type, rhs_type, .. }
                 | TraceOp::Sub { dest, lhs_type, rhs_type, .. }
                 | TraceOp::Mul { dest, lhs_type, rhs_type, .. }
@@ -531,9 +805,45 @@ impl TraceOptimizer {
                     };
                     Some((*dest, ty))
                 }
+                TraceOp::SpecializedOp { op, operands } => match op {
+                    crate::jit::trace::SpecializedOpKind::VecIndexOk => {
+                        let elem_ty = operands.get(2).and_then(|op| match op {
+                            crate::jit::trace::Operand::Specialized(id) => spec_types.get(id).copied(),
+                            _ => None,
+                        });
+                        if let (Some(crate::jit::trace::Operand::Register(val_dest)), Some(ty)) =
+                            (operands.get(0), elem_ty)
+                        {
+                            Some((*val_dest, ty))
+                        } else {
+                            None
+                        }
+                    }
+                    crate::jit::trace::SpecializedOpKind::VecGet => {
+                        let elem_ty = operands.get(1).and_then(|op| match op {
+                            crate::jit::trace::Operand::Specialized(id) => spec_types.get(id).copied(),
+                            _ => None,
+                        });
+                        if let (Some(crate::jit::trace::Operand::Register(dest)), Some(ty)) =
+                            (operands.get(0), elem_ty)
+                        {
+                            Some((*dest, ty))
+                        } else {
+                            None
+                        }
+                    }
+                    crate::jit::trace::SpecializedOpKind::VecLen => {
+                        if let Some(crate::jit::trace::Operand::Register(dest)) = operands.get(1) {
+                            Some((*dest, ValueType::Int))
+                        } else {
+                            None
+                        }
+                    }
+                    _ => None,
+                },
                 _ => None,
             }
-        }
+        };
 
         for i in 0..trace.ops.len() {
             let (target_reg, ty) = match op_write_type(&trace.ops[i]) {
@@ -542,10 +852,18 @@ impl TraceOptimizer {
             };
 
             let has_conflict = trace.ops.iter().enumerate().any(|(idx, other)| {
-                idx != i
-                    && op_write_type(other).is_some_and(|(other_reg, other_ty)| {
-                        other_reg == target_reg && other_ty != ty
-                    })
+                if idx == i {
+                    return false;
+                }
+                let writes_target = Self::dest_of(other) == Some(target_reg)
+                    || Self::other_writes(other).contains(&target_reg);
+                if !writes_target {
+                    return false;
+                }
+                match op_write_type(other) {
+                    Some((other_reg, other_ty)) => other_reg == target_reg && other_ty != ty,
+                    None => true,
+                }
             });
 
             if has_conflict && max_reg < 220 {
@@ -559,12 +877,32 @@ impl TraceOptimizer {
                     | TraceOp::Ge { dest, .. }
                     | TraceOp::Eq { dest, .. }
                     | TraceOp::Ne { dest, .. }
+                    | TraceOp::LoadConst { dest, .. }
                     | TraceOp::Add { dest, .. }
                     | TraceOp::Sub { dest, .. }
                     | TraceOp::Mul { dest, .. }
                     | TraceOp::Div { dest, .. } => {
                         *dest = fresh;
                     }
+                    TraceOp::SpecializedOp { op, operands } => match op {
+                        crate::jit::trace::SpecializedOpKind::VecIndexOk => {
+                            if let Some(crate::jit::trace::Operand::Register(val_dest)) = operands.get_mut(0) {
+                                *val_dest = fresh;
+                            }
+                        }
+                        crate::jit::trace::SpecializedOpKind::VecGet
+                        | crate::jit::trace::SpecializedOpKind::VecPop => {
+                            if let Some(crate::jit::trace::Operand::Register(dest)) = operands.get_mut(0) {
+                                *dest = fresh;
+                            }
+                        }
+                        crate::jit::trace::SpecializedOpKind::VecLen => {
+                            if let Some(crate::jit::trace::Operand::Register(dest)) = operands.get_mut(1) {
+                                *dest = fresh;
+                            }
+                        }
+                        _ => {}
+                    },
                     _ => {}
                 }
 
@@ -578,6 +916,7 @@ impl TraceOptimizer {
                 }
             }
         }
+        max_reg
     }
 
     fn hoist_constants(&mut self, trace: &mut Trace) {
@@ -637,17 +976,10 @@ impl TraceOptimizer {
                     {
                         clobbered.insert(*value_dest);
                         clobbered.insert(*condition_dest);
-                    } else if let TraceOp::SpecializedOp { operands, .. } = other {
-                        // A specialized op writes its register operands
-                        // (`VecLen`'s length, say); treat every one as
-                        // written rather than tell them apart.
-                        for operand in operands {
-                            if let crate::jit::trace::Operand::Register(register) = operand {
-                                clobbered.insert(*register);
-                            }
+                    } else {
+                        for reg in Self::other_writes(other).into_iter().chain(Self::dest_of(other)) {
+                            clobbered.insert(reg);
                         }
-                    } else if let Some(dest) = Self::dest_of(other) {
-                        clobbered.insert(dest);
                     }
                 }
             }
@@ -682,9 +1014,200 @@ impl TraceOptimizer {
         trace.ops = new_ops;
     }
 
+    fn op_actual_reads(op: &TraceOp) -> Vec<Register> {
+        match op {
+            TraceOp::Rebox { dest_reg, .. } => vec![*dest_reg],
+            TraceOp::Unbox { source_reg, .. } => vec![*source_reg],
+            _ => Self::reads_of(op),
+        }
+    }
+
+    fn hoist_invariants(&mut self, trace: &mut Trace) {
+        if trace.is_function || trace.ops.is_empty() {
+            return;
+        }
+        if trace
+            .ops
+            .iter()
+            .any(|op| matches!(op, TraceOp::NestedLoopCall { .. }))
+        {
+            return;
+        }
+
+        // 1. Hoist GuardGlobals if no globals can be modified in the loop.
+        let can_modify_globals = trace.ops.iter().any(|op| {
+            matches!(
+                op,
+                TraceOp::StoreGlobal { .. }
+                    | TraceOp::CallFunction { .. }
+                    | TraceOp::CallNative { .. }
+                    | TraceOp::CallMethod { .. }
+            )
+        });
+
+        if !can_modify_globals {
+            let mut first_guard_globals = None;
+            for op in &trace.ops {
+                if let TraceOp::GuardGlobals { version } = op {
+                    if first_guard_globals.is_none() {
+                        first_guard_globals = Some(*version);
+                    }
+                }
+            }
+            if let Some(version) = first_guard_globals {
+                if !trace.preamble.iter().any(|op| {
+                    matches!(op, TraceOp::GuardGlobals { version: v } if *v == version)
+                }) {
+                    trace.preamble.push(TraceOp::GuardGlobals { version });
+                }
+                trace
+                    .ops
+                    .retain(|op| !matches!(op, TraceOp::GuardGlobals { .. }));
+            }
+        }
+
+        // 2. Hoist loop-invariant GetField and associated GuardNativeFunction / Guard.
+        let mut hoisted_regs: HashSet<Register> =
+            self.hoisted_constants.iter().map(|(r, _)| *r).collect();
+        let mut written_regs: HashSet<Register> = HashSet::new();
+
+        for op in &trace.ops {
+            for r in Self::other_writes(op).into_iter().chain(Self::dest_of(op)) {
+                written_regs.insert(r);
+            }
+        }
+
+        let mut reads_before_first_write: HashSet<Register> = HashSet::new();
+        let mut seen_writes: HashSet<Register> = HashSet::new();
+
+        for op in &trace.ops {
+            for r in Self::op_actual_reads(op) {
+                if !seen_writes.contains(&r) {
+                    reads_before_first_write.insert(r);
+                }
+            }
+            for r in Self::other_writes(op).into_iter().chain(Self::dest_of(op)) {
+                seen_writes.insert(r);
+            }
+        }
+
+        let mut mutated_objects: HashSet<Register> = HashSet::new();
+        for op in &trace.ops {
+            match op {
+                TraceOp::SetField { object, .. } => {
+                    mutated_objects.insert(*object);
+                }
+                TraceOp::SetIndex { array, .. } => {
+                    mutated_objects.insert(*array);
+                }
+                _ => {}
+            }
+        }
+
+        let mut candidate_dests: HashSet<Register> = HashSet::new();
+        let mut invariant_get_fields: Vec<(Register, TraceOp)> = Vec::new();
+
+        for op in &trace.ops {
+            if let TraceOp::GetField {
+                dest,
+                object,
+                field_name,
+                ..
+            } = op
+            {
+                let is_obj_invariant = (hoisted_regs.contains(object)
+                    || !written_regs.contains(object))
+                    && !mutated_objects.contains(object);
+                let dest_not_reused = !reads_before_first_write.contains(dest);
+                if is_obj_invariant && dest_not_reused && *dest != *object {
+                    let only_written_by_same = trace.ops.iter().all(|other| {
+                        if let Some(d) = Self::dest_of(other) {
+                            if d == *dest {
+                                if let TraceOp::GetField {
+                                    object: o2,
+                                    field_name: f2,
+                                    ..
+                                } = other
+                                {
+                                    return o2 == object && f2 == field_name;
+                                }
+                                return false;
+                            }
+                        }
+                        if Self::other_writes(other).contains(dest) {
+                            return false;
+                        }
+                        true
+                    });
+
+                    if only_written_by_same && candidate_dests.insert(*dest) {
+                        invariant_get_fields.push((*dest, op.clone()));
+                    }
+                }
+            }
+        }
+
+        if !invariant_get_fields.is_empty() {
+            for (dest, op) in invariant_get_fields {
+                trace.preamble.push(op);
+
+                let mut guarded_ops = Vec::new();
+                for body_op in &trace.ops {
+                    match body_op {
+                        TraceOp::GuardNativeFunction { register, .. } if *register == dest => {
+                            guarded_ops.push(body_op.clone());
+                        }
+                        TraceOp::Guard { register, .. } if *register == dest => {
+                            guarded_ops.push(body_op.clone());
+                        }
+                        _ => {}
+                    }
+                }
+
+                for g in guarded_ops {
+                    if !trace.preamble.iter().any(|existing| match (existing, &g) {
+                        (
+                            TraceOp::GuardNativeFunction {
+                                register: r1,
+                                function: f1,
+                            },
+                            TraceOp::GuardNativeFunction {
+                                register: r2,
+                                function: f2,
+                            },
+                        ) => r1 == r2 && f1.pointer() == f2.pointer(),
+                        (
+                            TraceOp::Guard {
+                                register: r1,
+                                expected_type: t1,
+                            },
+                            TraceOp::Guard {
+                                register: r2,
+                                expected_type: t2,
+                            },
+                        ) => r1 == r2 && t1 == t2,
+                        _ => false,
+                    }) {
+                        trace.preamble.push(g);
+                    }
+                }
+
+                trace.ops.retain(|body_op| match body_op {
+                    TraceOp::GetField { dest: d, .. } if *d == dest => false,
+                    TraceOp::GuardNativeFunction { register: r, .. } if *r == dest => false,
+                    TraceOp::Guard { register: r, .. } if *r == dest => false,
+                    _ => true,
+                });
+
+                hoisted_regs.insert(dest);
+            }
+        }
+    }
+
     fn dest_of(op: &TraceOp) -> Option<Register> {
         match op {
-            TraceOp::Move { dest, .. }
+            TraceOp::LoadConst { dest, .. }
+            | TraceOp::Move { dest, .. }
             | TraceOp::Add { dest, .. }
             | TraceOp::Sub { dest, .. }
             | TraceOp::Mul { dest, .. }
@@ -720,7 +1243,21 @@ impl TraceOptimizer {
             | TraceOp::Select { dest, .. }
             | TraceOp::SelectBitZero { dest, .. }
             | TraceOp::ModImm { dest, .. }
+            | TraceOp::ConditionalHammock { acc_dest: dest, .. }
             | TraceOp::InlineCall { dest, .. } => Some(*dest),
+            TraceOp::SpecializedOp { op, operands } => match op {
+                crate::jit::trace::SpecializedOpKind::VecLen => operands.get(1).and_then(|op| match op {
+                    crate::jit::trace::Operand::Register(r) => Some(*r),
+                    _ => None,
+                }),
+                crate::jit::trace::SpecializedOpKind::VecGet
+                | crate::jit::trace::SpecializedOpKind::VecPop
+                | crate::jit::trace::SpecializedOpKind::VecIndexOk => operands.first().and_then(|op| match op {
+                    crate::jit::trace::Operand::Register(r) => Some(*r),
+                    _ => None,
+                }),
+                _ => None,
+            },
             TraceOp::ArrayIndexOk { .. } => None,
             _ => None,
         }
@@ -731,7 +1268,7 @@ impl TraceOptimizer {
     fn annotated_write_type(op: &TraceOp) -> Option<crate::jit::trace::ValueType> {
         use crate::jit::trace::ValueType;
         match op {
-            TraceOp::ModImm { .. } => Some(ValueType::Int),
+            TraceOp::ModImm { .. } | TraceOp::ConditionalHammock { .. } => Some(ValueType::Int),
             TraceOp::Select {
                 on_true, on_false, ..
             } => match (on_true, on_false) {
@@ -847,15 +1384,37 @@ impl TraceOptimizer {
             } => vec![*value_dest, *condition_dest],
             TraceOp::Rebox { dest_reg, .. } => vec![*dest_reg],
             TraceOp::LoadConst { dest, .. } => vec![*dest],
-            TraceOp::Unbox { source_reg, .. } => vec![*source_reg],
             TraceOp::CallDirect { dest, .. } => vec![*dest],
-            TraceOp::SpecializedOp { operands, .. } => operands
-                .iter()
-                .filter_map(|operand| match operand {
-                    crate::jit::trace::Operand::Register(register) => Some(*register),
-                    _ => None,
-                })
-                .collect(),
+            TraceOp::SpecializedOp { op, operands } => match op {
+                crate::jit::trace::SpecializedOpKind::VecLen => operands
+                    .get(1)
+                    .and_then(|op| match op {
+                        crate::jit::trace::Operand::Register(r) => Some(vec![*r]),
+                        _ => None,
+                    })
+                    .unwrap_or_default(),
+                crate::jit::trace::SpecializedOpKind::VecIndexOk => {
+                    let mut writes = Vec::new();
+                    if let Some(crate::jit::trace::Operand::Register(val_dest)) = operands.get(0) {
+                        writes.push(*val_dest);
+                    }
+                    if let Some(crate::jit::trace::Operand::Register(cond_dest)) = operands.get(1) {
+                        writes.push(*cond_dest);
+                    }
+                    writes
+                }
+                crate::jit::trace::SpecializedOpKind::VecGet
+                | crate::jit::trace::SpecializedOpKind::VecPop => operands
+                    .first()
+                    .and_then(|op| match op {
+                        crate::jit::trace::Operand::Register(r) => Some(vec![*r]),
+                        _ => None,
+                    })
+                    .unwrap_or_default(),
+                crate::jit::trace::SpecializedOpKind::VecPush
+                | crate::jit::trace::SpecializedOpKind::VecSet => Vec::new(),
+                _ => Vec::new(),
+            },
             _ => Vec::new(),
         }
     }
@@ -1119,15 +1678,71 @@ impl TraceOptimizer {
             TraceOp::Select { cond, .. } => vec![*cond],
             TraceOp::SelectBitZero { src, .. } => vec![*src],
             TraceOp::ModImm { src, .. } => vec![*src],
+            TraceOp::ConditionalHammock {
+                condition_register,
+                acc_src,
+                inner_loop_bypass,
+                ..
+            } => {
+                let mut regs = vec![*condition_register, *acc_src];
+                if let Some(bypass) = inner_loop_bypass {
+                    regs.push(bypass.mul_lhs);
+                    regs.push(bypass.mul_rhs);
+                    regs.push(bypass.bound_reg);
+                }
+                regs
+            }
+            TraceOp::StoreGlobal { src, .. } => vec![*src],
+            TraceOp::BorrowField { object, .. } | TraceOp::BorrowFieldSome { object, .. } => {
+                vec![*object]
+            }
+            TraceOp::BorrowEnumValue { enum_reg, .. } => vec![*enum_reg],
+            TraceOp::Unbox { source_reg, .. } => vec![*source_reg],
             TraceOp::NewEnumUnit { .. }
             | TraceOp::LoadConst { .. }
             | TraceOp::GuardGlobals { .. }
             | TraceOp::At { .. }
             | TraceOp::Label { .. }
             | TraceOp::Jump { .. }
+            | TraceOp::Rebox { .. }
             | TraceOp::DropSpecialized { .. } => Vec::new(),
-            // Specialized ops and reboxing read and write through slots;
-            // treat every register as read (no entry guard comes of it).
+            TraceOp::SpecializedOp { op, operands } => match op {
+                crate::jit::trace::SpecializedOpKind::VecPush => operands
+                    .get(1)
+                    .and_then(|op| match op {
+                        crate::jit::trace::Operand::Register(r) => Some(vec![*r]),
+                        _ => None,
+                    })
+                    .unwrap_or_default(),
+                crate::jit::trace::SpecializedOpKind::VecSet => {
+                    let mut reads = Vec::new();
+                    if let Some(crate::jit::trace::Operand::Register(index)) = operands.get(1) {
+                        reads.push(*index);
+                    }
+                    if let Some(crate::jit::trace::Operand::Register(val)) = operands.get(2) {
+                        reads.push(*val);
+                    }
+                    reads
+                }
+                crate::jit::trace::SpecializedOpKind::VecIndexOk => operands
+                    .get(3)
+                    .and_then(|op| match op {
+                        crate::jit::trace::Operand::Register(r) => Some(vec![*r]),
+                        _ => None,
+                    })
+                    .unwrap_or_default(),
+                crate::jit::trace::SpecializedOpKind::VecGet => operands
+                    .get(2)
+                    .and_then(|op| match op {
+                        crate::jit::trace::Operand::Register(r) => Some(vec![*r]),
+                        _ => None,
+                    })
+                    .unwrap_or_default(),
+                crate::jit::trace::SpecializedOpKind::VecLen
+                | crate::jit::trace::SpecializedOpKind::VecPop => Vec::new(),
+                _ => Vec::new(),
+            },
+            // Reboxing and other rare ops read through slots; treat every register as read.
             _ => (0..=u8::MAX).collect(),
         }
     }
@@ -1153,10 +1768,15 @@ impl TraceOptimizer {
             if let TraceOp::ArrayIndexOk {
                 value_dest,
                 condition_dest,
+                value_type,
                 ..
             } = &op
             {
-                known_types.remove(value_dest);
+                if let Some(ty) = value_type {
+                    known_types.insert(*value_dest, *ty);
+                } else {
+                    known_types.remove(value_dest);
+                }
                 known_types.insert(*condition_dest, crate::jit::trace::ValueType::Bool);
             } else if let Some(dest) = Self::dest_of(&op) {
                 match Self::result_type(&op, &known_types) {
@@ -1772,6 +2392,98 @@ impl TraceOptimizer {
                     }
                     if Self::reads_of(prev).contains(dest) || Self::dest_of(prev) == Some(*dest) {
                         break;
+                    }
+                }
+            }
+        }
+        if !to_remove.is_empty() {
+            let mut new_ops = Vec::with_capacity(trace.ops.len() - to_remove.len());
+            for (i, op) in trace.ops.drain(..).enumerate() {
+                if !to_remove.contains(&i) {
+                    new_ops.push(op);
+                }
+            }
+            trace.ops = new_ops;
+        }
+    }
+
+    fn op_may_exit(op: &TraceOp) -> bool {
+        matches!(
+            op,
+            TraceOp::Guard { .. }
+                | TraceOp::GuardGlobals { .. }
+                | TraceOp::GuardStructLayout { .. }
+                | TraceOp::GuardFunction { .. }
+                | TraceOp::GuardClosure { .. }
+                | TraceOp::GuardNativeFunction { .. }
+                | TraceOp::GuardLoopContinue { .. }
+                | TraceOp::BranchIf { .. }
+                | TraceOp::CallNative { .. }
+                | TraceOp::CallFunction { .. }
+                | TraceOp::CallMethod { .. }
+                | TraceOp::CallDirect { .. }
+                | TraceOp::InlineCall { .. }
+                | TraceOp::Div { .. }
+                | TraceOp::Mod { .. }
+                | TraceOp::GetIndex { .. }
+                | TraceOp::SetIndex { .. }
+                | TraceOp::ArrayPush { .. }
+                | TraceOp::ArrayIndexOk { .. }
+                | TraceOp::Return { .. }
+                | TraceOp::Unbox { .. }
+                | TraceOp::Rebox { .. }
+        )
+    }
+
+    fn eliminate_dead_moves(&mut self, trace: &mut Trace) {
+        if trace.ops.is_empty() {
+            return;
+        }
+        let mut to_remove = hashbrown::HashSet::new();
+        for (i, op) in trace.ops.iter().enumerate() {
+            let dest = match op {
+                TraceOp::Move { dest, .. } => *dest,
+                _ => continue,
+            };
+            let mut is_dead = false;
+            for k in i + 1..trace.ops.len() {
+                let next = &trace.ops[k];
+                if matches!(next, TraceOp::At { .. }) {
+                    continue;
+                }
+                if Self::reads_of(next).contains(&dest) {
+                    break;
+                }
+                if Self::op_may_exit(next) {
+                    break;
+                }
+                if Self::dest_of(next) == Some(dest) {
+                    is_dead = true;
+                    break;
+                }
+            }
+            if is_dead {
+                to_remove.insert(i);
+            }
+        }
+        let all_reads: hashbrown::HashSet<Register> = trace
+            .ops
+            .iter()
+            .chain(trace.postamble.iter())
+            .flat_map(Self::reads_of)
+            .collect();
+        let exits_are_safe = trace.ops.iter().all(|o| match o {
+            TraceOp::GuardLoopContinue { .. } | TraceOp::Guard { .. } | TraceOp::At { .. } => true,
+            _ => !Self::op_may_exit(o),
+        });
+        if exits_are_safe {
+            for (i, op) in trace.ops.iter().enumerate() {
+                if to_remove.contains(&i) {
+                    continue;
+                }
+                if let TraceOp::Move { dest, .. } = op {
+                    if !all_reads.contains(dest) && !trace.borrowed_registers.contains(dest) {
+                        to_remove.insert(i);
                     }
                 }
             }

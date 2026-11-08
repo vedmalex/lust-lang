@@ -42,6 +42,7 @@ impl TypeChecker {
             | BinaryOp::Mul
             | BinaryOp::Div
             | BinaryOp::Mod
+            | BinaryOp::FloorDiv
             | BinaryOp::Pow => {
                 if self.is_dynamic_numeric(&left_type) || self.is_dynamic_numeric(&right_type) {
                     return Ok(Type::new(TypeKind::Unknown, span));
@@ -60,6 +61,34 @@ impl TypeChecker {
                     Err(self.type_error_at(
                         format!(
                             "Arithmetic operator {} requires numeric types, got '{}' and '{}'",
+                            op, left_type, right_type
+                        ),
+                        left.span,
+                    ))
+                }
+            }
+
+            BinaryOp::BitAnd
+            | BinaryOp::BitOr
+            | BinaryOp::BitXor
+            | BinaryOp::Shl
+            | BinaryOp::Shr => {
+                if matches!(left_type.kind, TypeKind::Unknown)
+                    || matches!(right_type.kind, TypeKind::Unknown)
+                    || matches!(&left_type.kind, TypeKind::Named(name) if name == "LuaValue")
+                    || matches!(&right_type.kind, TypeKind::Named(name) if name == "LuaValue")
+                {
+                    return Ok(Type::new(TypeKind::Int, span));
+                }
+
+                if matches!(left_type.kind, TypeKind::Int)
+                    && matches!(right_type.kind, TypeKind::Int)
+                {
+                    Ok(Type::new(TypeKind::Int, span))
+                } else {
+                    Err(self.type_error_at(
+                        format!(
+                            "Bitwise operator {} requires integer types, got '{}' and '{}'",
                             op, left_type, right_type
                         ),
                         left.span,
@@ -413,6 +442,19 @@ impl TypeChecker {
             UnaryOp::Not => {
                 self.unify(&Type::new(TypeKind::Bool, span), &operand_type)?;
                 Ok(Type::new(TypeKind::Bool, span))
+            }
+
+            UnaryOp::BitNot => {
+                if matches!(operand_type.kind, TypeKind::Int | TypeKind::Unknown)
+                    || matches!(&operand_type.kind, TypeKind::Named(name) if name == "LuaValue")
+                {
+                    Ok(Type::new(TypeKind::Int, span))
+                } else {
+                    Err(self.type_error(format!(
+                        "Bitwise NOT requires integer type, got '{}'",
+                        operand_type
+                    )))
+                }
             }
         }
     }

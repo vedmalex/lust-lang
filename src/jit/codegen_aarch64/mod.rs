@@ -94,17 +94,29 @@ mod registers;
 mod specialization;
 mod values;
 
+pub(super) use comparisons::CmpOp;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum VecKind {
+    Int,
+    Bool,
+    Float,
+}
+
 /// Tracks a specialized value in the JIT trace
 #[derive(Debug, Clone)]
 pub(super) struct SpecializedValue {
     pub stack_offset: i32,
+    pub kind: VecKind,
 }
 
 #[derive(Debug, Clone, Copy)]
 pub(super) struct HoistedArray {
     pub array_reg: u8,
+    pub rc_reg: u8,
     pub ptr_reg: u8,
     pub len_reg: Option<u8>,
+    pub bounded_index: Option<u8>,
 }
 
 pub struct JitCompiler {
@@ -124,6 +136,8 @@ pub struct JitCompiler {
     pub(super) scalar_registers: HashMap<u8, ValueType>,
     /// Registers proven to contain an Array value at this point.
     pub(super) array_registers: hashbrown::HashSet<u8>,
+    /// Registers proven to contain a Struct with known layout at this point.
+    pub(super) guarded_structs: hashbrown::HashSet<u8>,
     /// VM registers held in machine registers for the loop body.
     pins: HashMap<u8, pins::Pin>,
     /// Pins apply only while compiling the loop body (not the preamble,
@@ -216,8 +230,13 @@ pub struct JitCompiler {
     #[allow(dead_code)]
     pub(super) next_specialized_id: usize,
     pub(super) cached_select_imms: Option<(i64, i64)>,
+    pub(super) cached_specialized_vec: Option<usize>,
     pub(super) hoisted_array: Option<HoistedArray>,
     pub(super) const_registers: hashbrown::HashMap<u8, Value>,
+    pub(super) specialized_bounded_indices: hashbrown::HashSet<(usize, u8)>,
+    pub(super) specialized_stride_loops: hashbrown::HashMap<(usize, u8), (u8, bool, u8)>,
+    pub(super) in_stride_batch_fallback: bool,
+    pub(super) cached_bool_const: Option<bool>,
 }
 
 impl Default for JitCompiler {
