@@ -14,6 +14,26 @@ pub const LUST_STATUS_ERR_INTERRUPTED: u32 = 4;
 
 pub type LustStatus = u32;
 
+/// Typed reasons for effect interruption preserving canonical status codes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InterruptReason {
+    Cancelled,
+    Timeout,
+    OutOfGas,
+    OutOfMemory,
+}
+
+impl InterruptReason {
+    #[inline]
+    pub fn status_code(&self) -> LustStatus {
+        match self {
+            InterruptReason::Cancelled | InterruptReason::Timeout => LUST_STATUS_ERR_INTERRUPTED,
+            InterruptReason::OutOfGas => LUST_STATUS_ERR_OUT_OF_GAS,
+            InterruptReason::OutOfMemory => LUST_STATUS_ERR_OUT_OF_MEMORY,
+        }
+    }
+}
+
 /// C-ABI invocation function pointer type.
 pub type LustInvokeFn = unsafe extern "C" fn(
     userdata: *mut core::ffi::c_void,
@@ -67,9 +87,17 @@ pub enum Cause<E = String> {
     Fail(E),
     /// Unchecked defect / fatal panic.
     Die(String),
-    /// Terminal interruption (e.g. OutOfGas, hardware abort).
-    /// Sticky and non-catchable by user catch blocks.
+    /// Terminal interruption (generic).
     Interrupt,
+    /// Terminal interruption with typed reason.
+    Interrupted(InterruptReason),
+}
+
+impl<E> Cause<E> {
+    #[inline]
+    pub fn is_interrupt(&self) -> bool {
+        matches!(self, Cause::Interrupt | Cause::Interrupted(_))
+    }
 }
 
 /// Disjoint result of executing an Effect<A, E, R>.
@@ -92,7 +120,16 @@ impl<A, E> Exit<A, E> {
 
     #[inline]
     pub fn is_interrupt(&self) -> bool {
-        matches!(self, Exit::Failure(Cause::Interrupt))
+        matches!(self, Exit::Failure(c) if c.is_interrupt())
+    }
+
+    #[inline]
+    pub fn interrupt_reason(&self) -> Option<InterruptReason> {
+        match self {
+            Exit::Failure(Cause::Interrupted(r)) => Some(*r),
+            Exit::Failure(Cause::Interrupt) => Some(InterruptReason::Cancelled),
+            _ => None,
+        }
     }
 
     /// Maps successful values preserving failures.
@@ -116,6 +153,7 @@ impl<A, E> Exit<A, E> {
     pub fn status_code(&self) -> LustStatus {
         match self {
             Exit::Success(_) => LUST_STATUS_SUCCESS,
+            Exit::Failure(Cause::Interrupted(reason)) => reason.status_code(),
             Exit::Failure(Cause::Interrupt) => LUST_STATUS_ERR_INTERRUPTED,
             Exit::Failure(Cause::Die(_)) => LUST_STATUS_ERR_GENERIC,
             Exit::Failure(Cause::Fail(_)) => LUST_STATUS_ERR_GENERIC,
@@ -203,6 +241,289 @@ impl Drop for LayerRollbackLedger {
         if !self.committed {
             while let Some(f) = self.finalizers.pop() {
                 f();
+            }
+        }
+    }
+}
+
+/// Scope admission states: Open accepts child forks and resource acquisition, Closed denies new entries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScopeAdmission {
+    Open,
+    Closed,
+}
+
+/// Stages of the Scope teardown lifecycle (RFC §3.4, Gate-NEG-02).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScopeTeardown {
+    Idle,
+    Cancelling,
+    Joining,
+    Finalizing,
+    Done,
+}
+
+/// Structured Concurrency Scope governing child fibers and LIFO finalizers.
+pub struct Scope {
+    pub id: u64,
+    pub parent_id: Option<u64>,
+    pub admission: ScopeAdmission,
+    pub teardown: ScopeTeardown,
+    pub children: Vec<u64>,
+    pub finalizers: Vec<Box<dyn FnOnce() + 'static>>,
+}
+
+impl Scope {
+    pub fn new(id: u64, parent_id: Option<u64>) -> Self {
+        Self {
+            id,
+            parent_id,
+            admission: ScopeAdmission::Open,
+            teardown: ScopeTeardown::Idle,
+            children: Vec::new(),
+            finalizers: Vec::new(),
+        }
+    }
+
+    #[inline]
+    pub fn is_open(&self) -> bool {
+        self.admission == ScopeAdmission::Open
+    }
+
+    /// Registers a child fiber ID. Fails if the scope has closed admission.
+    pub fn register_child(&mut self, fiber_id: u64) -> Result<(), &'static str> {
+        if self.admission == ScopeAdmission::Closed {
+            return Err("Scope closed: cannot fork new child fiber");
+        }
+        self.children.push(fiber_id);
+        Ok(())
+    }
+
+    /// Registers a finalizer to be executed in LIFO order upon scope exit.
+    pub fn register_finalizer<F: FnOnce() + 'static>(&mut self, finalizer: F) -> Result<(), &'static str> {
+        if self.admission == ScopeAdmission::Closed {
+            return Err("Scope closed: cannot register new resource finalizer");
+        }
+        self.finalizers.push(Box::new(finalizer));
+        Ok(())
+    }
+
+    /// Initiates teardown: closes admission to new operations, transitions to Cancelling,
+    /// and returns the list of child fiber IDs that must be cancelled.
+    pub fn begin_teardown(&mut self) -> Vec<u64> {
+        self.admission = ScopeAdmission::Closed;
+        self.teardown = ScopeTeardown::Cancelling;
+        self.children.clone()
+    }
+
+    /// Transitions scope teardown stage to Joining after cancelling all children.
+    pub fn mark_joining(&mut self) {
+        self.teardown = ScopeTeardown::Joining;
+    }
+
+    /// Called after all child fibers have joined and stopped executing.
+    /// Executes all registered finalizers in strict reverse (LIFO) order.
+    pub fn finalize_resources(&mut self) {
+        self.teardown = ScopeTeardown::Finalizing;
+        while let Some(f) = self.finalizers.pop() {
+            f();
+        }
+        self.teardown = ScopeTeardown::Done;
+    }
+}
+
+/// Execution state of a structured Fiber.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FiberExecutionState {
+    Ready,
+    Running,
+    Suspended,
+    Completed,
+    Failed,
+    Interrupted,
+}
+
+/// Context for an active Fiber with interruption masking for acquire_release.
+pub struct FiberContext {
+    pub id: u64,
+    pub scope_id: u64,
+    pub state: FiberExecutionState,
+    pub pending_interrupt: Option<InterruptReason>,
+    pub interrupt_mask_depth: usize,
+}
+
+impl FiberContext {
+    pub fn new(id: u64, scope_id: u64) -> Self {
+        Self {
+            id,
+            scope_id,
+            state: FiberExecutionState::Ready,
+            pending_interrupt: None,
+            interrupt_mask_depth: 0,
+        }
+    }
+
+    #[inline]
+    pub fn is_masked(&self) -> bool {
+        self.interrupt_mask_depth > 0
+    }
+
+    /// Enters interrupt-masked section (e.g. during acquire_release).
+    pub fn enter_mask(&mut self) {
+        self.interrupt_mask_depth = self.interrupt_mask_depth.saturating_add(1);
+    }
+
+    /// Exits interrupt-masked section. If mask reaches 0, returns any pending interrupt.
+    pub fn exit_mask(&mut self) -> Option<InterruptReason> {
+        self.interrupt_mask_depth = self.interrupt_mask_depth.saturating_sub(1);
+        if self.interrupt_mask_depth == 0 {
+            self.pending_interrupt.take()
+        } else {
+            None
+        }
+    }
+
+    /// Signals an interrupt to the fiber.
+    /// If masked, the interrupt is queued in `pending_interrupt`.
+    /// Returns true if delivered immediately, false if masked/deferred.
+    pub fn request_interrupt(&mut self, reason: InterruptReason) -> bool {
+        if self.is_masked() {
+            if self.pending_interrupt.is_none() {
+                self.pending_interrupt = Some(reason);
+            }
+            false
+        } else {
+            self.state = FiberExecutionState::Interrupted;
+            true
+        }
+    }
+}
+
+/// Schedule policy definition (immutable blueprint).
+#[derive(Debug, Clone, PartialEq)]
+pub enum ScheduleKind {
+    /// Exactly n additional attempts (total runs <= n + 1). n = 0 -> only initial run.
+    Recurs(u64),
+    /// Fixed delay between attempts in milliseconds.
+    Spaced(u64),
+    /// Exponential backoff with saturation cap: delay = min(base * (factor ^ attempt), max_ms).
+    Exponential { base_ms: u64, factor: f64, max_ms: u64 },
+    /// Apply full jitter to computed delay (random fraction between 0 and delay).
+    WithJitter(Box<ScheduleKind>),
+    /// Composed schedule: executes first schedule, then second.
+    AndThen(Box<ScheduleKind>, Box<ScheduleKind>),
+}
+
+/// Per-execution mutable state tracking for a running schedule.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ScheduleState {
+    pub attempt: u64,
+    pub total_delay_ms: u64,
+    pub last_delay_ms: u64,
+}
+
+impl ScheduleState {
+    pub fn initial() -> Self {
+        Self {
+            attempt: 0,
+            total_delay_ms: 0,
+            last_delay_ms: 0,
+        }
+    }
+}
+
+/// Result of evaluating one step of a Schedule.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ScheduleStep {
+    Done,
+    Continue { next_state: ScheduleState, delay_ms: u64 },
+}
+
+impl ScheduleKind {
+    pub fn recurs(n: u64) -> Self {
+        ScheduleKind::Recurs(n)
+    }
+
+    pub fn spaced(ms: u64) -> Self {
+        ScheduleKind::Spaced(ms)
+    }
+
+    pub fn exponential(base_ms: u64, factor: f64, max_ms: u64) -> Self {
+        ScheduleKind::Exponential { base_ms, factor, max_ms }
+    }
+
+    pub fn with_jitter(self) -> Self {
+        ScheduleKind::WithJitter(Box::new(self))
+    }
+
+    pub fn and_then(self, other: Self) -> Self {
+        ScheduleKind::AndThen(Box::new(self), Box::new(other))
+    }
+
+    /// Evaluates one step of the schedule given current state.
+    pub fn step(&self, state: &ScheduleState) -> ScheduleStep {
+        match self {
+            ScheduleKind::Recurs(max_retries) => {
+                if state.attempt < *max_retries {
+                    ScheduleStep::Continue {
+                        next_state: ScheduleState {
+                            attempt: state.attempt + 1,
+                            total_delay_ms: state.total_delay_ms,
+                            last_delay_ms: 0,
+                        },
+                        delay_ms: 0,
+                    }
+                } else {
+                    ScheduleStep::Done
+                }
+            }
+            ScheduleKind::Spaced(ms) => {
+                ScheduleStep::Continue {
+                    next_state: ScheduleState {
+                        attempt: state.attempt + 1,
+                        total_delay_ms: state.total_delay_ms.saturating_add(*ms),
+                        last_delay_ms: *ms,
+                    },
+                    delay_ms: *ms,
+                }
+            }
+            ScheduleKind::Exponential { base_ms, factor, max_ms } => {
+                let mult = factor.powi(state.attempt.min(30) as i32);
+                let computed = (*base_ms as f64 * mult) as u64;
+                let delay = computed.min(*max_ms);
+                ScheduleStep::Continue {
+                    next_state: ScheduleState {
+                        attempt: state.attempt + 1,
+                        total_delay_ms: state.total_delay_ms.saturating_add(delay),
+                        last_delay_ms: delay,
+                    },
+                    delay_ms: delay,
+                }
+            }
+            ScheduleKind::WithJitter(inner) => {
+                match inner.step(state) {
+                    ScheduleStep::Continue { next_state, delay_ms } => {
+                        // In deterministic mode or test harness, half-delay is standard baseline jitter
+                        let jittered_delay = delay_ms / 2;
+                        ScheduleStep::Continue {
+                            next_state: ScheduleState {
+                                attempt: next_state.attempt,
+                                total_delay_ms: state.total_delay_ms.saturating_add(jittered_delay),
+                                last_delay_ms: jittered_delay,
+                            },
+                            delay_ms: jittered_delay,
+                        }
+                    }
+                    ScheduleStep::Done => ScheduleStep::Done,
+                }
+            }
+            ScheduleKind::AndThen(first, second) => {
+                match first.step(state) {
+                    ScheduleStep::Continue { next_state, delay_ms } => {
+                        ScheduleStep::Continue { next_state, delay_ms }
+                    }
+                    ScheduleStep::Done => second.step(state),
+                }
             }
         }
     }

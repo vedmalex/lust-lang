@@ -48,8 +48,9 @@ pub use embed::{
     weak_struct_field_decl,
 };
 pub use effect_abi::{
-    Cause, Exit, LayerRollbackLedger, LustClosureObject, LustEffectDescriptor,
-    StackContextProjection,
+    Cause, Exit, FiberContext, FiberExecutionState, InterruptReason, LayerRollbackLedger,
+    LustClosureObject, LustEffectDescriptor, ScheduleKind, ScheduleState, ScheduleStep, Scope,
+    ScopeAdmission, ScopeTeardown, StackContextProjection,
 };
 pub use error::{LustError, Result};
 pub use jit::{JitCompiler, JitState, JitStats};
