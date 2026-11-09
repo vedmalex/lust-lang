@@ -50,10 +50,23 @@ pub struct Compiler {
     pub(super) strict_mir: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum CleanupKind {
+    Defer,
+    ErrDefer,
+}
+
+#[derive(Debug, Clone)]
+pub(super) struct ScopeCleanup {
+    pub(super) kind: CleanupKind,
+    pub(super) stmt: Box<crate::ast::Stmt>,
+}
+
 #[derive(Debug, Clone)]
 pub(super) struct Scope {
     pub(super) locals: HashMap<String, (Register, bool)>,
     pub(super) depth: usize,
+    pub(super) cleanups: Vec<ScopeCleanup>,
 }
 
 #[derive(Debug, Clone)]

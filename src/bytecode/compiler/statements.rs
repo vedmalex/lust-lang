@@ -223,15 +223,30 @@ impl Compiler {
             }
 
             StmtKind::Return(values) => {
-                if values.is_empty() {
-                    self.emit(Instruction::Return(255), 0);
+                let ret_reg = if values.is_empty() {
+                    255
                 } else if values.len() == 1 {
-                    let reg = self.compile_expr(&values[0])?;
-                    self.emit(Instruction::Return(reg), 0);
+                    let expr_reg = self.compile_expr(&values[0])?;
+                    let dedicated_reg = self.next_local_slot();
+                    if let Some(scope) = self.scopes.first_mut() {
+                        scope.locals.insert(format!("(return_{})", dedicated_reg), (dedicated_reg, false));
+                    }
+                    self.emit(Instruction::Move(dedicated_reg, expr_reg), 0);
+                    self.free_register(expr_reg);
+                    dedicated_reg
                 } else {
                     let tuple_reg = self.compile_exprs_to_tuple(values)?;
-                    self.emit(Instruction::Return(tuple_reg), 0);
-                }
+                    let dedicated_reg = self.next_local_slot();
+                    if let Some(scope) = self.scopes.first_mut() {
+                        scope.locals.insert(format!("(return_{})", dedicated_reg), (dedicated_reg, false));
+                    }
+                    self.emit(Instruction::Move(dedicated_reg, tuple_reg), 0);
+                    self.free_register(tuple_reg);
+                    dedicated_reg
+                };
+
+                self.emit_all_defers()?;
+                self.emit(Instruction::Return(ret_reg), 0);
             }
 
             StmtKind::Block(stmts) => {
@@ -241,7 +256,7 @@ impl Compiler {
                     self.reset_temp_registers();
                 }
 
-                self.end_scope();
+                self.end_scope()?;
             }
 
             StmtKind::Break => {
@@ -294,8 +309,22 @@ impl Compiler {
                 self.compile_for_in_loop(variables, iterator, body)?;
             }
 
-            StmtKind::Defer(s) | StmtKind::ErrDefer(s) => {
-                self.compile_stmt(s)?;
+            StmtKind::Defer(s) => {
+                if let Some(scope) = self.scopes.last_mut() {
+                    scope.cleanups.push(ScopeCleanup {
+                        kind: CleanupKind::Defer,
+                        stmt: s.clone(),
+                    });
+                }
+            }
+
+            StmtKind::ErrDefer(s) => {
+                if let Some(scope) = self.scopes.last_mut() {
+                    scope.cleanups.push(ScopeCleanup {
+                        kind: CleanupKind::ErrDefer,
+                        stmt: s.clone(),
+                    });
+                }
             }
 
             StmtKind::Scoped(stmts) => {
@@ -303,7 +332,7 @@ impl Compiler {
                 for s in stmts {
                     self.compile_stmt(s)?;
                 }
-                self.end_scope();
+                self.end_scope()?;
             }
         }
 
@@ -367,7 +396,7 @@ impl Compiler {
             self.compile_stmt(stmt)?;
         }
 
-        self.end_scope();
+        self.end_scope()?;
         let mut jumps_to_end = vec![self.emit(Instruction::Jump(0), 0)];
         let next_branch_start = self.current_chunk().instructions.len();
         self.current_chunk_mut()
@@ -420,7 +449,7 @@ impl Compiler {
                 self.compile_stmt(stmt)?;
             }
 
-            self.end_scope();
+            self.end_scope()?;
             jumps_to_end.push(self.emit(Instruction::Jump(0), 0));
             let next_start = self.current_chunk().instructions.len();
             self.current_chunk_mut()
@@ -434,7 +463,7 @@ impl Compiler {
                 self.compile_stmt(stmt)?;
             }
 
-            self.end_scope();
+            self.end_scope()?;
         }
 
         let end_pos = self.current_chunk().instructions.len();
@@ -460,7 +489,7 @@ impl Compiler {
             self.compile_stmt(stmt)?;
         }
 
-        self.end_scope();
+        self.end_scope()?;
         let loop_ctx = self.loop_contexts.pop().unwrap();
         self.emit_jump_back_to(loop_start);
         let end_pos = self.current_chunk().instructions.len();
@@ -623,7 +652,7 @@ impl Compiler {
 
         self.free_register(end_reg);
         self.free_register(step_reg);
-        self.end_scope();
+        self.end_scope()?;
         Ok(())
     }
 
@@ -695,7 +724,7 @@ impl Compiler {
 
             self.free_register(end_reg);
             self.free_register(var_reg);
-            self.end_scope();
+            self.end_scope()?;
             return Ok(());
         }
 
@@ -767,7 +796,7 @@ impl Compiler {
             self.free_register(len_reg);
             self.free_register(i_reg);
             self.free_register(array_reg);
-            self.end_scope();
+            self.end_scope()?;
             return Ok(());
         }
 
@@ -868,7 +897,7 @@ impl Compiler {
         }
 
         self.free_register(iter_reg);
-        self.end_scope();
+        self.end_scope()?;
         Ok(())
     }
 }

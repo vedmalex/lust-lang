@@ -156,6 +156,7 @@ impl VM {
             root_frame: Some(CallFrame::new(0, None, 255)),
             active_native_depth: 0,
             active_jit_depth: 0,
+            host_ledger: TrustedHostResourceLedger::new(),
         };
         vm.cycle_collector.set_enabled(config.gc_enabled());
         if config.use_mir() {
@@ -222,6 +223,18 @@ impl VM {
         });
 
         vm
+    }
+
+    pub fn acquire_host_resource(
+        &mut self,
+        handle: usize,
+        cleanup: super::HostResourceCleanupFn,
+    ) -> crate::error::Result<usize> {
+        self.host_ledger.acquire(handle, cleanup)
+    }
+
+    pub fn release_host_resource(&mut self, slot_id: usize) {
+        self.host_ledger.release(slot_id);
     }
 
     fn register_index_error_layout(&mut self) {

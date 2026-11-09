@@ -15,10 +15,23 @@ pub enum MirLowerError {
     UnsupportedLvalue(String),
 }
 
+#[derive(Debug, Clone)]
+pub(super) enum MirCleanupKind {
+    Defer,
+    ErrDefer,
+}
+
+#[derive(Debug, Clone)]
+pub(super) struct MirCleanup {
+    pub(super) kind: MirCleanupKind,
+    pub(super) stmt: Box<Stmt>,
+}
+
 pub struct AstLowering<'a> {
     current_fn: &'a mut MirFunction,
     current_block: BlockId,
     scopes: Vec<HashMap<String, LocalId>>,
+    cleanups: Vec<Vec<MirCleanup>>,
     loop_stack: Vec<(BlockId, BlockId)>, // (header/continue_block, exit_block)
     struct_fields: HashMap<String, Vec<String>>,
     struct_field_substructs: HashMap<String, Vec<Option<String>>>,
@@ -42,6 +55,7 @@ impl<'a> AstLowering<'a> {
             current_fn: func,
             current_block: entry,
             scopes: vec![scope],
+            cleanups: vec![Vec::new()],
             loop_stack: Vec::new(),
             struct_fields: HashMap::new(),
             struct_field_substructs: HashMap::new(),
@@ -51,10 +65,19 @@ impl<'a> AstLowering<'a> {
 
     fn push_scope(&mut self) {
         self.scopes.push(HashMap::new());
+        self.cleanups.push(Vec::new());
     }
 
-    fn pop_scope(&mut self) {
+    fn pop_scope(&mut self) -> Result<(), MirLowerError> {
         self.scopes.pop();
+        if let Some(cleanups) = self.cleanups.pop() {
+            for c in cleanups.into_iter().rev() {
+                if matches!(c.kind, MirCleanupKind::Defer) {
+                    self.lower_statement(&c.stmt)?;
+                }
+            }
+        }
+        Ok(())
     }
 
     fn insert_var(&mut self, name: String, local_id: LocalId) {
@@ -175,8 +198,18 @@ impl<'a> AstLowering<'a> {
             // Ensure current block has a terminator
             let cur_block = lowering.current_block;
             if lowering.current_fn.blocks[cur_block.0].terminator.is_none() {
-                lowering.current_fn.blocks[cur_block.0].terminator =
-                    Some(Terminator::Return(None, crate::ast::Span::dummy()));
+                if let Some(root_cleanups) = lowering.cleanups.last().cloned() {
+                    for c in root_cleanups.iter().rev() {
+                        if matches!(c.kind, MirCleanupKind::Defer) {
+                            lowering.lower_statement(&c.stmt)?;
+                        }
+                    }
+                }
+                let final_block = lowering.current_block;
+                if lowering.current_fn.blocks[final_block.0].terminator.is_none() {
+                    lowering.current_fn.blocks[final_block.0].terminator =
+                        Some(Terminator::Return(None, crate::ast::Span::dummy()));
+                }
             }
         }
 
@@ -200,8 +233,18 @@ impl<'a> AstLowering<'a> {
 
             let cur_block = lowering.current_block;
             if lowering.current_fn.blocks[cur_block.0].terminator.is_none() {
-                lowering.current_fn.blocks[cur_block.0].terminator =
-                    Some(Terminator::Return(None, crate::ast::Span::dummy()));
+                if let Some(root_cleanups) = lowering.cleanups.last().cloned() {
+                    for c in root_cleanups.iter().rev() {
+                        if matches!(c.kind, MirCleanupKind::Defer) {
+                            lowering.lower_statement(&c.stmt)?;
+                        }
+                    }
+                }
+                let final_block = lowering.current_block;
+                if lowering.current_fn.blocks[final_block.0].terminator.is_none() {
+                    lowering.current_fn.blocks[final_block.0].terminator =
+                        Some(Terminator::Return(None, crate::ast::Span::dummy()));
+                }
             }
         }
 
@@ -332,7 +375,7 @@ impl<'a> AstLowering<'a> {
                 for s in body {
                     self.lower_statement(s)?;
                 }
-                self.pop_scope();
+                self.pop_scope()?;
                 self.loop_stack.pop();
 
                 // Loop back to header
@@ -344,10 +387,23 @@ impl<'a> AstLowering<'a> {
             }
             StmtKind::Return(exprs) => {
                 let ret_op = if let Some(first) = exprs.first() {
-                    Some(self.lower_expr(first)?)
+                    let op = self.lower_expr(first)?;
+                    let temp = self.current_fn.add_local(None, MirType::Int, true, stmt.span);
+                    self.emit_stmt(Statement::StorageLive(temp, stmt.span));
+                    self.emit_stmt(Statement::Assign(Place::Local(temp), Rvalue::Use(op), stmt.span));
+                    Some(Operand::Copy(Place::Local(temp)))
                 } else {
                     None
                 };
+
+                for scope_cleanups in self.cleanups.clone().iter().rev() {
+                    for c in scope_cleanups.iter().rev() {
+                        if matches!(c.kind, MirCleanupKind::Defer) {
+                            self.lower_statement(&c.stmt)?;
+                        }
+                    }
+                }
+
                 self.terminate_block(Terminator::Return(ret_op, stmt.span));
             }
             StmtKind::ForNumeric {
@@ -511,7 +567,7 @@ impl<'a> AstLowering<'a> {
                     self.lower_statement(s)?;
                 }
                 self.loop_stack.pop();
-                self.pop_scope();
+                self.pop_scope()?;
                 if self.current_fn.blocks[self.current_block.0].terminator.is_none() {
                     self.terminate_block(Terminator::Goto(step_bb, stmt.span));
                 }
@@ -633,7 +689,7 @@ impl<'a> AstLowering<'a> {
                         self.lower_statement(s)?;
                     }
                     self.loop_stack.pop();
-                    self.pop_scope();
+                    self.pop_scope()?;
                     if self.current_fn.blocks[self.current_block.0].terminator.is_none() {
                         self.terminate_block(Terminator::Goto(step_bb, stmt.span));
                     }
@@ -710,7 +766,7 @@ impl<'a> AstLowering<'a> {
                         self.lower_statement(s)?;
                     }
                     self.loop_stack.pop();
-                    self.pop_scope();
+                    self.pop_scope()?;
                     if self.current_fn.blocks[self.current_block.0].terminator.is_none() {
                         self.terminate_block(Terminator::Goto(step_bb, stmt.span));
                     }
@@ -830,7 +886,7 @@ impl<'a> AstLowering<'a> {
                         self.lower_statement(s)?;
                     }
                     self.loop_stack.pop();
-                    self.pop_scope();
+                    self.pop_scope()?;
                     if self.current_fn.blocks[self.current_block.0].terminator.is_none() {
                         self.terminate_block(Terminator::Goto(step_bb, stmt.span));
                     }
@@ -873,15 +929,30 @@ impl<'a> AstLowering<'a> {
                 for s in stmts {
                     self.lower_statement(s)?;
                 }
-                self.pop_scope();
+                self.pop_scope()?;
             }
-            StmtKind::Defer(_) | StmtKind::ErrDefer(_) => {}
+            StmtKind::Defer(s) => {
+                if let Some(cleanups) = self.cleanups.last_mut() {
+                    cleanups.push(MirCleanup {
+                        kind: MirCleanupKind::Defer,
+                        stmt: s.clone(),
+                    });
+                }
+            }
+            StmtKind::ErrDefer(s) => {
+                if let Some(cleanups) = self.cleanups.last_mut() {
+                    cleanups.push(MirCleanup {
+                        kind: MirCleanupKind::ErrDefer,
+                        stmt: s.clone(),
+                    });
+                }
+            }
             StmtKind::Scoped(stmts) => {
                 self.push_scope();
                 for s in stmts {
                     self.lower_statement(s)?;
                 }
-                self.pop_scope();
+                self.pop_scope()?;
             }
         }
         Ok(())
@@ -1082,7 +1153,7 @@ impl<'a> AstLowering<'a> {
         for s in then_block {
             self.lower_statement(s)?;
         }
-        self.pop_scope();
+        self.pop_scope()?;
         if self.current_fn.blocks[self.current_block.0].terminator.is_none() {
             self.terminate_block(Terminator::Goto(merge_bb, span));
         }
@@ -1124,7 +1195,7 @@ impl<'a> AstLowering<'a> {
             for s in elif_body {
                 self.lower_statement(s)?;
             }
-            self.pop_scope();
+            self.pop_scope()?;
             if self.current_fn.blocks[self.current_block.0].terminator.is_none() {
                 self.terminate_block(Terminator::Goto(merge_bb, span));
             }
@@ -1140,7 +1211,7 @@ impl<'a> AstLowering<'a> {
                 for s in eb {
                     self.lower_statement(s)?;
                 }
-                self.pop_scope();
+                self.pop_scope()?;
                 if self.current_fn.blocks[self.current_block.0].terminator.is_none() {
                     self.terminate_block(Terminator::Goto(merge_bb, span));
                 }
@@ -1312,7 +1383,7 @@ impl<'a> AstLowering<'a> {
                     Rvalue::Use(then_op),
                     expr.span,
                 ));
-                self.pop_scope();
+                self.pop_scope()?;
                 if self.current_fn.blocks[self.current_block.0].terminator.is_none() {
                     self.terminate_block(Terminator::Goto(merge_bb, expr.span));
                 }

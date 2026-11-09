@@ -58,11 +58,34 @@ impl Compiler {
         self.scopes.push(Scope {
             locals: HashMap::new(),
             depth,
+            cleanups: Vec::new(),
         });
     }
 
-    pub(super) fn end_scope(&mut self) {
-        if let Some(_scope) = self.scopes.pop() {}
+    pub(super) fn end_scope(&mut self) -> Result<()> {
+        if let Some(scope) = self.scopes.pop() {
+            for cleanup in scope.cleanups.into_iter().rev() {
+                if cleanup.kind == CleanupKind::Defer {
+                    self.compile_stmt(&cleanup.stmt)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub(super) fn emit_all_defers(&mut self) -> Result<()> {
+        let mut defers = Vec::new();
+        for scope in self.scopes.iter().rev() {
+            for cleanup in scope.cleanups.iter().rev() {
+                if cleanup.kind == CleanupKind::Defer {
+                    defers.push(cleanup.stmt.clone());
+                }
+            }
+        }
+        for stmt in defers {
+            self.compile_stmt(&stmt)?;
+        }
+        Ok(())
     }
 
     pub(super) fn resolve_local(&self, name: &str) -> Result<Register> {

@@ -255,6 +255,80 @@ pub struct VM {
     pub(super) root_frame: Option<Box<CallFrame>>,
     pub(super) active_native_depth: usize,
     pub(super) active_jit_depth: usize,
+    pub host_ledger: TrustedHostResourceLedger,
+}
+
+pub type HostResourceCleanupFn = fn(usize);
+
+#[derive(Clone, Copy)]
+pub struct HostResourceSlot {
+    pub handle: usize,
+    pub cleanup: HostResourceCleanupFn,
+    pub active: bool,
+}
+
+pub struct TrustedHostResourceLedger {
+    pub slots: [HostResourceSlot; 256],
+    pub count: usize,
+}
+
+impl Default for TrustedHostResourceLedger {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl TrustedHostResourceLedger {
+    pub fn new() -> Self {
+        Self {
+            slots: [HostResourceSlot {
+                handle: 0,
+                cleanup: |_| {},
+                active: false,
+            }; 256],
+            count: 0,
+        }
+    }
+
+    pub fn acquire(
+        &mut self,
+        handle: usize,
+        cleanup: HostResourceCleanupFn,
+    ) -> crate::error::Result<usize> {
+        for (idx, slot) in self.slots.iter_mut().enumerate() {
+            if !slot.active {
+                slot.handle = handle;
+                slot.cleanup = cleanup;
+                slot.active = true;
+                self.count += 1;
+                return Ok(idx);
+            }
+        }
+        Err(crate::error::LustError::RuntimeError {
+            message: "TooManyOpenResources: Host resource ledger full (capacity 256 slots)".to_string(),
+        })
+    }
+
+    pub fn release(&mut self, slot_id: usize) {
+        if slot_id < self.slots.len() && self.slots[slot_id].active {
+            let slot = &mut self.slots[slot_id];
+            slot.active = false;
+            (slot.cleanup)(slot.handle);
+            if self.count > 0 {
+                self.count -= 1;
+            }
+        }
+    }
+
+    pub fn cleanup_all(&mut self) {
+        for slot in self.slots.iter_mut() {
+            if slot.active {
+                slot.active = false;
+                (slot.cleanup)(slot.handle);
+            }
+        }
+        self.count = 0;
+    }
 }
 
 impl VM {
@@ -505,6 +579,9 @@ impl Default for VM {
 
 impl Drop for VM {
     fn drop(&mut self) {
+        // Track A: Immediately release all native host resources with 0 gas and 0 alloc
+        self.host_ledger.cleanup_all();
+
         let mut collector = core::mem::take(&mut self.cycle_collector);
 
         // Drop every VM-owned root before the collector itself disappears so

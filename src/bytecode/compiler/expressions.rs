@@ -550,8 +550,14 @@ impl Compiler {
                     }
                 }
 
-                self.end_scope();
-                Ok(result_reg)
+                let final_reg = self.next_local_slot();
+                if let Some(scope) = self.scopes.first_mut() {
+                    scope.locals.insert(format!("(block_res_{})", final_reg), (final_reg, false));
+                }
+                self.emit(Instruction::Move(final_reg, result_reg), 0);
+                self.free_register(result_reg);
+                self.end_scope()?;
+                Ok(final_reg)
             }
 
             ExprKind::EffectBlock(stmts) => {
@@ -591,6 +597,7 @@ impl Compiler {
                 let mut lambda_scope = Scope {
                     locals: HashMap::new(),
                     depth: 0,
+                    cleanups: Vec::new(),
                 };
                 for (param_name, _param_type) in params {
                     let reg = self.allocate_register();
@@ -612,7 +619,14 @@ impl Compiler {
                 }
 
                 let body_reg = self.compile_expr(body)?;
-                self.emit(Instruction::Return(body_reg), 0);
+                let final_body_reg = self.next_local_slot();
+                if let Some(scope) = self.scopes.first_mut() {
+                    scope.locals.insert(format!("(lambda_ret_{})", final_body_reg), (final_body_reg, false));
+                }
+                self.emit(Instruction::Move(final_body_reg, body_reg), 0);
+                self.free_register(body_reg);
+                self.emit_all_defers()?;
+                self.emit(Instruction::Return(final_body_reg), 0);
                 self.functions[lambda_func_idx].set_register_count(self.max_register + 1);
                 self.scopes = saved_scopes;
                 self.current_function = saved_func_idx;

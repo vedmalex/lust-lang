@@ -407,6 +407,7 @@ impl Compiler {
         let mut scope = Scope {
             locals: HashMap::new(),
             depth: 0,
+            cleanups: Vec::new(),
         };
         if func_def.is_method {
             scope.locals.insert("self".to_string(), (0, false));
@@ -427,6 +428,7 @@ impl Compiler {
 
         let last_instr = self.current_chunk().instructions.last();
         if !matches!(last_instr, Some(Instruction::Return(_))) {
+            self.emit_all_defers()?;
             self.emit(Instruction::Return(255), 0);
         }
 
