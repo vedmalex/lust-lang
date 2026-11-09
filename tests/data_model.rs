@@ -145,3 +145,22 @@ fn test_gate_01_mutant_accepting_duplicates_fails_oracle() {
     let mutant_result = mutant_insert_ignoring_duplicates(&mut doc, "k1", 2);
     assert_eq!(mutant_result, Ok(())); // Catches that mutant diverges from required Err(DuplicateKeyError)
 }
+
+#[test]
+fn test_exact_number_no_silent_f64_narrowing_on_integer_overflow() {
+    // Counterexample 1: JSON token 18446744073709551616 (2^64) exceeds u64/i64 lanes and must not narrow to f64
+    let json_res = lust::data::json::from_str("18446744073709551616");
+    assert!(
+        json_res.is_err(),
+        "JSON integer token exceeding integer lanes must be rejected instead of narrowing to f64: got {:?}",
+        json_res
+    );
+
+    // Counterexample 2: TOON token 9223372036854775808 (i64::MAX + 1) exceeds i64 lane and must not narrow to f64
+    let toon_res = lust::data::toon::from_str("value\n9223372036854775808");
+    assert!(
+        toon_res.is_err(),
+        "TOON integer token exceeding integer lane must be rejected instead of narrowing to f64: got {:?}",
+        toon_res
+    );
+}
