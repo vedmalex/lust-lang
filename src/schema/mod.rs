@@ -24,7 +24,10 @@ pub mod error;
 pub mod ir;
 pub mod validate;
 
-pub use binding::{derive_schema_from_layout, StructSchemaBinding};
+pub use binding::{
+    derive_schema, derive_schema_from_item, derive_schema_from_layout,
+    derive_schema_from_struct_def, DeriveSchemaTarget, StructSchemaBinding, StructSchemaBuilder,
+};
 pub use builder::{s, ArrayBuilder, FloatBuilder, IntBuilder, ObjectBuilder, Schema, StringBuilder};
 pub use error::{ValidationError, ValidationErrors};
 pub use ir::{ObjectFieldIR, RefinePredicate, SchemaIR, TransformFn};

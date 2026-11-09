@@ -29,6 +29,10 @@ pub mod yaml;
 pub use budget::{BudgetError, BudgetTracker};
 pub use document::{Document, DuplicateKeyError};
 pub use layout::{CanonicalTypeTag, LogicalFieldDesc, LogicalLayoutV1, TargetAbi};
+pub use materialize::{
+    materialize_from_document, materialize_from_item, materialize_into_struct, struct_def_to_layout,
+    MaterializeError, MaterializedStruct,
+};
 pub use number::{DataError, DateTimeUtc, Decimal128, ExactNumber, ObjectId};
 pub use owner::{LeaseError, LeaseLifecycleState, OwnerId, OwnerRegistry, SlotEntry};
 pub use value::DataValue;

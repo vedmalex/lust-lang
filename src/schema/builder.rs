@@ -542,4 +542,12 @@ impl SchemaFactory {
             variants: variants.into_iter().map(|sch| sch.ir).collect(),
         })
     }
+
+    pub fn r#struct(&self, name: impl Into<String>) -> crate::schema::binding::StructSchemaBuilder {
+        crate::schema::binding::StructSchemaBuilder::new(name)
+    }
+
+    pub fn derive_schema<T: crate::schema::binding::DeriveSchemaTarget>(&self, target: T) -> Schema {
+        target.derive_schema()
+    }
 }

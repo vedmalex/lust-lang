@@ -2,8 +2,10 @@ pub mod entity;
 pub mod lifecycle;
 pub mod relation;
 
-pub use entity::{Entity, EntityBuilder, EntityField};
-pub use lifecycle::{HookEvent, LifecycleHooks};
+pub use entity::{Entity, EntityBuilder, EntityField, IdStrategy, ModelError, ModelInstance, SaveResult};
+pub use lifecycle::{
+    AfterLoadDelegate, BeforeSaveDelegate, HookAction, HookError, HookEvent, LifecycleHooks,
+};
 pub use relation::{Relation, RelationKind};
 
 pub struct ModelFactory;
