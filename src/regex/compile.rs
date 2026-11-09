@@ -16,11 +16,24 @@ pub fn compile_bounded(pattern: &str) -> Result<RegexPlan, RegexError> {
         RegexError::UnsupportedPattern(format!("{}: {}", pattern, e))
     })?;
 
+    let rev_dfa = regex_automata::hybrid::dfa::DFA::builder()
+        .configure(
+            regex_automata::hybrid::dfa::DFA::config()
+                .prefilter(None)
+                .specialize_start_states(false)
+                .match_kind(regex_automata::MatchKind::All),
+        )
+        .thompson(regex_automata::nfa::thompson::Config::new().reverse(true))
+        .build(pattern)
+        .map_err(|e| {
+            RegexError::UnsupportedPattern(format!("{}: {}", pattern, e))
+        })?;
+
     let caps = dfa.create_captures();
     let group_count = caps.group_len();
     if group_count > MAX_CAPTURE_GROUPS {
         return Err(RegexError::TooManyCaptureGroups(group_count));
     }
 
-    Ok(RegexPlan::new(pattern.to_string(), dfa, fwd_dfa, group_count))
+    Ok(RegexPlan::new(pattern.to_string(), dfa, fwd_dfa, rev_dfa, group_count))
 }

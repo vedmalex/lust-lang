@@ -38,6 +38,42 @@ fn review_gate_schema_04_find_scans_no_match_input_linearly() {
 }
 
 #[test]
+fn review_gate_schema_08_find_scans_matched_pattern_linearly() {
+    let regex = BoundedRegex::new("a+b").unwrap();
+    let n1 = 10_000;
+    let short = format!("{}c{}b", "a".repeat(n1), "a".repeat(n1));
+    let n2 = 20_000;
+    let long = format!("{}c{}b", "a".repeat(n2), "a".repeat(n2));
+
+    let start = std::time::Instant::now();
+    let m_short = regex.find(&short).unwrap().expect("must find match");
+    let short_elapsed = start.elapsed();
+
+    assert_eq!(m_short.start, n1 + 1);
+    assert_eq!(m_short.end, 2 * n1 + 2);
+    assert_eq!(m_short.text, format!("{}b", "a".repeat(n1)));
+
+    let start = std::time::Instant::now();
+    let m_long = regex.find(&long).unwrap().expect("must find match");
+    let long_elapsed = start.elapsed();
+
+    assert_eq!(m_long.start, n2 + 1);
+    assert_eq!(m_long.end, 2 * n2 + 2);
+    assert_eq!(m_long.text, format!("{}b", "a".repeat(n2)));
+
+    // Under quadratic repeated scans, 20,002 bytes took 1.7s and 40,002 bytes took 6.7s.
+    // Under linear reverse DFA search, 40,002 bytes finishes in a few milliseconds.
+    assert!(
+        long_elapsed.as_millis() < 300,
+        "find must scale linearly and not repeat suffix scan quadratically: took {long_elapsed:?}"
+    );
+    assert!(
+        long_elapsed.as_nanos() <= short_elapsed.as_nanos().saturating_mul(4).max(10_000_000),
+        "doubling input should scale linearly: short={short_elapsed:?}, long={long_elapsed:?}"
+    );
+}
+
+#[test]
 fn review_gate_schema_09_layout_ordinals_are_contiguous_and_unique() {
     let fields = vec![
         LogicalFieldDesc::new(1, "first", CanonicalTypeTag::Int64),

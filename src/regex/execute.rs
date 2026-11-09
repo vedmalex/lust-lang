@@ -34,7 +34,7 @@ pub fn is_match(plan: &RegexPlan, input_text: &str) -> Result<bool, RegexError> 
 pub fn find(plan: &RegexPlan, input_text: &str) -> Result<Option<RegexMatch>, RegexError> {
     let mut tracker = RegexWorkTracker::new(input_text.len(), plan.group_count, 0)?;
 
-    // Linear-time forward DFA pre-check: scans input once in O(n) to find match existence and end position
+    // Linear-time forward DFA search: scans input once in O(n) to find match existence and end position
     let mut fwd_cache = plan.fwd_dfa.create_cache();
     let fwd_input = Input::new(input_text);
     tracker.charge_scanned(input_text.len() as u64)?;
@@ -50,34 +50,43 @@ pub fn find(plan: &RegexPlan, input_text: &str) -> Result<Option<RegexMatch>, Re
         None => return Ok(None),
     };
 
-    let mut caps = plan.dfa.create_captures();
-    let mut cache = plan.dfa.create_cache();
-
-    // Match is guaranteed to end at hm.offset(), scan candidate start positions up to hm.offset()
-    for pos in 0..=hm.offset() {
-        let input = Input::new(input_text)
-            .range(pos..)
-            .anchored(regex_automata::Anchored::Yes);
-
-        tracker.charge_scanned(1)?;
-        tracker.charge_transitions(1)?;
-
-        plan.dfa.try_search(&mut cache, &input, &mut caps).map_err(|e| {
-            RegexError::SyntaxError(e.to_string())
-        })?;
-
-        if let Some(span) = caps.get_group(0) {
-            tracker.charge_capture_updates(1)?;
-            let matched_text = &input_text[span.start..span.end];
-            return Ok(Some(RegexMatch {
-                start: span.start,
-                end: span.end,
-                text: matched_text.to_string(),
-            }));
-        }
+    let end = hm.offset();
+    if end == 0 {
+        tracker.charge_capture_updates(1)?;
+        return Ok(Some(RegexMatch {
+            start: 0,
+            end: 0,
+            text: String::new(),
+        }));
     }
 
-    Ok(None)
+    // Linear-time reverse DFA search: scans backwards from end position to find match start in O(match_len)
+    let mut rev_cache = plan.rev_dfa.create_cache();
+    let rev_input = Input::new(input_text)
+        .range(..end)
+        .anchored(regex_automata::Anchored::Yes);
+
+    let rev_match = plan
+        .rev_dfa
+        .try_search_rev(&mut rev_cache, &rev_input)
+        .map_err(|e| RegexError::SyntaxError(e.to_string()))?;
+
+    let start = match rev_match {
+        Some(m) => m.offset(),
+        None => 0,
+    };
+
+    let matched_len = (end - start) as u64;
+    tracker.charge_scanned(matched_len)?;
+    tracker.charge_transitions(matched_len)?;
+    tracker.charge_capture_updates(1)?;
+
+    let matched_text = &input_text[start..end];
+    Ok(Some(RegexMatch {
+        start,
+        end,
+        text: matched_text.to_string(),
+    }))
 }
 
 pub fn replace_all(

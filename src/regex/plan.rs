@@ -6,15 +6,23 @@ pub struct RegexPlan {
     pub pattern: String,
     pub dfa: OnepassDFA,
     pub fwd_dfa: HybridDFA,
+    pub rev_dfa: HybridDFA,
     pub group_count: usize,
 }
 
 impl RegexPlan {
-    pub fn new(pattern: String, dfa: OnepassDFA, fwd_dfa: HybridDFA, group_count: usize) -> Self {
+    pub fn new(
+        pattern: String,
+        dfa: OnepassDFA,
+        fwd_dfa: HybridDFA,
+        rev_dfa: HybridDFA,
+        group_count: usize,
+    ) -> Self {
         Self {
             pattern,
             dfa,
             fwd_dfa,
+            rev_dfa,
             group_count,
         }
     }
