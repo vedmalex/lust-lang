@@ -79,12 +79,12 @@ name = "numeric"
 path = "benchmarks/numeric.rs"
 required-features = ["std"]
 
-[[example]]
+[[bin]]
 name = "effects_bench"
 path = "benchmarks/effects_bench.rs"
 required-features = ["std"]
 
-[[example]]
+[[bin]]
 name = "test_framework_bench"
 path = "benchmarks/test_framework_bench.rs"
 required-features = ["std"]
@@ -171,15 +171,6 @@ web-sys = { version = "0.3.105", features = ["console"] }
 getrandom = { version = "0.4.3", features = ["wasm_js"] }
 
 [profile.release]
-strip = false
-lto = "fat"
-opt-level = 3
-debug = 1
-overflow-checks = false
-panic = "abort"
-codegen-units = 1
-
-[profile.bench]
 strip = false
 lto = "fat"
 opt-level = 3
