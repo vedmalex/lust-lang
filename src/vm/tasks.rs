@@ -475,6 +475,15 @@ impl VM {
             })
     }
 
+    pub fn get_task_instance_mut(&mut self, handle: TaskHandle) -> Result<&mut TaskInstance> {
+        let task_id = self.task_id_from_handle(handle)?;
+        self.task_manager
+            .get_mut(task_id)
+            .ok_or_else(|| LustError::RuntimeError {
+                message: format!("Invalid task handle {}", handle.id()),
+            })
+    }
+
     pub fn current_task_handle(&self) -> Option<TaskHandle> {
         self.current_task.map(|id| id.to_handle())
     }
