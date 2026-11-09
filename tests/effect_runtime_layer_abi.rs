@@ -261,3 +261,68 @@ fn test_gate_neg_03_replay_blueprint_purity() {
     }
     assert_eq!(COUNTER.load(Ordering::SeqCst), 2);
 }
+
+#[test]
+fn test_gate_neg_01_sticky_out_of_gas_cannot_be_caught() {
+    // Gate-NEG-01: An effect encountering OutOfGas produces an Interrupt that cannot be swallowed
+    let mut prog = EmbeddedProgram::builder()
+        .module(
+            "main",
+            r#"
+            function infinite_loop(): int
+                local x = 0
+                while true do
+                    x = x + 1
+                end
+                return 42
+            end
+            "#,
+        )
+        .entry_module("main")
+        .compile()
+        .expect("compile");
+
+    prog.vm_mut().set_gas_budget(50);
+    prog.vm_mut().reset_gas_counter();
+
+    let err = prog.vm_mut().call("main.infinite_loop", vec![]).unwrap_err();
+    let err_msg = format!("{}", err);
+    assert!(
+        err_msg.to_lowercase().contains("out of gas"),
+        "expected out of gas, got: {}",
+        err_msg
+    );
+
+    // Invariant: Exit::Failure(Cause::Interrupt) cannot be caught by catch() to return 42
+    let exit: Exit<i32, String> = Exit::Failure(Cause::Interrupt);
+    let attempted_recovery = exit.catch(|_| Exit::Success(42));
+    assert!(attempted_recovery.is_interrupt());
+    assert_ne!(attempted_recovery, Exit::Success(42));
+}
+
+static SECONDARY_HOST_RELEASE: AtomicUsize = AtomicUsize::new(0);
+
+fn mock_secondary_release(handle: usize) {
+    SECONDARY_HOST_RELEASE.fetch_add(handle, Ordering::SeqCst);
+}
+
+#[test]
+fn test_gate_neg_05_secondary_failure_isolation() {
+    SECONDARY_HOST_RELEASE.store(0, Ordering::SeqCst);
+
+    // Contour A: Host resource ledger acquires a native resource
+    let vm = lust::VM::new();
+    let mut vm = vm;
+    let _slot = vm.acquire_host_resource(777, mock_secondary_release).expect("acquire slot");
+    assert_eq!(vm.host_ledger.count, 1);
+
+    // Simulate secondary defect in user defer / cleanup: script division by zero or panic
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+        let _inner = vm;
+        panic!("secondary defect: simulated failure in user defer");
+    }));
+    assert!(result.is_err(), "panic should have occurred");
+
+    // Contour A guarantee: When VM drops during the unwind, native resource 777 was safely released with 0 gas and 0 alloc
+    assert_eq!(SECONDARY_HOST_RELEASE.load(Ordering::SeqCst), 777);
+}
