@@ -36,7 +36,62 @@ impl Parser {
 
     #[inline(never)]
     fn parse_assignment(&mut self) -> Result<Expr> {
-        self.parse_logical_or()
+        self.parse_pipe()
+    }
+
+    #[inline(never)]
+    fn parse_pipe(&mut self) -> Result<Expr> {
+        let mut expr = self.parse_logical_or()?;
+        while self.match_token(&[TokenKind::PipeGreater]) {
+            let right = self.parse_logical_or()?;
+            let span = self.span_through_previous(expr.span);
+            match right.kind {
+                ExprKind::Call {
+                    callee,
+                    type_args,
+                    mut args,
+                } => {
+                    args.insert(0, expr);
+                    expr = Expr::new(
+                        ExprKind::Call {
+                            callee,
+                            type_args,
+                            args,
+                        },
+                        span,
+                    );
+                }
+                ExprKind::MethodCall {
+                    receiver,
+                    method,
+                    type_args,
+                    mut args,
+                } => {
+                    args.insert(0, expr);
+                    expr = Expr::new(
+                        ExprKind::MethodCall {
+                            receiver,
+                            method,
+                            type_args,
+                            args,
+                        },
+                        span,
+                    );
+                }
+                _ => {
+                    expr = Expr::new(
+                        ExprKind::Call {
+                            callee: Box::new(right),
+                            type_args: None,
+                            args: vec![expr],
+                        },
+                        span,
+                    );
+                }
+            }
+        }
+
+        Ok(expr)
     }
 
     #[inline(never)]

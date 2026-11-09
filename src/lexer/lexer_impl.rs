@@ -264,6 +264,13 @@ impl<'a> Lexer<'a> {
                         start_line,
                         start_column,
                     ));
+                } else if self.current_char() == '>' {
+                    self.advance();
+                    return Ok(Token::simple(
+                        TokenKind::PipeGreater,
+                        start_line,
+                        start_column,
+                    ));
                 } else {
                     return Ok(Token::simple(TokenKind::Pipe, start_line, start_column));
                 }
