@@ -44,9 +44,11 @@ pub use ast::{Expr, Item, Span, Stmt, Type};
 pub use bytecode::{Chunk, Compiler, Function, Instruction, Value};
 pub use config::{ConfigError, DependencyKind, DependencySpec, LustConfig};
 pub use data::{
-    BudgetError, BudgetTracker, CanonicalTypeTag, DataValue, DataView, DateTimeUtc, Decimal128,
-    Document, DuplicateKeyError, ExactNumber, LeaseError, LeaseLifecycleState, LogicalFieldDesc,
-    LogicalLayoutV1, ObjectId, OwnerId, OwnerRegistry, TargetAbi,
+    BsonArrayView, BsonDocumentView, BsonElementIter, BsonError, BsonValueView, BudgetError,
+    BudgetTracker, CanonicalTypeTag, DataValue, DataView, DateTimeUtc, Decimal128, Document,
+    DuplicateKeyError, ExactNumber, LeaseError, LeaseLifecycleState, LogicalFieldDesc,
+    LogicalLayoutV1, LustSafeYaml12, ObjectId, OwnerId, OwnerRegistry, TargetAbi, ToonCodec,
+    ToonError, ToonTable, YamlError,
 };
 #[cfg(feature = "std")]
 pub use embed::{

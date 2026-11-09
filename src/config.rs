@@ -360,7 +360,10 @@ impl LustConfig {
     }
 
     pub fn allow_all_pure_std(&mut self) {
-        for mod_name in ["math", "string", "array", "map", "table", "fmt", "assert", "iter"] {
+        for mod_name in [
+            "math", "string", "array", "map", "table", "fmt", "assert", "iter", "bson", "yaml",
+            "toon",
+        ] {
             self.allow_std_module(mod_name);
         }
     }
@@ -396,7 +399,8 @@ impl LustConfig {
             }
             PreludeMode::Pure => {
                 match key.as_str() {
-                    "math" | "string" | "array" | "map" | "table" | "fmt" | "assert" | "iter" => {
+                    "math" | "string" | "array" | "map" | "table" | "fmt" | "assert" | "iter"
+                    | "bson" | "yaml" | "toon" => {
                         true
                     }
                     "io" => self.is_module_enabled("io") || self.capability_mask.allow_io,

@@ -1725,6 +1725,9 @@ pub fn is_virtual_std_module(module_path: &str) -> bool {
             | "test"
             | "test.clock"
             | "test.mock"
+            | "bson"
+            | "yaml"
+            | "toon"
     )
 }
 
@@ -1755,6 +1758,9 @@ pub fn canonical_std_module_name(module_path: &str) -> &'static str {
         "schema" => "schema",
         "data" => "data",
         "model" => "model",
+        "bson" => "bson",
+        "yaml" => "yaml",
+        "toon" => "toon",
         "test" | "test.clock" | "test.mock" => "test",
         _ => "unknown",
     }
@@ -1763,6 +1769,32 @@ pub fn canonical_std_module_name(module_path: &str) -> &'static str {
 pub fn resolve_std_function(module_path: &str, item_name: &str) -> Option<&'static str> {
     let canon = canonical_std_module_name(module_path);
     match canon {
+        "bson" => match item_name {
+            "decode" => Some("bson.decode"),
+            "encode" => Some("bson.encode"),
+            "from_slice" => Some("bson.from_slice"),
+            "to_vec" => Some("bson.to_vec"),
+            "view" => Some("bson.view"),
+            _ => None,
+        },
+        "yaml" => match item_name {
+            "decode" => Some("yaml.decode"),
+            "parse" => Some("yaml.parse"),
+            "from_str" => Some("yaml.from_str"),
+            "from_str_with_aliases" => Some("yaml.from_str_with_aliases"),
+            "parse_documents" => Some("yaml.parse_documents"),
+            "parse_documents_with_aliases" => Some("yaml.parse_documents_with_aliases"),
+            _ => None,
+        },
+        "toon" => match item_name {
+            "decode" => Some("toon.decode"),
+            "encode" => Some("toon.encode"),
+            "from_str" => Some("toon.from_str"),
+            "to_string" => Some("toon.to_string"),
+            "decode_table" => Some("toon.decode_table"),
+            "encode_table" => Some("toon.encode_table"),
+            _ => None,
+        },
         "test" => match item_name {
             "test" => Some("std.test.test"),
             "suite" => Some("std.test.suite"),
