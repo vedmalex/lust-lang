@@ -10,6 +10,7 @@ pub mod builtins;
 pub mod bytecode;
 pub mod config;
 pub mod data;
+pub mod model;
 pub mod schema;
 #[cfg(feature = "std")]
 pub mod regex;

@@ -3,6 +3,7 @@ pub mod budget;
 pub mod document;
 pub mod json;
 pub mod layout;
+pub mod materialize;
 pub mod number;
 pub mod owner;
 pub mod toon;
