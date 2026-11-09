@@ -21,6 +21,7 @@ pub struct AstLowering<'a> {
     scopes: Vec<HashMap<String, LocalId>>,
     loop_stack: Vec<(BlockId, BlockId)>, // (header/continue_block, exit_block)
     struct_fields: HashMap<String, Vec<String>>,
+    struct_field_substructs: HashMap<String, Vec<Option<String>>>,
     local_field_names: HashMap<LocalId, Vec<String>>,
 }
 
@@ -43,6 +44,7 @@ impl<'a> AstLowering<'a> {
             scopes: vec![scope],
             loop_stack: Vec::new(),
             struct_fields: HashMap::new(),
+            struct_field_substructs: HashMap::new(),
             local_field_names: HashMap::new(),
         }
     }
@@ -70,7 +72,39 @@ impl<'a> AstLowering<'a> {
         None
     }
 
+    fn get_place_struct_name(&self, place: &Place) -> Option<String> {
+        match place {
+            Place::Local(loc) => {
+                if let MirType::Struct(name) = &self.current_fn.locals[loc.0].ty {
+                    Some(name.clone())
+                } else {
+                    None
+                }
+            }
+            Place::Field(base, field_idx) => {
+                let base_struct = self.get_place_struct_name(base)?;
+                let subs = self.struct_field_substructs.get(&base_struct)?;
+                subs.get(*field_idx).cloned().flatten()
+            }
+            Place::Index(..) => None,
+        }
+    }
+
     fn resolve_field_idx(&self, base_place: &Place, field: &str) -> Option<usize> {
+        if let Some(struct_name) = self.get_place_struct_name(base_place) {
+            if let Some(names) = self.struct_fields.get(&struct_name) {
+                if let Some(pos) = names.iter().position(|n| n == field) {
+                    return Some(pos);
+                }
+            }
+        }
+        if let Place::Local(loc) = base_place {
+            if let Some(names) = self.local_field_names.get(loc) {
+                if let Some(pos) = names.iter().position(|n| n == field) {
+                    return Some(pos);
+                }
+            }
+        }
         let loc = match base_place {
             Place::Local(loc) => *loc,
             Place::Field(base, _) | Place::Index(base, _) => match &**base {
@@ -1428,11 +1462,18 @@ impl<'a> AstLowering<'a> {
             ExprKind::StructLiteral { name, fields } => {
                 let mut lowered = Vec::with_capacity(fields.len());
                 let mut field_names = Vec::with_capacity(fields.len());
+                let mut field_substructs = Vec::with_capacity(fields.len());
                 for f in fields {
+                    let sub = match &f.value.kind {
+                        ExprKind::StructLiteral { name: sub_name, .. } => Some(sub_name.clone()),
+                        _ => None,
+                    };
+                    field_substructs.push(sub);
                     lowered.push(self.lower_expr(&f.value)?);
                     field_names.push(f.name.clone());
                 }
                 self.struct_fields.insert(name.clone(), field_names.clone());
+                self.struct_field_substructs.insert(name.clone(), field_substructs);
                 let struct_ty = MirType::Struct(name.clone());
                 let temp = self.current_fn.add_local(None, struct_ty.clone(), true, expr.span);
                 self.local_field_names.insert(temp, field_names);
@@ -1563,46 +1604,7 @@ impl<'a> AstLowering<'a> {
                     ));
                     Ok(Operand::Move(Place::Local(res_local)))
                 } else {
-                    let rec_op = self.lower_expr(receiver)?;
-                    let rec_local = match rec_op {
-                        Operand::Copy(Place::Local(loc)) | Operand::Move(Place::Local(loc)) => loc,
-                        _ => {
-                            let temp = self.current_fn.add_local(None, MirType::Int, true, expr.span);
-                            self.emit_stmt(Statement::StorageLive(temp, expr.span));
-                            self.emit_stmt(Statement::Assign(Place::Local(temp), Rvalue::Use(rec_op), expr.span));
-                            temp
-                        }
-                    };
-
-                    let is_err_temp = self.current_fn.add_local(None, MirType::Bool, true, expr.span);
-                    self.emit_stmt(Statement::StorageLive(is_err_temp, expr.span));
-                    self.emit_stmt(Statement::Assign(
-                        Place::Local(is_err_temp),
-                        Rvalue::BinaryOp(
-                            MirBinaryOp::Lt,
-                            Operand::Copy(Place::Local(rec_local)),
-                            Operand::Constant(MirConstant::Int(0)),
-                        ),
-                        expr.span,
-                    ));
-
-                    let ok_bb = self.current_fn.new_block();
-                    let err_bb = self.current_fn.new_block();
-
-                    self.terminate_block(Terminator::Cond {
-                        cond: Operand::Move(Place::Local(is_err_temp)),
-                        then_block: err_bb,
-                        else_block: ok_bb,
-                        span: expr.span,
-                    });
-
-                    // err_bb
-                    self.current_block = err_bb;
-                    self.terminate_block(Terminator::Return(Some(Operand::Copy(Place::Local(rec_local))), expr.span));
-
-                    // ok_bb
-                    self.current_block = ok_bb;
-                    Ok(Operand::Copy(Place::Local(rec_local)))
+                    self.lower_expr(receiver)
                 }
             }
             ExprKind::Call { callee, args, .. } => {
@@ -1617,6 +1619,22 @@ impl<'a> AstLowering<'a> {
                     }
                     _ => "unknown_callee".into(),
                 };
+                match callee_name.as_str() {
+                    "Ok" | "Result.Ok" | "Some" | "Option.Some" => {
+                        if let Some(arg) = args.first() {
+                            return self.lower_expr(arg);
+                        }
+                    }
+                    "Err" | "Result.Err" => {
+                        if let Some(arg) = args.first() {
+                            return self.lower_expr(arg);
+                        }
+                    }
+                    "None" | "Option.None" => {
+                        return Ok(Operand::Constant(MirConstant::Int(0)));
+                    }
+                    _ => {}
+                }
                 let mut lowered_args = Vec::with_capacity(args.len());
                 for a in args {
                     lowered_args.push(self.lower_expr(a)?);

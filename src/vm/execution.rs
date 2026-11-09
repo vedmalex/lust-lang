@@ -1709,6 +1709,28 @@ impl VM {
                             })?
                             .to_string()
                     };
+                    if method_name == "try_unwrap" {
+                        let unwrap_res = match &object {
+                            Value::Enum(obj) if obj.enum_name == "Option" => {
+                                if obj.variant == "Some" {
+                                    Ok(obj.values.as_ref().and_then(|v| v.first().cloned()).unwrap_or(Value::Nil))
+                                } else {
+                                    Err(LustError::RuntimeError { message: "Option is None".into() })
+                                }
+                            }
+                            Value::Enum(obj) if obj.enum_name == "Result" => {
+                                if obj.variant == "Ok" {
+                                    Ok(obj.values.as_ref().and_then(|v| v.first().cloned()).unwrap_or(Value::Nil))
+                                } else {
+                                    Err(LustError::RuntimeError { message: "Result is Err".into() })
+                                }
+                            }
+                            scalar => Ok(scalar.clone()),
+                        };
+                        let val = unwrap_res?;
+                        self.set_register(dest_reg, val)?;
+                        break 'method;
+                    }
                     let object_type_name = match &object {
                         Value::Struct(object) => Some(object.name.as_str()),
                         Value::Enum(object) => Some(object.enum_name.as_str()),

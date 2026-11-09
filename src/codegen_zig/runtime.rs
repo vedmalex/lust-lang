@@ -235,6 +235,43 @@ pub fn __lust_unwrap(val: anytype) @TypeOf(if (@typeInfo(@TypeOf(val)) == .optio
     }
 }
 
+pub fn __lust_try_unwrap(val: anytype) !@TypeOf(switch (@typeInfo(@TypeOf(val))) {
+    .optional => |opt| @as(opt.child, undefined),
+    .@"struct" => if (@hasField(@TypeOf(val), "Ok")) @as(@TypeOf(@field(val, "Ok")), undefined) else val,
+    .@"union" => if (@hasField(@TypeOf(val), "Ok")) @as(@TypeOf(val.Ok), undefined) else val,
+    else => val,
+}) {
+    const T = @TypeOf(val);
+    const info = @typeInfo(T);
+    switch (info) {
+        .optional => {
+            if (val) |v| return v;
+            return error.None;
+        },
+        .@"struct" => {
+            if (@hasField(T, "Ok")) {
+                return @field(val, "Ok");
+            } else if (@hasField(T, "Err")) {
+                return error.CustomError;
+            } else {
+                return val;
+            }
+        },
+        .@"union" => {
+            if (@hasField(T, "Ok")) {
+                return switch (val) {
+                    .Ok => |v| v,
+                    .Err => error.CustomError,
+                    else => error.CustomError,
+                };
+            } else {
+                return val;
+            }
+        },
+        else => return val,
+    }
+}
+
 pub fn __lust_print(val: anytype) void {
     const T = @TypeOf(val);
     switch (@typeInfo(T)) {

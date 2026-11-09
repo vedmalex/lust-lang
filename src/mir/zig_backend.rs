@@ -99,8 +99,26 @@ pub mod zig_engine {
             s.push_str("    __last_status = 0;\n");
             s.push_str("}\n\n");
 
+            s.push_str("fn __lust_mir_div(a: i64, b: i64) i64 {\n");
+            s.push_str("    if (b == 0) @panic(\"division by zero\");\n");
+            s.push_str("    if (a == std.math.minInt(i64) and b == -1) return std.math.minInt(i64);\n");
+            s.push_str("    return @divTrunc(a, b);\n");
+            s.push_str("}\n\n");
+
+            s.push_str("fn __lust_mir_rem(a: i64, b: i64) i64 {\n");
+            s.push_str("    if (b == 0) @panic(\"division by zero\");\n");
+            s.push_str("    if (a == std.math.minInt(i64) and b == -1) return 0;\n");
+            s.push_str("    return @rem(a, b);\n");
+            s.push_str("}\n\n");
+
+            s.push_str("fn __lust_mir_floordiv(a: i64, b: i64) i64 {\n");
+            s.push_str("    if (b == 0) @panic(\"division by zero\");\n");
+            s.push_str("    if (a == std.math.minInt(i64) and b == -1) return std.math.minInt(i64);\n");
+            s.push_str("    return @divFloor(a, b);\n");
+            s.push_str("}\n\n");
+
             s.push_str("fn __lust_mir_pow(base: i64, exp: i64) i64 {\n");
-            s.push_str("    if (exp < 0) return 0;\n");
+            s.push_str("    if (exp < 0) @panic(\"Negative exponent in integer power\");\n");
             s.push_str("    var b = base;\n");
             s.push_str("    var e: u64 = @intCast(exp);\n");
             s.push_str("    var res: i64 = 1;\n");
@@ -112,6 +130,28 @@ pub mod zig_engine {
             s.push_str("        e >>= 1;\n");
             s.push_str("    }\n");
             s.push_str("    return res;\n");
+            s.push_str("}\n\n");
+
+            s.push_str("fn __to_i64(val: anytype) i64 {\n");
+            s.push_str("    const T = @TypeOf(val);\n");
+            s.push_str("    if (T == i64) return val;\n");
+            s.push_str("    if (T == []i64 or T == []const i64) return @as(i64, @bitCast(@intFromPtr(val.ptr)));\n");
+            s.push_str("    if (@typeInfo(T) == .pointer) return @as(i64, @bitCast(@intFromPtr(val)));\n");
+            s.push_str("    return @as(i64, @intCast(val));\n");
+            s.push_str("}\n\n");
+
+            s.push_str("fn __get_field_ptr(base: anytype, offset: usize) *i64 {\n");
+            s.push_str("    const T = @TypeOf(base);\n");
+            s.push_str("    if (T == []i64) {\n");
+            s.push_str("        return &base[offset];\n");
+            s.push_str("    } else if (T == i64) {\n");
+            s.push_str("        const addr: usize = @bitCast(base);\n");
+            s.push_str("        const ptr: [*]i64 = @ptrFromInt(addr);\n");
+            s.push_str("        return &ptr[offset];\n");
+            s.push_str("    } else {\n");
+            s.push_str("        const ptr: [*]i64 = @ptrCast(base);\n");
+            s.push_str("        return &ptr[offset];\n");
+            s.push_str("    }\n");
             s.push_str("}\n\n");
 
             s.push_str("fn __alloc_slice(items: []const i64) []i64 {\n");
@@ -135,7 +175,13 @@ pub mod zig_engine {
         fn generate_function_code(func: &MirFunction) -> Result<String, MirZigBackendError> {
             let mut s = String::new();
             let ret_ty = mir_to_zig_type(&func.signature.return_type);
-            s.push_str(&format!("pub export fn {}(", func.signature.name));
+            let has_slice = func.signature.param_types.iter().any(|p| matches!(p, MirType::Array(_)))
+                || matches!(func.signature.return_type, MirType::Array(_));
+            if has_slice {
+                s.push_str(&format!("pub fn {}(", func.signature.name));
+            } else {
+                s.push_str(&format!("pub export fn {}(", func.signature.name));
+            }
 
             for (i, p_id) in func.params.iter().enumerate() {
                 if i > 0 {
@@ -145,7 +191,11 @@ pub mod zig_engine {
                 s.push_str(&format!("arg{i}: {p_ty}"));
             }
 
-            s.push_str(&format!(") callconv(.c) {ret_ty} {{\n"));
+            if has_slice {
+                s.push_str(&format!(") {ret_ty} {{\n"));
+            } else {
+                s.push_str(&format!(") callconv(.c) {ret_ty} {{\n"));
+            }
 
             // Declare locals
             for local in &func.locals {
@@ -216,20 +266,28 @@ pub mod zig_engine {
                             for arg in args {
                                 args_strs.push(lower_operand(arg)?);
                             }
-                            let call_expr = match callee.as_str() {
-                                "math.abs" | "abs" => format!("@as(i64, @intCast(@abs({})))", args_strs.first().cloned().unwrap_or_default()),
-                                "math.min" | "min" => format!("@min({}, {})", args_strs.get(0).cloned().unwrap_or_default(), args_strs.get(1).cloned().unwrap_or_default()),
-                                "math.max" | "max" => format!("@max({}, {})", args_strs.get(0).cloned().unwrap_or_default(), args_strs.get(1).cloned().unwrap_or_default()),
-                                "math.clamp" | "clamp" => format!("std.math.clamp({}, {}, {})", args_strs.get(0).cloned().unwrap_or_default(), args_strs.get(1).cloned().unwrap_or_default(), args_strs.get(2).cloned().unwrap_or_default()),
-                                "table.len" | "array.len" => format!("@as(i64, @intCast({}.len))", args_strs.first().cloned().unwrap_or_default()),
-                                _ => {
-                                    let args_joined = args_strs.join(", ");
-                                    format!("{callee}({args_joined})")
-                                }
-                            };
                             let dest_expr = lower_place(destination);
-                            s.push_str(&format!("                {dest_expr} = {call_expr};\n"));
-                            s.push_str(&format!("                block_id = {};\n                continue;\n", success.0));
+                            if callee == "print" || callee == "println" {
+                                let first = args_strs.first().cloned().unwrap_or("0".to_string());
+                                s.push_str(&format!("                std.debug.print(\"{{d}}\\n\", .{{{first}}});\n"));
+                                s.push_str(&format!("                block_id = {};\n                continue;\n", success.0));
+                            } else {
+                                let call_expr = match callee.as_str() {
+                                    "math.abs" | "abs" => format!("@as(i64, @intCast(@abs({})))", args_strs.first().cloned().unwrap_or_default()),
+                                    "math.min" | "min" => format!("@min({}, {})", args_strs.get(0).cloned().unwrap_or_default(), args_strs.get(1).cloned().unwrap_or_default()),
+                                    "math.max" | "max" => format!("@max({}, {})", args_strs.get(0).cloned().unwrap_or_default(), args_strs.get(1).cloned().unwrap_or_default()),
+                                    "math.clamp" | "clamp" => format!("std.math.clamp({}, {}, {})", args_strs.get(0).cloned().unwrap_or_default(), args_strs.get(1).cloned().unwrap_or_default(), args_strs.get(2).cloned().unwrap_or_default()),
+                                    "table.len" | "array.len" => format!("@as(i64, @intCast({}.len))", args_strs.first().cloned().unwrap_or_default()),
+                                    _ => {
+                                        let args_joined = args_strs.join(", ");
+                                        format!("{callee}({args_joined})")
+                                    }
+                                };
+                                s.push_str(&format!("                {dest_expr} = {call_expr};\n"));
+                                let err_ret = if func.signature.return_type != MirType::Unit { " 0" } else { "" };
+                                s.push_str(&format!("                if (__last_status != 0) return{err_ret};\n"));
+                                s.push_str(&format!("                block_id = {};\n                continue;\n", success.0));
+                            }
                         }
                         Terminator::Return(opt_op, _) => {
                             if func.signature.return_type != MirType::Unit {
@@ -382,7 +440,7 @@ pub mod zig_engine {
             }
             Place::Field(base, f) => {
                 let b = lower_place(base);
-                format!("{b}[{f}]")
+                format!("__get_field_ptr({b}, {f}).*")
             }
         }
     }
@@ -410,9 +468,9 @@ pub mod zig_engine {
                     MirBinaryOp::Add => format!("{l} + {r}"),
                     MirBinaryOp::Sub => format!("{l} - {r}"),
                     MirBinaryOp::Mul => format!("{l} * {r}"),
-                    MirBinaryOp::Div => format!("@divTrunc({l}, {r})"),
-                    MirBinaryOp::Mod => format!("@rem({l}, {r})"),
-                    MirBinaryOp::FloorDiv => format!("@divFloor({l}, {r})"),
+                    MirBinaryOp::Div => format!("__lust_mir_div({l}, {r})"),
+                    MirBinaryOp::Mod => format!("__lust_mir_rem({l}, {r})"),
+                    MirBinaryOp::FloorDiv => format!("__lust_mir_floordiv({l}, {r})"),
                     MirBinaryOp::Pow => format!("__lust_mir_pow({l}, {r})"),
                     MirBinaryOp::BitAnd => format!("({l} & {r})"),
                     MirBinaryOp::BitOr => format!("({l} | {r})"),
@@ -446,7 +504,8 @@ pub mod zig_engine {
                     if i > 0 {
                         elems.push_str(", ");
                     }
-                    elems.push_str(&lower_operand(el)?);
+                    let operand_str = lower_operand(el)?;
+                    elems.push_str(&format!("__to_i64({operand_str})"));
                 }
                 Ok(format!("__alloc_slice(&[_]i64{{{elems}}})"))
             }

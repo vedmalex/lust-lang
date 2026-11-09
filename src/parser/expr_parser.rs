@@ -221,9 +221,11 @@ impl Parser {
         let expr = self.parse_term()?;
         if self.check(TokenKind::DoubleDot) {
             if !Self::is_string_like_expr(&expr) {
-                if let Some(next) = self.peek_ahead(1)
-                    && matches!(next.kind, TokenKind::Integer | TokenKind::Float)
-                {
+                let next_is_string = self
+                    .peek_ahead(1)
+                    .map(|next| matches!(next.kind, TokenKind::String))
+                    .unwrap_or(false);
+                if !next_is_string {
                     return Ok(expr);
                 }
             }

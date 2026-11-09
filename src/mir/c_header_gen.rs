@@ -50,13 +50,7 @@ impl CHeaderGenerator {
     }
 
     pub fn generate_header_for_module(module: &MirModule) -> String {
-        let guard_name = format!(
-            "LUST_GENERATED_{}_H",
-            module
-                .name
-                .to_ascii_uppercase()
-                .replace(|c: char| !c.is_alphanumeric(), "_")
-        );
+        let guard_name = "LUST_GENERATED_H";
 
         let mut s = String::new();
         s.push_str(&format!("#ifndef {guard_name}\n"));
@@ -82,11 +76,9 @@ impl CHeaderGenerator {
         );
 
         for func in &module.functions {
-            if func.signature.is_public {
-                let proto = Self::function_prototype(func);
-                s.push_str(&proto);
-                s.push('\n');
-            }
+            let proto = Self::function_prototype(func);
+            s.push_str(&proto);
+            s.push('\n');
         }
         s.push('\n');
 
@@ -141,13 +133,15 @@ impl CHeaderGenerator {
     }
 }
 
-pub fn mir_type_to_c(ty: &MirType) -> &'static str {
+pub fn mir_type_to_c(ty: &MirType) -> String {
     match ty {
-        MirType::Int => "int64_t",
-        MirType::Float => "double",
-        MirType::Bool => "bool",
-        MirType::Unit => "void",
-        MirType::Array(_) => "int64_t*",
-        _ => "int64_t",
+        MirType::Int => "int64_t".to_string(),
+        MirType::Float => "double".to_string(),
+        MirType::Bool => "bool".to_string(),
+        MirType::Unit => "void".to_string(),
+        MirType::String => "const char*".to_string(),
+        MirType::Array(_) => "void*".to_string(),
+        MirType::Struct(name) => format!("const {}*", name),
+        _ => "int64_t".to_string(),
     }
 }

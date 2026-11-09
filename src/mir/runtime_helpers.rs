@@ -3,10 +3,16 @@ use alloc::vec::Vec;
 use core::sync::atomic::{AtomicI64, Ordering};
 
 static GAS_REMAINING: AtomicI64 = AtomicI64::new(1_000_000_000);
+static LAST_STATUS: AtomicI64 = AtomicI64::new(0);
+static MAX_MEMORY_LIMIT: AtomicI64 = AtomicI64::new(i64::MAX);
+static MEMORY_USED: AtomicI64 = AtomicI64::new(0);
 
 #[unsafe(no_mangle)]
 pub extern "C" fn lust_mir_set_gas(gas: i64) {
     GAS_REMAINING.store(gas, Ordering::SeqCst);
+    if gas >= 0 {
+        LAST_STATUS.store(0, Ordering::SeqCst);
+    }
 }
 
 #[unsafe(no_mangle)]
@@ -17,13 +23,45 @@ pub extern "C" fn lust_mir_get_gas() -> i64 {
 #[unsafe(no_mangle)]
 pub extern "C" fn lust_mir_charge_gas(amt: i64) -> i64 {
     let cur = GAS_REMAINING.fetch_sub(amt, Ordering::SeqCst);
-    cur - amt
+    let rem = cur - amt;
+    if rem < 0 {
+        LAST_STATUS.store(1, Ordering::SeqCst);
+    }
+    rem
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn lust_mir_get_status() -> i64 {
+    LAST_STATUS.load(Ordering::SeqCst)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn lust_mir_set_status(status: i64) {
+    LAST_STATUS.store(status, Ordering::SeqCst);
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn lust_mir_set_max_memory(bytes: i64) {
+    MAX_MEMORY_LIMIT.store(bytes, Ordering::SeqCst);
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn lust_mir_get_memory_used() -> i64 {
+    MEMORY_USED.load(Ordering::SeqCst)
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn lust_mir_alloc_array(len: i64) -> *mut i64 {
     let count = if len < 0 { 0 } else { len as usize };
     let size = (count + 2).max(2);
+    let bytes_needed = (size * core::mem::size_of::<i64>()) as i64;
+    let limit = MAX_MEMORY_LIMIT.load(Ordering::SeqCst);
+    let prev = MEMORY_USED.fetch_add(bytes_needed, Ordering::SeqCst);
+    if prev + bytes_needed > limit {
+        MEMORY_USED.fetch_sub(bytes_needed, Ordering::SeqCst);
+        LAST_STATUS.store(2, Ordering::SeqCst);
+        panic!("Out of memory");
+    }
     let mut vec = Vec::<i64>::with_capacity(size);
     vec.push(count as i64);
     vec.push(count as i64);
@@ -67,9 +105,33 @@ pub extern "C" fn lust_mir_array_set(ptr: *mut i64, idx: i64, val: i64) {
 }
 
 #[unsafe(no_mangle)]
+pub extern "C" fn lust_mir_div_int(a: i64, b: i64) -> i64 {
+    if b == 0 {
+        panic!("Division by zero");
+    }
+    if a == i64::MIN && b == -1 {
+        i64::MIN
+    } else {
+        a / b
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn lust_mir_rem_int(a: i64, b: i64) -> i64 {
+    if b == 0 {
+        panic!("Modulo by zero");
+    }
+    if a == i64::MIN && b == -1 {
+        0
+    } else {
+        a % b
+    }
+}
+
+#[unsafe(no_mangle)]
 pub extern "C" fn lust_mir_floordiv_int(a: i64, b: i64) -> i64 {
     if b == 0 {
-        return 0;
+        panic!("Division by zero");
     }
     if a == i64::MIN && b == -1 {
         i64::MIN
@@ -87,7 +149,7 @@ pub extern "C" fn lust_mir_floordiv_int(a: i64, b: i64) -> i64 {
 #[unsafe(no_mangle)]
 pub extern "C" fn lust_mir_pow_int(mut base: i64, exp: i64) -> i64 {
     if exp < 0 {
-        return 0;
+        panic!("Negative exponent in integer power");
     }
     let mut e = exp as u64;
     let mut res: i64 = 1;
@@ -99,6 +161,11 @@ pub extern "C" fn lust_mir_pow_int(mut base: i64, exp: i64) -> i64 {
         e >>= 1;
     }
     res
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn lust_mir_print_int(x: i64) {
+    println!("{x}");
 }
 
 #[unsafe(no_mangle)]

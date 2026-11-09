@@ -140,6 +140,52 @@ impl Compiler {
             }
 
             ExprKind::Call { callee, args, .. } => {
+                if let ExprKind::Identifier(fn_name) = &callee.kind {
+                    if fn_name == "Ok" || fn_name == "Err" {
+                        let enum_name_idx = self.add_string_constant("Result");
+                        let variant_idx = self.add_string_constant(fn_name);
+                        let arg_refs: Vec<&Expr> = args.iter().collect();
+                        let first_value_reg = self.place_exprs_consecutive(&arg_refs)?;
+                        let result_reg = self.allocate_register();
+                        self.emit(
+                            Instruction::NewEnumVariant(
+                                result_reg,
+                                enum_name_idx,
+                                variant_idx,
+                                first_value_reg,
+                                args.len() as u8,
+                            ),
+                            0,
+                        );
+                        return Ok(result_reg);
+                    }
+                    if fn_name == "Some" {
+                        let enum_name_idx = self.add_string_constant("Option");
+                        let variant_idx = self.add_string_constant("Some");
+                        let arg_refs: Vec<&Expr> = args.iter().collect();
+                        let first_value_reg = self.place_exprs_consecutive(&arg_refs)?;
+                        let result_reg = self.allocate_register();
+                        self.emit(
+                            Instruction::NewEnumVariant(
+                                result_reg,
+                                enum_name_idx,
+                                variant_idx,
+                                first_value_reg,
+                                args.len() as u8,
+                            ),
+                            0,
+                        );
+                        return Ok(result_reg);
+                    }
+                    if fn_name == "None" {
+                        let enum_name_idx = self.add_string_constant("Option");
+                        let variant_idx = self.add_string_constant("None");
+                        let result_reg = self.allocate_register();
+                        self.emit(Instruction::NewEnumUnit(result_reg, enum_name_idx, variant_idx), 0);
+                        return Ok(result_reg);
+                    }
+                }
+
                 if let ExprKind::FieldAccess { object, field } = &callee.kind
                     && let ExprKind::Identifier(type_name) = &object.kind
                 {

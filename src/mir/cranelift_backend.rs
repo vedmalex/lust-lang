@@ -63,6 +63,11 @@ pub mod jit_engine {
             builder.symbol("lust_mir_min_int", lust_mir_min_int as *const u8);
             builder.symbol("lust_mir_max_int", lust_mir_max_int as *const u8);
             builder.symbol("lust_mir_clamp_int", lust_mir_clamp_int as *const u8);
+            builder.symbol("lust_mir_get_status", lust_mir_get_status as *const u8);
+            builder.symbol("lust_mir_set_status", lust_mir_set_status as *const u8);
+            builder.symbol("lust_mir_print_int", lust_mir_print_int as *const u8);
+            builder.symbol("lust_mir_div_int", lust_mir_div_int as *const u8);
+            builder.symbol("lust_mir_rem_int", lust_mir_rem_int as *const u8);
             let module = JITModule::new(builder);
 
             Ok(Self {
@@ -159,9 +164,24 @@ pub mod jit_engine {
             // Declare lust_mir_charge_gas import
             let mut gas_sig = self.module.make_signature();
             gas_sig.params.push(AbiParam::new(types::I64));
+            gas_sig.returns.push(AbiParam::new(types::I64));
             let gas_callee = self
                 .module
                 .declare_function("lust_mir_charge_gas", Linkage::Import, &gas_sig)
+                .map_err(|e| MirCraneliftBackendError::CodegenError(format!("{e}")))?;
+
+            let mut status_sig = self.module.make_signature();
+            status_sig.returns.push(AbiParam::new(types::I64));
+            let status_callee = self
+                .module
+                .declare_function("lust_mir_get_status", Linkage::Import, &status_sig)
+                .map_err(|e| MirCraneliftBackendError::CodegenError(format!("{e}")))?;
+
+            let mut print_sig = self.module.make_signature();
+            print_sig.params.push(AbiParam::new(types::I64));
+            let print_callee = self
+                .module
+                .declare_function("lust_mir_print_int", Linkage::Import, &print_sig)
                 .map_err(|e| MirCraneliftBackendError::CodegenError(format!("{e}")))?;
 
             // Declare binop helpers
@@ -178,6 +198,16 @@ pub mod jit_engine {
             let pow_callee = self
                 .module
                 .declare_function("lust_mir_pow_int", Linkage::Import, &binop_sig)
+                .map_err(|e| MirCraneliftBackendError::CodegenError(format!("{e}")))?;
+
+            let div_callee = self
+                .module
+                .declare_function("lust_mir_div_int", Linkage::Import, &binop_sig)
+                .map_err(|e| MirCraneliftBackendError::CodegenError(format!("{e}")))?;
+
+            let rem_callee = self
+                .module
+                .declare_function("lust_mir_rem_int", Linkage::Import, &binop_sig)
                 .map_err(|e| MirCraneliftBackendError::CodegenError(format!("{e}")))?;
 
             // Declare builtin call helpers
@@ -225,8 +255,13 @@ pub mod jit_engine {
                 let mut builder = FunctionBuilder::new(&mut self.ctx.func, &mut self.builder_ctx);
                 let alloc_fn = self.module.declare_func_in_func(alloc_callee, &mut builder.func);
                 let gas_fn = self.module.declare_func_in_func(gas_callee, &mut builder.func);
+                let status_fn = self.module.declare_func_in_func(status_callee, &mut builder.func);
+                let print_fn = self.module.declare_func_in_func(print_callee, &mut builder.func);
                 let floordiv_fn = self.module.declare_func_in_func(floordiv_callee, &mut builder.func);
                 let pow_fn = self.module.declare_func_in_func(pow_callee, &mut builder.func);
+                let div_fn = self.module.declare_func_in_func(div_callee, &mut builder.func);
+                let rem_fn = self.module.declare_func_in_func(rem_callee, &mut builder.func);
+                let emergency_exit_bb = builder.create_block();
 
                 // Create CLIF blocks corresponding 1-to-1 to MIR basic blocks
                 let mut clif_blocks = Vec::new();
@@ -260,11 +295,11 @@ pub mod jit_engine {
                     for stmt in &mir_block.statements {
                         match stmt {
                             Statement::Assign(Place::Local(dst), rvalue, _) => {
-                                let val = lower_rvalue(rvalue, &mut builder, &local_vars, alloc_fn, floordiv_fn, pow_fn)?;
+                                let val = lower_rvalue(rvalue, &mut builder, &local_vars, alloc_fn, floordiv_fn, pow_fn, div_fn, rem_fn)?;
                                 builder.def_var(local_vars[dst.0], val);
                             }
                             Statement::Assign(Place::Index(base, idx), rvalue, _) => {
-                                let val = lower_rvalue(rvalue, &mut builder, &local_vars, alloc_fn, floordiv_fn, pow_fn)?;
+                                let val = lower_rvalue(rvalue, &mut builder, &local_vars, alloc_fn, floordiv_fn, pow_fn, div_fn, rem_fn)?;
                                 let base_ptr = lower_place(base, &mut builder, &local_vars);
                                 let idx_val = builder.use_var(local_vars[idx.0]);
                                 let eight = builder.ins().iconst(types::I64, 8);
@@ -275,13 +310,18 @@ pub mod jit_engine {
                                 builder.ins().store(MemFlagsData::trusted(), val, elem_addr, 0);
                             }
                             Statement::Assign(Place::Field(base, field_idx), rvalue, _) => {
-                                let val = lower_rvalue(rvalue, &mut builder, &local_vars, alloc_fn, floordiv_fn, pow_fn)?;
+                                let val = lower_rvalue(rvalue, &mut builder, &local_vars, alloc_fn, floordiv_fn, pow_fn, div_fn, rem_fn)?;
                                 let base_ptr = lower_place(base, &mut builder, &local_vars);
                                 builder.ins().store(MemFlagsData::trusted(), val, base_ptr, 16 + (*field_idx as i32) * 8);
                             }
                             Statement::ResourceCheck(ResourceKind::Gas, amt, _) => {
                                 let amt_val = builder.ins().iconst(types::I64, *amt as i64);
-                                builder.ins().call(gas_fn, &[amt_val]);
+                                let call_inst = builder.ins().call(gas_fn, &[amt_val]);
+                                let rem = builder.inst_results(call_inst)[0];
+                                let is_neg = builder.ins().icmp_imm_s(IntCC::SignedLessThan, rem, 0);
+                                let cont_bb = builder.create_block();
+                                builder.ins().brif(is_neg, emergency_exit_bb, &[], cont_bb, &[]);
+                                builder.switch_to_block(cont_bb);
                             }
                             _ => {}
                         }
@@ -307,61 +347,85 @@ pub mod jit_engine {
                                 builder.ins().jump(clif_blocks[default.0], &[]);
                             }
                             Terminator::Call { callee, args, destination, success, .. } => {
-                                let (callee_func_id, param_count) = match callee.as_str() {
-                                    "math.abs" | "abs" => (abs_callee, 1),
-                                    "math.min" | "min" => (min_callee, 2),
-                                    "math.max" | "max" => (max_callee, 2),
-                                    "math.clamp" | "clamp" => (clamp_callee, 3),
-                                    "table.len" | "array.len" => (len_callee, 1),
-                                    _ => {
-                                        if let Some(&fid) = module_funcs.get(callee) {
-                                            (fid, args.len())
-                                        } else {
-                                            let mut call_sig = self.module.make_signature();
-                                            for _ in 0..args.len() {
-                                                call_sig.params.push(AbiParam::new(types::I64));
-                                            }
-                                            call_sig.returns.push(AbiParam::new(types::I64));
-                                            let fid = self.module
-                                                .declare_function(callee, Linkage::Import, &call_sig)
-                                                .map_err(|e| MirCraneliftBackendError::CodegenError(format!("{e}")))?;
-                                            (fid, args.len())
-                                        }
-                                    }
-                                };
-                                let callee_ref = self.module.declare_func_in_func(callee_func_id, &mut builder.func);
-                                let mut arg_vals = Vec::with_capacity(param_count);
-                                for a in args {
-                                    arg_vals.push(lower_operand(a, &mut builder, &local_vars)?);
-                                }
-                                while arg_vals.len() < param_count {
-                                    arg_vals.push(builder.ins().iconst(types::I64, 0));
-                                }
-                                let call_inst = builder.ins().call(callee_ref, &arg_vals);
-                                let ret_vals = builder.inst_results(call_inst);
-                                if !ret_vals.is_empty() {
-                                    let res_val = ret_vals[0];
+                                if callee == "print" || callee == "println" {
+                                    let arg_val = if let Some(first) = args.first() {
+                                        lower_operand(first, &mut builder, &local_vars)?
+                                    } else {
+                                        builder.ins().iconst(types::I64, 0)
+                                    };
+                                    builder.ins().call(print_fn, &[arg_val]);
                                     match destination {
                                         Place::Local(loc) => {
-                                            builder.def_var(local_vars[loc.0], res_val);
+                                            let zero = builder.ins().iconst(types::I64, 0);
+                                            builder.def_var(local_vars[loc.0], zero);
                                         }
-                                        Place::Index(base, idx) => {
-                                            let base_ptr = lower_place(base, &mut builder, &local_vars);
-                                            let idx_val = builder.use_var(local_vars[idx.0]);
-                                            let eight = builder.ins().iconst(types::I64, 8);
-                                            let byte_idx = builder.ins().imul(idx_val, eight);
-                                            let sixteen = builder.ins().iconst(types::I64, 16);
-                                            let offset = builder.ins().iadd(byte_idx, sixteen);
-                                            let elem_addr = builder.ins().iadd(base_ptr, offset);
-                                            builder.ins().store(MemFlagsData::trusted(), res_val, elem_addr, 0);
+                                        _ => {}
+                                    }
+                                    builder.ins().jump(clif_blocks[success.0], &[]);
+                                } else {
+                                    let (callee_func_id, param_count) = match callee.as_str() {
+                                        "math.abs" | "abs" => (abs_callee, 1),
+                                        "math.min" | "min" => (min_callee, 2),
+                                        "math.max" | "max" => (max_callee, 2),
+                                        "math.clamp" | "clamp" => (clamp_callee, 3),
+                                        "table.len" | "array.len" => (len_callee, 1),
+                                        _ => {
+                                            if let Some(&fid) = module_funcs.get(callee) {
+                                                (fid, args.len())
+                                            } else {
+                                                let mut call_sig = self.module.make_signature();
+                                                for _ in 0..args.len() {
+                                                    call_sig.params.push(AbiParam::new(types::I64));
+                                                }
+                                                call_sig.returns.push(AbiParam::new(types::I64));
+                                                let fid = self.module
+                                                    .declare_function(callee, Linkage::Import, &call_sig)
+                                                    .map_err(|e| MirCraneliftBackendError::CodegenError(format!("{e}")))?;
+                                                (fid, args.len())
+                                            }
                                         }
-                                        Place::Field(base, field_idx) => {
-                                            let base_ptr = lower_place(base, &mut builder, &local_vars);
-                                            builder.ins().store(MemFlagsData::trusted(), res_val, base_ptr, 16 + (*field_idx as i32) * 8);
+                                    };
+                                    let callee_ref = self.module.declare_func_in_func(callee_func_id, &mut builder.func);
+                                    let mut arg_vals = Vec::with_capacity(param_count);
+                                    for a in args {
+                                        arg_vals.push(lower_operand(a, &mut builder, &local_vars)?);
+                                    }
+                                    while arg_vals.len() < param_count {
+                                        arg_vals.push(builder.ins().iconst(types::I64, 0));
+                                    }
+                                    let call_inst = builder.ins().call(callee_ref, &arg_vals);
+                                    let ret_vals = builder.inst_results(call_inst);
+                                    if !ret_vals.is_empty() {
+                                        let res_val = ret_vals[0];
+                                        match destination {
+                                            Place::Local(loc) => {
+                                                builder.def_var(local_vars[loc.0], res_val);
+                                            }
+                                            Place::Index(base, idx) => {
+                                                let base_ptr = lower_place(base, &mut builder, &local_vars);
+                                                let idx_val = builder.use_var(local_vars[idx.0]);
+                                                let eight = builder.ins().iconst(types::I64, 8);
+                                                let byte_idx = builder.ins().imul(idx_val, eight);
+                                                let sixteen = builder.ins().iconst(types::I64, 16);
+                                                let offset = builder.ins().iadd(byte_idx, sixteen);
+                                                let elem_addr = builder.ins().iadd(base_ptr, offset);
+                                                builder.ins().store(MemFlagsData::trusted(), res_val, elem_addr, 0);
+                                            }
+                                            Place::Field(base, field_idx) => {
+                                                let base_ptr = lower_place(base, &mut builder, &local_vars);
+                                                builder.ins().store(MemFlagsData::trusted(), res_val, base_ptr, 16 + (*field_idx as i32) * 8);
+                                            }
                                         }
                                     }
+                                    let stat_call = builder.ins().call(status_fn, &[]);
+                                    let stat_val = builder.inst_results(stat_call)[0];
+                                    let is_err = builder.ins().icmp_imm_s(IntCC::NotEqual, stat_val, 0);
+                                    let call_cont_bb = builder.create_block();
+                                    builder.ins().brif(is_err, emergency_exit_bb, &[], call_cont_bb, &[]);
+                                    builder.switch_to_block(call_cont_bb);
+
+                                    builder.ins().jump(clif_blocks[success.0], &[]);
                                 }
-                                builder.ins().jump(clif_blocks[success.0], &[]);
                             }
                             Terminator::Return(opt_op, _) => {
                                 if ret_clif_ty != types::I8 || mir_fn.signature.return_type != MirType::Unit {
@@ -388,6 +452,14 @@ pub mod jit_engine {
                             }
                         }
                     }
+                }
+
+                builder.switch_to_block(emergency_exit_bb);
+                if ret_clif_ty != types::I8 || mir_fn.signature.return_type != MirType::Unit {
+                    let ret_val = builder.ins().iconst(ret_clif_ty, 0);
+                    builder.ins().return_(&[ret_val]);
+                } else {
+                    builder.ins().return_(&[]);
                 }
 
                 builder.seal_all_blocks();
@@ -461,6 +533,8 @@ pub mod jit_engine {
         alloc_fn: FuncRef,
         floordiv_fn: FuncRef,
         pow_fn: FuncRef,
+        div_fn: FuncRef,
+        rem_fn: FuncRef,
     ) -> Result<ClifValue, MirCraneliftBackendError> {
         match rval {
             Rvalue::Use(op) => lower_operand(op, builder, local_vars),
@@ -471,8 +545,14 @@ pub mod jit_engine {
                     MirBinaryOp::Add => builder.ins().iadd(l, r),
                     MirBinaryOp::Sub => builder.ins().isub(l, r),
                     MirBinaryOp::Mul => builder.ins().imul(l, r),
-                    MirBinaryOp::Div => builder.ins().sdiv(l, r),
-                    MirBinaryOp::Mod => builder.ins().srem(l, r),
+                    MirBinaryOp::Div => {
+                        let call = builder.ins().call(div_fn, &[l, r]);
+                        builder.inst_results(call)[0]
+                    }
+                    MirBinaryOp::Mod => {
+                        let call = builder.ins().call(rem_fn, &[l, r]);
+                        builder.inst_results(call)[0]
+                    }
                     MirBinaryOp::FloorDiv => {
                         let call = builder.ins().call(floordiv_fn, &[l, r]);
                         builder.inst_results(call)[0]

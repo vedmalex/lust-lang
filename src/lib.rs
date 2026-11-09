@@ -71,3 +71,4 @@ pub use packages::{
 pub use parser::Parser;
 pub use typechecker::{FunctionSignature, TypeChecker, TypeCollection};
 pub use vm::{NativeExport, NativeExportParam, VM};
+pub use hashbrown;

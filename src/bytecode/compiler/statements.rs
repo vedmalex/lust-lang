@@ -628,6 +628,66 @@ impl Compiler {
             _ => Some(iterator),
         };
         if variables.len() == 1
+            && let ExprKind::Range { start, end, inclusive } = &iterator.kind
+        {
+            self.begin_scope();
+            let start_reg = self.compile_expr(start)?;
+            let end_reg = self.compile_expr(end)?;
+            let var_reg = self.next_local_slot();
+            self.emit(Instruction::Move(var_reg, start_reg), 0);
+            self.free_register(start_reg);
+            if let Some(scope) = self.scopes.last_mut() {
+                scope.locals.insert(variables[0].clone(), (var_reg, false));
+            }
+
+            let loop_start = self.current_chunk().instructions.len();
+            let cond_reg = self.allocate_register();
+            if *inclusive {
+                self.emit(Instruction::LeInt(cond_reg, var_reg, end_reg), 0);
+            } else {
+                self.emit(Instruction::LtInt(cond_reg, var_reg, end_reg), 0);
+            }
+            let jump_to_end = self.emit(Instruction::JumpIfNot(cond_reg, 0), 0);
+            self.free_register(cond_reg);
+            self.loop_contexts.push(LoopContext {
+                continue_target: None,
+                continue_jumps: Vec::new(),
+                break_jumps: Vec::new(),
+            });
+
+            for stmt in body {
+                self.compile_stmt(stmt)?;
+            }
+
+            let loop_ctx = self.loop_contexts.pop().unwrap();
+            let increment_pos = self.current_chunk().instructions.len();
+            let one_reg = self.allocate_register();
+            let one_idx = self.add_int_const(1);
+            self.emit(Instruction::LoadConst(one_reg, one_idx), 0);
+            let tmp_reg = self.allocate_register();
+            let increment = self.emit(Instruction::AddInt(tmp_reg, var_reg, one_reg), 0);
+            self.move_result(var_reg, tmp_reg, increment);
+            self.free_register(tmp_reg);
+            self.free_register(one_reg);
+            for continue_jump in loop_ctx.continue_jumps {
+                self.current_chunk_mut()
+                    .patch_jump(continue_jump, increment_pos);
+            }
+
+            self.emit_jump_back_to(loop_start);
+            let end_pos = self.current_chunk().instructions.len();
+            self.current_chunk_mut().patch_jump(jump_to_end, end_pos);
+            for b in loop_ctx.break_jumps {
+                self.current_chunk_mut().patch_jump(b, end_pos);
+            }
+
+            self.free_register(end_reg);
+            self.free_register(var_reg);
+            self.end_scope();
+            return Ok(());
+        }
+
+        if variables.len() == 1
             && let Some(arr_expr) = array_receiver_expr
         {
             self.begin_scope();

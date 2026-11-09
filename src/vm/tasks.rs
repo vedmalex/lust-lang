@@ -721,7 +721,7 @@ impl VM {
             Value::Enum(object) if object.enum_name == "Option" => match method_name {
                 "is_some" => Ok(Value::Bool(object.variant == "Some")),
                 "is_none" => Ok(Value::Bool(object.variant == "None")),
-                "unwrap" => {
+                "unwrap" | "try_unwrap" => {
                     if object.variant == "Some" {
                         if let Some(vals) = &object.values {
                             if !vals.is_empty() {
@@ -772,7 +772,7 @@ impl VM {
             Value::Enum(object) if object.enum_name == "Result" => match method_name {
                 "is_ok" => Ok(Value::Bool(object.variant == "Ok")),
                 "is_err" => Ok(Value::Bool(object.variant == "Err")),
-                "unwrap" => {
+                "unwrap" | "try_unwrap" => {
                     if object.variant == "Ok" {
                         if let Some(vals) = &object.values {
                             if !vals.is_empty() {
@@ -882,13 +882,18 @@ impl VM {
                     message: format!("Iterator has no method '{}'", method_name),
                 }),
             },
-            _ => Err(LustError::RuntimeError {
-                message: format!(
-                    "Type {:?} has no method '{}'",
-                    object.type_of(),
-                    method_name
-                ),
-            }),
+            _ => {
+                if method_name == "try_unwrap" {
+                    return Ok(object.clone());
+                }
+                Err(LustError::RuntimeError {
+                    message: format!(
+                        "Type {:?} has no method '{}'",
+                        object.type_of(),
+                        method_name
+                    ),
+                })
+            }
         }
     }
 

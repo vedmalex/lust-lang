@@ -2018,7 +2018,7 @@ type CompiledProgram = (
     Vec<lust::bytecode::Function>,
     Vec<(String, String)>,
     Vec<(String, String)>,
-    hashbrown::HashMap<String, lust::ast::StructDef>,
+    lust::hashbrown::HashMap<String, lust::ast::StructDef>,
 );
 
 fn compile_program(
@@ -2031,7 +2031,7 @@ fn compile_program(
         &[PreparedRustDependency],
     >,
 ) -> Result<CompiledProgram, lust::LustError> {
-    use hashbrown::{HashMap, HashSet};
+    use lust::hashbrown::{HashMap, HashSet};
 
     let entry_path = Path::new(entry_filename);
     let entry_dir = entry_path.parent().unwrap_or_else(|| Path::new("."));
