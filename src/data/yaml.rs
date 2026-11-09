@@ -5,6 +5,8 @@ use std::fmt;
 pub const MAX_YAML_BYTES: usize = 33_554_432; // 32 MiB
 pub const MAX_YAML_NODES: usize = 1_000_000;
 pub const MAX_EXPANSION_RATIO: f64 = 10.0;
+pub const MAX_YAML_ALIASES: usize = 1_000;
+pub const MAX_YAML_EDGES: usize = 10_000;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum YamlError {
@@ -13,12 +15,16 @@ pub enum YamlError {
     DuplicateKey(String),
     CyclicReference(String),
     ForwardReference(String),
+    CrossDocumentAnchorReference(String),
     UnsupportedTag(String),
     MaxBytesExceeded(usize),
     MaxNodesExceeded(usize),
+    MaxAliasesExceeded(usize),
+    MaxEdgesExceeded(usize),
     AmplificationLimitExceeded { b0: usize, bexp: usize, ratio: f64 },
     NodeAmplificationLimitExceeded { n0: usize, nexp: usize, ratio: f64 },
     SyntaxError(String),
+    UnconsumedTrailingJunk(String),
 }
 
 impl fmt::Display for YamlError {
@@ -29,9 +35,14 @@ impl fmt::Display for YamlError {
             YamlError::DuplicateKey(k) => write!(f, "Duplicate key '{}' rejected in YAML map", k),
             YamlError::CyclicReference(a) => write!(f, "Cyclic alias reference to anchor '&{}' rejected", a),
             YamlError::ForwardReference(a) => write!(f, "Forward alias reference to undeclared anchor '&{}' rejected", a),
+            YamlError::CrossDocumentAnchorReference(a) => {
+                write!(f, "Cross-document alias reference to anchor '&{}' rejected", a)
+            }
             YamlError::UnsupportedTag(tag) => write!(f, "Arbitrary YAML tag '{}' rejected by LustSafeYaml12", tag),
             YamlError::MaxBytesExceeded(b) => write!(f, "YAML document bytes {} exceeded maximum {}", b, MAX_YAML_BYTES),
             YamlError::MaxNodesExceeded(n) => write!(f, "YAML document nodes {} exceeded maximum {}", n, MAX_YAML_NODES),
+            YamlError::MaxAliasesExceeded(a) => write!(f, "YAML alias count {} exceeded maximum budget {}", a, MAX_YAML_ALIASES),
+            YamlError::MaxEdgesExceeded(e) => write!(f, "YAML DAG edge count {} exceeded maximum budget {}", e, MAX_YAML_EDGES),
             YamlError::AmplificationLimitExceeded { b0, bexp, ratio } => {
                 write!(f, "YAML expansion ratio {:.1}x (B0={}, Bexp={}) exceeded maximum 10.0x cap", ratio, b0, bexp)
             }
@@ -39,6 +50,7 @@ impl fmt::Display for YamlError {
                 write!(f, "YAML node expansion ratio {:.1}x (N0={}, Nexp={}) exceeded maximum 10.0x cap", ratio, n0, nexp)
             }
             YamlError::SyntaxError(msg) => write!(f, "YAML syntax error: {}", msg),
+            YamlError::UnconsumedTrailingJunk(msg) => write!(f, "Unconsumed trailing junk in YAML input: {}", msg),
         }
     }
 }
@@ -56,6 +68,9 @@ enum RawYamlNode {
 pub struct LustSafeYaml12 {
     allow_aliases: bool,
     anchors: HashMap<String, RawYamlNode>,
+    alias_count: usize,
+    edge_count: usize,
+    past_anchors: std::collections::HashSet<String>,
 }
 
 impl LustSafeYaml12 {
@@ -63,6 +78,9 @@ impl LustSafeYaml12 {
         Self {
             allow_aliases: false,
             anchors: HashMap::new(),
+            alias_count: 0,
+            edge_count: 0,
+            past_anchors: std::collections::HashSet::new(),
         }
     }
 
@@ -73,19 +91,78 @@ impl LustSafeYaml12 {
 
     pub fn parse(&mut self, input: &str) -> Result<DataValue, YamlError> {
         self.anchors.clear();
+        self.alias_count = 0;
+        self.edge_count = 0;
+        self.past_anchors.clear();
+
         if input.len() > MAX_YAML_BYTES {
             return Err(YamlError::MaxBytesExceeded(input.len()));
         }
 
-        // Basic line-based YAML parser supporting Safe profile, anchors, aliases, maps, sequences
+        self.parse_single_doc(input)
+    }
+
+    pub fn parse_documents(&mut self, input: &str) -> Result<Vec<DataValue>, YamlError> {
+        if input.len() > MAX_YAML_BYTES {
+            return Err(YamlError::MaxBytesExceeded(input.len()));
+        }
+
+        self.anchors.clear();
+        self.alias_count = 0;
+        self.edge_count = 0;
+        self.past_anchors.clear();
+
+        let chunks = split_yaml_documents(input);
+        let mut docs = Vec::new();
+
+        for chunk in chunks {
+            let trimmed = chunk.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+
+            // CRITICAL: Anchors must not resolve across documents. Record prior anchors to detect cross-doc references.
+            for k in self.anchors.keys() {
+                self.past_anchors.insert(k.clone());
+            }
+            self.anchors.clear();
+            self.alias_count = 0;
+            self.edge_count = 0;
+
+            let doc = self.parse_single_doc(trimmed)?;
+            docs.push(doc);
+        }
+
+        Ok(docs)
+    }
+
+    fn parse_single_doc(&mut self, input: &str) -> Result<DataValue, YamlError> {
         let lines: Vec<&str> = input.lines().collect();
         let mut idx = 0;
+
+        // Skip leading document start marker if present
+        while idx < lines.len() {
+            let trimmed = lines[idx].trim();
+            if trimmed.is_empty() || trimmed.starts_with('#') {
+                idx += 1;
+                continue;
+            }
+            if trimmed == "---" {
+                idx += 1;
+            }
+            break;
+        }
+
         let raw_root = self.parse_lines(&lines, &mut idx, 0)?;
 
         while idx < lines.len() {
             let trimmed = lines[idx].trim();
             if !trimmed.is_empty() && !trimmed.starts_with('#') {
-                return Err(YamlError::SyntaxError(format!("unconsumed input: {}", lines[idx])));
+                if trimmed == "..." {
+                    idx += 1;
+                    continue;
+                }
+                return Err(YamlError::UnconsumedTrailingJunk(lines[idx].to_string()));
             }
             idx += 1;
         }
@@ -95,14 +172,17 @@ impl LustSafeYaml12 {
         let b0 = b0.max(1);
         let n0 = n0.max(1);
 
+        self.alias_count = 0;
+        self.edge_count = 0;
         let (bexp, nexp) = self.calculate_expanded_weights(&raw_root, &mut Vec::new())?;
 
         let byte_ratio = bexp as f64 / b0 as f64;
-        if byte_ratio > MAX_EXPANSION_RATIO {
+        let input_ratio = bexp as f64 / input.len().max(1) as f64;
+        if byte_ratio > MAX_EXPANSION_RATIO || input_ratio > MAX_EXPANSION_RATIO {
             return Err(YamlError::AmplificationLimitExceeded {
                 b0,
                 bexp,
-                ratio: byte_ratio,
+                ratio: byte_ratio.max(input_ratio),
             });
         }
 
@@ -148,7 +228,7 @@ impl LustSafeYaml12 {
     }
 
     fn calculate_expanded_weights(
-        &self,
+        &mut self,
         node: &RawYamlNode,
         visiting: &mut Vec<String>,
     ) -> Result<(usize, usize), YamlError> {
@@ -158,12 +238,29 @@ impl LustSafeYaml12 {
                 if !self.allow_aliases {
                     return Err(YamlError::SyntaxError(format!("Alias *{} rejected; aliases disabled by default", name)));
                 }
+                self.alias_count += 1;
+                if self.alias_count > MAX_YAML_ALIASES {
+                    return Err(YamlError::MaxAliasesExceeded(self.alias_count));
+                }
+                self.edge_count += 1;
+                if self.edge_count > MAX_YAML_EDGES {
+                    return Err(YamlError::MaxEdgesExceeded(self.edge_count));
+                }
                 if visiting.contains(name) {
                     return Err(YamlError::CyclicReference(name.clone()));
                 }
-                let target = self.anchors.get(name).ok_or_else(|| YamlError::ForwardReference(name.clone()))?;
+                let target = match self.anchors.get(name) {
+                    Some(t) => t.clone(),
+                    None => {
+                        if self.past_anchors.contains(name) {
+                            return Err(YamlError::CrossDocumentAnchorReference(name.clone()));
+                        } else {
+                            return Err(YamlError::ForwardReference(name.clone()));
+                        }
+                    }
+                };
                 visiting.push(name.clone());
-                let res = self.calculate_expanded_weights(target, visiting);
+                let res = self.calculate_expanded_weights(&target, visiting);
                 visiting.pop();
                 res
             }
@@ -293,6 +390,11 @@ impl LustSafeYaml12 {
                     *idx += 1;
                     let val_node = if raw_val.is_empty() {
                         self.parse_lines(lines, idx, indent + 2)?
+                    } else if raw_val.starts_with('&') && !raw_val.contains(' ') {
+                        let anchor_name = raw_val[1..].trim().to_string();
+                        let inner = self.parse_lines(lines, idx, indent + 2)?;
+                        self.anchors.insert(anchor_name, inner.clone());
+                        inner
                     } else {
                         self.parse_single_value(raw_val)?
                     };
@@ -371,6 +473,32 @@ fn parse_yaml_scalar(s: &str) -> DataValue {
     }
 }
 
+fn split_yaml_documents(input: &str) -> Vec<String> {
+    let mut docs = Vec::new();
+    let mut current = String::new();
+    for line in input.lines() {
+        let trimmed = line.trim();
+        if trimmed == "---" {
+            if !current.trim().is_empty() {
+                docs.push(current);
+                current = String::new();
+            }
+        } else if trimmed == "..." {
+            if !current.trim().is_empty() {
+                docs.push(current);
+                current = String::new();
+            }
+        } else {
+            current.push_str(line);
+            current.push('\n');
+        }
+    }
+    if !current.trim().is_empty() {
+        docs.push(current);
+    }
+    docs
+}
+
 pub fn from_str(input: &str) -> Result<DataValue, YamlError> {
     let mut parser = LustSafeYaml12::new();
     parser.parse(input)
@@ -380,3 +508,14 @@ pub fn from_str_with_aliases(input: &str) -> Result<DataValue, YamlError> {
     let mut parser = LustSafeYaml12::new().with_opt_in_aliases();
     parser.parse(input)
 }
+
+pub fn parse_documents(input: &str) -> Result<Vec<DataValue>, YamlError> {
+    let mut parser = LustSafeYaml12::new();
+    parser.parse_documents(input)
+}
+
+pub fn parse_documents_with_aliases(input: &str) -> Result<Vec<DataValue>, YamlError> {
+    let mut parser = LustSafeYaml12::new().with_opt_in_aliases();
+    parser.parse_documents(input)
+}
+

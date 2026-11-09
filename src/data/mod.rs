@@ -28,6 +28,7 @@ pub mod value;
 pub mod view;
 pub mod yaml;
 
+pub use bson::{BsonArrayView, BsonDocumentView, BsonElementIter, BsonError, BsonValueView};
 pub use budget::{BudgetError, BudgetTracker};
 pub use document::{Document, DuplicateKeyError};
 pub use jsonl::{
@@ -43,6 +44,9 @@ pub use materialize::{
 };
 pub use number::{DataError, DateTimeUtc, Decimal128, ExactNumber, ObjectId};
 pub use owner::{LeaseError, LeaseLifecycleState, OwnerId, OwnerRegistry, SlotEntry};
+pub use toon::{ToonCodec, ToonError, ToonTable};
 pub use value::DataValue;
 pub use view::DataView;
+pub use yaml::{LustSafeYaml12, YamlError};
+
 

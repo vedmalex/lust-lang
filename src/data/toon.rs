@@ -35,6 +35,137 @@ impl fmt::Display for ToonError {
 
 impl std::error::Error for ToonError {}
 
+/// Compact row/column tabular frontend for TOON
+#[derive(Debug, Clone, PartialEq)]
+pub struct ToonTable {
+    columns: Vec<String>,
+    rows: Vec<Document>,
+}
+
+impl ToonTable {
+    pub fn new(columns: Vec<String>, rows: Vec<Document>) -> Result<Self, ToonError> {
+        if columns.is_empty() {
+            return Err(ToonError::MissingHeader);
+        }
+        if columns.len() > MAX_COLUMNS {
+            return Err(ToonError::MaxColumnsExceeded(columns.len()));
+        }
+        // Verify unique columns
+        for (i, col) in columns.iter().enumerate() {
+            for other in &columns[i + 1..] {
+                if col == other {
+                    return Err(ToonError::DuplicateColumn(col.clone()));
+                }
+            }
+        }
+        if rows.len() > MAX_TABLE_ROWS {
+            return Err(ToonError::MaxRowsExceeded(rows.len()));
+        }
+        // Verify each row has matching columns
+        for (idx, row) in rows.iter().enumerate() {
+            if row.len() != columns.len() {
+                return Err(ToonError::ColumnMismatch {
+                    expected: columns.len(),
+                    found: row.len(),
+                    row: idx + 1,
+                });
+            }
+        }
+        Ok(Self { columns, rows })
+    }
+
+    /// Construct a table from columnar data (column names and corresponding column value vectors)
+    pub fn from_columns(columns: Vec<String>, columns_data: Vec<Vec<DataValue>>) -> Result<Self, ToonError> {
+        if columns.len() != columns_data.len() {
+            return Err(ToonError::ColumnMismatch {
+                expected: columns.len(),
+                found: columns_data.len(),
+                row: 0,
+            });
+        }
+        if columns.is_empty() {
+            return Err(ToonError::MissingHeader);
+        }
+        let row_count = columns_data[0].len();
+        for (idx, col_data) in columns_data.iter().enumerate() {
+            if col_data.len() != row_count {
+                return Err(ToonError::ColumnMismatch {
+                    expected: row_count,
+                    found: col_data.len(),
+                    row: idx + 1,
+                });
+            }
+        }
+
+        let mut rows = Vec::with_capacity(row_count);
+        for r in 0..row_count {
+            let mut doc = Document::new();
+            for (c, col_name) in columns.iter().enumerate() {
+                let _ = doc.try_insert(col_name.clone(), columns_data[c][r].clone());
+            }
+            rows.push(doc);
+        }
+
+        Self::new(columns, rows)
+    }
+
+    pub fn columns(&self) -> &[String] {
+        &self.columns
+    }
+
+    pub fn column_count(&self) -> usize {
+        self.columns.len()
+    }
+
+    pub fn row_count(&self) -> usize {
+        self.rows.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.rows.is_empty()
+    }
+
+    pub fn get_row(&self, index: usize) -> Option<&Document> {
+        self.rows.get(index)
+    }
+
+    pub fn get_cell(&self, row: usize, col: &str) -> Option<&DataValue> {
+        self.rows.get(row).and_then(|r| r.get(col))
+    }
+
+    /// Columnar slice accessor
+    pub fn column(&self, col: &str) -> Result<Vec<&DataValue>, ToonError> {
+        if !self.columns.iter().any(|c| c == col) {
+            return Err(ToonError::InvalidScalar(format!("unknown column: {}", col), 0));
+        }
+        let mut vals = Vec::with_capacity(self.rows.len());
+        for row in &self.rows {
+            if let Some(val) = row.get(col) {
+                vals.push(val);
+            } else {
+                vals.push(&DataValue::Null);
+            }
+        }
+        Ok(vals)
+    }
+
+    pub fn to_data_value(&self) -> DataValue {
+        DataValue::Array(self.rows.iter().cloned().map(DataValue::Document).collect())
+    }
+
+    pub fn to_documents(&self) -> &[Document] {
+        &self.rows
+    }
+
+    pub fn decode(input: &str) -> Result<Self, ToonError> {
+        ToonCodec::decode_table(input)
+    }
+
+    pub fn encode_compact(&self) -> Result<String, ToonError> {
+        ToonCodec::encode_table(self)
+    }
+}
+
 pub struct ToonCodec;
 
 impl ToonCodec {
@@ -90,6 +221,32 @@ impl ToonCodec {
         Ok(DataValue::Array(rows))
     }
 
+    pub fn decode_table(input: &str) -> Result<ToonTable, ToonError> {
+        let val = Self::decode(input)?;
+        match val {
+            DataValue::Array(rows) => {
+                let mut docs = Vec::with_capacity(rows.len());
+                let mut columns = Vec::new();
+                for (idx, r) in rows.into_iter().enumerate() {
+                    match r {
+                        DataValue::Document(d) => {
+                            if idx == 0 {
+                                columns = d.keys().cloned().collect();
+                            }
+                            docs.push(d);
+                        }
+                        _ => return Err(ToonError::InvalidScalar("Row is not a document".to_string(), idx + 1)),
+                    }
+                }
+                if columns.is_empty() && !docs.is_empty() {
+                    columns = docs[0].keys().cloned().collect();
+                }
+                ToonTable::new(columns, docs)
+            }
+            _ => Err(ToonError::EmptyInput),
+        }
+    }
+
     pub fn encode(value: &DataValue) -> Result<String, ToonError> {
         match value {
             DataValue::Array(rows) => {
@@ -138,6 +295,11 @@ impl ToonCodec {
             }
             _ => Ok(String::new()),
         }
+    }
+
+    pub fn encode_table(table: &ToonTable) -> Result<String, ToonError> {
+        let val = table.to_data_value();
+        Self::encode(&val)
     }
 }
 
@@ -252,3 +414,12 @@ pub fn from_str(input: &str) -> Result<DataValue, ToonError> {
 pub fn to_string(value: &DataValue) -> Result<String, ToonError> {
     ToonCodec::encode(value)
 }
+
+pub fn decode_table(input: &str) -> Result<ToonTable, ToonError> {
+    ToonCodec::decode_table(input)
+}
+
+pub fn encode_table(table: &ToonTable) -> Result<String, ToonError> {
+    ToonCodec::encode_table(table)
+}
+
