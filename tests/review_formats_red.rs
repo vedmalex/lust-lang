@@ -44,3 +44,21 @@ fn review_gate01_bson_nested_document_cannot_cross_parent_boundary() {
     ];
     assert!(bson::from_slice(&bytes).is_err(), "malformed nested document was accepted: {bytes:?}");
 }
+
+#[test]
+fn review_gate01_json_rejects_integer_overflow_narrowing() {
+    // Integer token 18446744073709551616 (2^64) exceeds integer lanes and must not narrow to f64
+    assert!(
+        json::from_str("18446744073709551616").is_err(),
+        "JSON integer token exceeding integer lanes must be rejected instead of narrowing to f64"
+    );
+}
+
+#[test]
+fn review_gate01_toon_rejects_integer_overflow_narrowing() {
+    // Integer token 9223372036854775808 (i64::MAX + 1) exceeds integer lane and must not narrow to f64
+    assert!(
+        toon::from_str("value\n9223372036854775808").is_err(),
+        "TOON integer token exceeding integer lane must be rejected instead of narrowing to f64"
+    );
+}

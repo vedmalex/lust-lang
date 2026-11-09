@@ -188,8 +188,22 @@ fn parse_scalar(s: &str, row: usize) -> Result<DataValue, ToonError> {
         "true" | "TRUE" => Ok(DataValue::Bool(true)),
         "false" | "FALSE" => Ok(DataValue::Bool(false)),
         other => {
-            if let Ok(i) = other.parse::<i64>() {
-                Ok(DataValue::Number(ExactNumber::Int(i)))
+            let is_integer = {
+                let trimmed = other.trim();
+                let without_sign = if let Some(stripped) = trimmed.strip_prefix('+').or_else(|| trimmed.strip_prefix('-')) {
+                    stripped
+                } else {
+                    trimmed
+                };
+                !without_sign.is_empty() && without_sign.chars().all(|c| c.is_ascii_digit())
+            };
+
+            if is_integer {
+                if let Ok(i) = other.parse::<i64>() {
+                    Ok(DataValue::Number(ExactNumber::Int(i)))
+                } else {
+                    Err(ToonError::InvalidScalar(other.to_string(), row))
+                }
             } else if let Ok(f) = other.parse::<f64>() {
                 if !f.is_finite() {
                     return Err(ToonError::InvalidScalar(other.to_string(), row));
