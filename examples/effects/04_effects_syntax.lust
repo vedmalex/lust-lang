@@ -1,0 +1,60 @@
+-- Lust Lang Effect System v2.0 - Syntax and Primitives Showcase
+-- Demonstrates Effect<A, E, R> type contracts, scoped resources, defer/errdefer, and lazy effect suspension.
+
+type HttpError = string
+type DbError = string
+
+-- Service interfaces
+type Network = { host: string }
+type Database = { connection_string: string }
+type Logger = { log_level: int }
+
+-- 1. Function with full algebraic effect signature:
+--    Returns: string
+--    Typed Error: HttpError (via `! HttpError`)
+--    Context Requirements: Network + Logger (via `~ (Network + Logger)`)
+function fetch_data(url: string): string ! HttpError ~ (Network + Logger)
+    -- Acquire resource safely
+    local fd = open_socket(url)
+    
+    -- Ensure socket closure regardless of normal or error exit (LIFO order)
+    defer close_socket(fd)
+    
+    -- Rollback or cleanup that only triggers if an error occurs
+    errdefer record_failure_metric("fetch_data", url)
+    
+    if url == "" then
+        return "empty url"
+    end
+    
+    return "response_body"
+end
+
+-- 2. Scoped lifecycle execution:
+--    A scoped block establishes a lifecycle boundary (Gate-NEG-02).
+--    Any resources acquired within are automatically finalized before exiting.
+function process_transaction(tx_id: int): bool ! DbError ~ Database
+    scoped do
+        local tx = begin_transaction(tx_id)
+        defer commit_or_rollback(tx)
+        
+        -- Business logic here
+        return true
+    end
+end
+
+-- 3. Lazy Effect Suspension:
+--    `effect do ... end` constructs a cold effect blueprint without executing it immediately.
+function create_pipeline(): Effect<int, string, Database>
+    local job = effect do
+        local count = query_record_count()
+        return count * 2
+    end
+    
+    return job
+end
+
+-- 4. Entrypoint demo
+function main(): ()
+    print("Lust Effect System v2.0 syntax validated.")
+end

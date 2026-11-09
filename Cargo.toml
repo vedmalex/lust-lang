@@ -79,6 +79,26 @@ name = "numeric"
 path = "benchmarks/numeric.rs"
 required-features = ["std"]
 
+[[example]]
+name = "effects_bench"
+path = "benchmarks/effects_bench.rs"
+required-features = ["std"]
+
+[[example]]
+name = "effects_basic"
+path = "examples/effects/01_basic_effects.rs"
+required-features = ["std"]
+
+[[example]]
+name = "effects_retry_repeat"
+path = "examples/effects/02_retry_and_repeat.rs"
+required-features = ["std"]
+
+[[example]]
+name = "effects_acquire_release"
+path = "examples/effects/03_acquire_release_and_scopes.rs"
+required-features = ["std"]
+
 [dependencies]
 dynasmrt = { version = "5.1.0", optional = true }
 serde = { version = "1.0.229", default-features = false, features = [

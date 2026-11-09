@@ -140,6 +140,14 @@ impl<A, E> Exit<A, E> {
         }
     }
 
+    /// Flat-maps successful values preserving failures.
+    pub fn and_then<B, F: FnOnce(A) -> Exit<B, E>>(self, f: F) -> Exit<B, E> {
+        match self {
+            Exit::Success(a) => f(a),
+            Exit::Failure(cause) => Exit::Failure(cause),
+        }
+    }
+
     /// Catches expected `Cause::Fail(e)`.
     /// INVARIANT: `Cause::Interrupt` and `Cause::Die` are STICKY and cannot be caught.
     pub fn catch<F: FnOnce(E) -> Exit<A, E>>(self, f: F) -> Exit<A, E> {
