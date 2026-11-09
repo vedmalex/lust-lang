@@ -530,8 +530,11 @@ impl ScheduleKind {
 }
 
 /// Executes an effect, retrying on standard failure `Cause::Fail` according to the given schedule.
-/// Invariant: `Cause::Die` and `Cause::Interrupted` (OutOfGas, Timeout, Cancelled) are fail-closed and NEVER retried.
-pub fn effect_retry<A, E, F>(mut effect_fn: F, schedule: &ScheduleKind) -> Exit<A, E>
+///
+/// Critical Invariant (Fail-Closed):
+/// `Cause::Die` (defects) and `Cause::Interrupted` / `Cause::Interrupt` (OutOfGas, Timeout, Cancelled, OOM)
+/// are fail-closed and strictly NEVER retried.
+pub fn retry<A, E, F>(mut effect_fn: F, schedule: &ScheduleKind) -> Exit<A, E>
 where
     F: FnMut() -> Exit<A, E>,
 {
@@ -556,9 +559,18 @@ where
     }
 }
 
+/// Backwards-compatible alias for `retry`.
+#[inline]
+pub fn effect_retry<A, E, F>(effect_fn: F, schedule: &ScheduleKind) -> Exit<A, E>
+where
+    F: FnMut() -> Exit<A, E>,
+{
+    retry(effect_fn, schedule)
+}
+
 /// Repeatedly executes an effect upon `Exit::Success` according to the given schedule.
 /// Halts immediately on any failure.
-pub fn effect_repeat<A, E, F>(mut effect_fn: F, schedule: &ScheduleKind) -> Exit<A, E>
+pub fn repeat<A, E, F>(mut effect_fn: F, schedule: &ScheduleKind) -> Exit<A, E>
 where
     F: FnMut() -> Exit<A, E>,
 {
@@ -579,6 +591,57 @@ where
     }
 }
 
+/// Backwards-compatible alias for `repeat`.
+#[inline]
+pub fn effect_repeat<A, E, F>(effect_fn: F, schedule: &ScheduleKind) -> Exit<A, E>
+where
+    F: FnMut() -> Exit<A, E>,
+{
+    repeat(effect_fn, schedule)
+}
+
+/// Executes an effect with a time limit in milliseconds.
+/// If execution exceeds `timeout_ms` (or timeout_ms == 0), returns
+/// `Exit::Failure(Cause::Interrupted(InterruptReason::Timeout))` with C-ABI status code 4.
+#[cfg(feature = "std")]
+pub fn timeout<A, E, F>(effect_fn: F, timeout_ms: u64) -> Exit<A, E>
+where
+    A: Send + 'static,
+    E: Send + 'static,
+    F: FnOnce() -> Exit<A, E> + Send + 'static,
+{
+    if timeout_ms == 0 {
+        return Exit::Failure(Cause::Interrupted(InterruptReason::Timeout));
+    }
+    let (tx, rx) = std::sync::mpsc::channel();
+    let duration = std::time::Duration::from_millis(timeout_ms);
+    std::thread::spawn(move || {
+        let res = effect_fn();
+        let _ = tx.send(res);
+    });
+    match rx.recv_timeout(duration) {
+        Ok(res) => res,
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+            Exit::Failure(Cause::Interrupted(InterruptReason::Timeout))
+        }
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+            Exit::Failure(Cause::Die("Effect thread disconnected unexpectedly".into()))
+        }
+    }
+}
+
+#[cfg(not(feature = "std"))]
+pub fn timeout<A, E, F>(effect_fn: F, timeout_ms: u64) -> Exit<A, E>
+where
+    F: FnOnce() -> Exit<A, E>,
+{
+    if timeout_ms == 0 {
+        Exit::Failure(Cause::Interrupted(InterruptReason::Timeout))
+    } else {
+        effect_fn()
+    }
+}
+
 /// Executes an effect with a timeout constraint.
 /// If `timed_out` flag is triggered or duration exceeds limit, returns `Exit::Failure(Cause::Interrupted(InterruptReason::Timeout))`.
 pub fn effect_timeout<A, E, F>(effect_fn: F, timed_out: bool) -> Exit<A, E>
@@ -592,10 +655,10 @@ where
     }
 }
 
-/// Executes `acquire` with interruption masked, registers `release` finalizer in `Scope`
-/// upon success, and unmasks interrupts. If an interrupt arrived during `acquire`,
-/// it is delivered upon exit from mask.
-pub fn effect_acquire_release<A, E, Acq, Rel>(
+/// Executes `acquire` with interruption masked (`FiberContext::enter_mask`),
+/// registers `release` finalizer in current `Scope` upon success, and unmasks interrupts (`FiberContext::exit_mask`).
+/// If an interrupt arrived during `acquire`, it is delivered upon exit from mask.
+pub fn acquire_release<A, E, Acq, Rel>(
     fiber: &mut FiberContext,
     scope: &mut Scope,
     acquire: Acq,
@@ -619,6 +682,85 @@ where
     }
 }
 
+/// Convenience variant of `acquire_release` where `acquire` takes no arguments.
+pub fn acquire_release_simple<A, E, Acq, Rel>(
+    fiber: &mut FiberContext,
+    scope: &mut Scope,
+    acquire: Acq,
+    release: Rel,
+) -> Exit<A, E>
+where
+    Acq: FnOnce() -> Exit<A, E>,
+    Rel: FnOnce() + 'static,
+{
+    acquire_release(fiber, scope, |_| acquire(), release)
+}
+
+/// Backwards-compatible alias for `acquire_release`.
+#[inline]
+pub fn effect_acquire_release<A, E, Acq, Rel>(
+    fiber: &mut FiberContext,
+    scope: &mut Scope,
+    acquire: Acq,
+    release: Rel,
+) -> Exit<A, E>
+where
+    Acq: FnOnce(&mut FiberContext) -> Exit<A, E>,
+    Rel: FnOnce() + 'static,
+{
+    acquire_release(fiber, scope, acquire, release)
+}
+
+impl FiberContext {
+    #[inline]
+    pub fn acquire_release<A, E, Acq, Rel>(
+        &mut self,
+        scope: &mut Scope,
+        acquire: Acq,
+        release: Rel,
+    ) -> Exit<A, E>
+    where
+        Acq: FnOnce(&mut FiberContext) -> Exit<A, E>,
+        Rel: FnOnce() + 'static,
+    {
+        acquire_release(self, scope, acquire, release)
+    }
+}
+
+impl Scope {
+    #[inline]
+    pub fn acquire_release<A, E, Acq, Rel>(
+        &mut self,
+        fiber: &mut FiberContext,
+        acquire: Acq,
+        release: Rel,
+    ) -> Exit<A, E>
+    where
+        Acq: FnOnce(&mut FiberContext) -> Exit<A, E>,
+        Rel: FnOnce() + 'static,
+    {
+        acquire_release(fiber, self, acquire, release)
+    }
+}
+
+impl ScheduleKind {
+    #[inline]
+    pub fn retry<A, E, F>(&self, effect_fn: F) -> Exit<A, E>
+    where
+        F: FnMut() -> Exit<A, E>,
+    {
+        retry(effect_fn, self)
+    }
+
+    #[inline]
+    pub fn repeat<A, E, F>(&self, effect_fn: F) -> Exit<A, E>
+    where
+        F: FnMut() -> Exit<A, E>,
+    {
+        repeat(effect_fn, self)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -630,7 +772,7 @@ mod tests {
         let attempts = Rc::new(RefCell::new(0));
         let attempts_clone = attempts.clone();
 
-        let res: Exit<i32, &'static str> = effect_retry(
+        let res: Exit<i32, &'static str> = retry(
             || {
                 *attempts_clone.borrow_mut() += 1;
                 Exit::Failure(Cause::Fail("transient error"))
@@ -638,7 +780,7 @@ mod tests {
             &ScheduleKind::recurs(2),
         );
 
-        assert_eq!(*attempts.borrow(), 3);
+        assert_eq!(*attempts.borrow(), 3, "retry with recurs(2) must attempt exactly 3 times (1 initial + 2 retries)");
         assert_eq!(res, Exit::Failure(Cause::Fail("transient error")));
     }
 
@@ -647,7 +789,7 @@ mod tests {
         let attempts = Rc::new(RefCell::new(0));
         let attempts_clone = attempts.clone();
 
-        let res: Exit<i32, &'static str> = effect_retry(
+        let res: Exit<i32, &'static str> = retry(
             || {
                 *attempts_clone.borrow_mut() += 1;
                 Exit::Failure(Cause::Interrupted(InterruptReason::OutOfGas))
@@ -655,9 +797,10 @@ mod tests {
             &ScheduleKind::recurs(5),
         );
 
-        // Exactly 1 attempt, interrupt cannot be retried!
-        assert_eq!(*attempts.borrow(), 1);
+        // Exactly 1 attempt, OutOfGas interruption cannot be retried!
+        assert_eq!(*attempts.borrow(), 1, "retry must fail-closed on OutOfGas with zero retries");
         assert_eq!(res, Exit::Failure(Cause::Interrupted(InterruptReason::OutOfGas)));
+        assert_eq!(res.status_code(), LUST_STATUS_ERR_OUT_OF_GAS);
     }
 
     #[test]
@@ -665,7 +808,7 @@ mod tests {
         let count = Rc::new(RefCell::new(0));
         let count_clone = count.clone();
 
-        let res: Exit<i32, ()> = effect_repeat(
+        let res: Exit<i32, ()> = repeat(
             || {
                 *count_clone.borrow_mut() += 1;
                 Exit::Success(*count_clone.borrow())
@@ -673,7 +816,7 @@ mod tests {
             &ScheduleKind::recurs(2),
         );
 
-        assert_eq!(*count.borrow(), 3);
+        assert_eq!(*count.borrow(), 3, "repeat with recurs(2) must execute exactly 3 times (1 initial + 2 repeats)");
         assert_eq!(res, Exit::Success(3));
     }
 
@@ -684,7 +827,7 @@ mod tests {
         let released = Rc::new(RefCell::new(false));
         let released_clone = released.clone();
 
-        let res: Exit<i32, &'static str> = effect_acquire_release(
+        let res: Exit<i32, &'static str> = acquire_release(
             &mut fiber,
             &mut scope,
             |fib| {
@@ -708,5 +851,17 @@ mod tests {
         // Teardown executes release
         scope.finalize_resources();
         assert!(*released.borrow());
+    }
+
+    #[test]
+    fn test_timeout_combinator() {
+        // Successful execution within timeout
+        let res: Exit<i32, &'static str> = timeout(|| Exit::Success(42), 1000);
+        assert_eq!(res, Exit::Success(42));
+
+        // Immediate zero timeout
+        let expired: Exit<i32, &'static str> = timeout(|| Exit::Success(99), 0);
+        assert_eq!(expired, Exit::Failure(Cause::Interrupted(InterruptReason::Timeout)));
+        assert_eq!(expired.status_code(), 4);
     }
 }
