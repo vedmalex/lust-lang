@@ -17,6 +17,7 @@ pub mod bson;
 pub mod budget;
 pub mod document;
 pub mod json;
+pub mod jsonc;
 pub mod layout;
 pub mod materialize;
 pub mod number;
