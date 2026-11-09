@@ -11,7 +11,7 @@ pub mod bytecode;
 pub mod config;
 #[cfg(feature = "std")]
 pub mod codegen_zig;
-#[cfg(feature = "std")]
+pub mod effect_abi;
 pub mod embed;
 pub mod error;
 #[cfg(feature = "std")]
@@ -46,6 +46,10 @@ pub use embed::{
     ValueRef, enum_variant, enum_variant_with, function_param, private_struct_field_decl,
     self_param, struct_field, struct_field_decl, trait_bound, type_named, type_unit, type_unknown,
     weak_struct_field_decl,
+};
+pub use effect_abi::{
+    Cause, Exit, LayerRollbackLedger, LustClosureObject, LustEffectDescriptor,
+    StackContextProjection,
 };
 pub use error::{LustError, Result};
 pub use jit::{JitCompiler, JitState, JitStats};

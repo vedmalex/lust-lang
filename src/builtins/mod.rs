@@ -1712,6 +1712,7 @@ pub fn is_virtual_std_module(module_path: &str) -> bool {
                 | "assert"
                 | "iter"
                 | "random"
+                | "effect"
         )
     } else {
         matches!(
@@ -1729,6 +1730,7 @@ pub fn is_virtual_std_module(module_path: &str) -> bool {
                 | "assert"
                 | "iter"
                 | "random"
+                | "effect"
         )
     }
 }
@@ -1750,6 +1752,7 @@ pub fn canonical_std_module_name(module_path: &str) -> &'static str {
         "assert" => "assert",
         "iter" => "iter",
         "random" => "random",
+        "effect" => "effect",
         _ => "unknown",
     }
 }
@@ -1757,6 +1760,17 @@ pub fn canonical_std_module_name(module_path: &str) -> &'static str {
 pub fn resolve_std_function(module_path: &str, item_name: &str) -> Option<&'static str> {
     let canon = canonical_std_module_name(module_path);
     match canon {
+        "effect" => match item_name {
+            "succeed" => Some("effect.succeed"),
+            "fail" => Some("effect.fail"),
+            "die" => Some("effect.die"),
+            "interrupt" => Some("effect.interrupt"),
+            "from_result" => Some("effect.from_result"),
+            "run_sync" => Some("effect.run_sync"),
+            "suspend" => Some("effect.suspend"),
+            "provide" => Some("effect.provide"),
+            _ => None,
+        },
         "math" => match item_name {
             "abs" => Some("math.abs"),
             "floor" => Some("math.floor"),
@@ -1893,6 +1907,16 @@ pub fn resolve_std_function(module_path: &str, item_name: &str) -> Option<&'stat
 pub fn virtual_std_module_functions(module_path: &str) -> Vec<(&'static str, &'static str)> {
     let canon = canonical_std_module_name(module_path);
     match canon {
+        "effect" => vec![
+            ("succeed", "effect.succeed"),
+            ("fail", "effect.fail"),
+            ("die", "effect.die"),
+            ("interrupt", "effect.interrupt"),
+            ("from_result", "effect.from_result"),
+            ("run_sync", "effect.run_sync"),
+            ("suspend", "effect.suspend"),
+            ("provide", "effect.provide"),
+        ],
         "math" => vec![
             ("abs", "math.abs"),
             ("floor", "math.floor"),

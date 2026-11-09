@@ -31,8 +31,16 @@ pub fn create_stdlib(config: &LustConfig, vm: &VM) -> Vec<(&'static str, Value)>
         ("table", create_table_module(vm)),
         ("map", create_map_module(vm)),
         ("math", create_math_module(vm)),
+        ("effect", create_effect_module(vm)),
 
         // Direct qualified entries for imported symbols
+        ("effect.succeed", create_effect_succeed_fn()),
+        ("effect.fail", create_effect_fail_fn()),
+        ("effect.die", create_effect_die_fn()),
+        ("effect.interrupt", create_effect_interrupt_fn()),
+        ("effect.from_result", create_effect_from_result_fn()),
+        ("effect.run_sync", create_effect_run_sync_fn()),
+        ("effect.suspend", create_effect_suspend_fn()),
         ("math.abs", create_math_abs_fn()),
         ("math.floor", create_math_floor_fn()),
         ("math.ceil", create_math_ceil_fn()),
@@ -1980,6 +1988,245 @@ fn create_table_module(vm: &VM) -> Value {
         (string_key("unpack"), create_table_unpack_fn()),
     ];
     vm.map_with_entries(entries)
+}
+
+fn create_effect_module(vm: &VM) -> Value {
+    let entries = [
+        (string_key("succeed"), create_effect_succeed_fn()),
+        (string_key("fail"), create_effect_fail_fn()),
+        (string_key("die"), create_effect_die_fn()),
+        (string_key("interrupt"), create_effect_interrupt_fn()),
+        (string_key("from_result"), create_effect_from_result_fn()),
+        (string_key("run_sync"), create_effect_run_sync_fn()),
+        (string_key("suspend"), create_effect_suspend_fn()),
+    ];
+    vm.map_with_entries(entries)
+}
+
+fn create_effect_succeed_fn() -> Value {
+    Value::NativeFunction(native_fn(|args: &[Value]| {
+        let val = args.first().cloned().unwrap_or(Value::Nil);
+        let entries = vec![
+            (string_key("__effect"), Value::Bool(true)),
+            (string_key("__kind"), Value::string("succeed")),
+            (string_key("__value"), val),
+        ];
+        Ok(NativeCallResult::Return(Value::map(entries.into_iter().collect())))
+    }))
+}
+
+fn create_effect_fail_fn() -> Value {
+    Value::NativeFunction(native_fn(|args: &[Value]| {
+        let err = args.first().cloned().unwrap_or(Value::Nil);
+        let entries = vec![
+            (string_key("__effect"), Value::Bool(true)),
+            (string_key("__kind"), Value::string("fail")),
+            (string_key("__error"), err),
+        ];
+        Ok(NativeCallResult::Return(Value::map(entries.into_iter().collect())))
+    }))
+}
+
+fn create_effect_die_fn() -> Value {
+    Value::NativeFunction(native_fn(|args: &[Value]| {
+        let msg = args.first().cloned().unwrap_or(Value::string("defect"));
+        let entries = vec![
+            (string_key("__effect"), Value::Bool(true)),
+            (string_key("__kind"), Value::string("die")),
+            (string_key("__defect"), msg),
+        ];
+        Ok(NativeCallResult::Return(Value::map(entries.into_iter().collect())))
+    }))
+}
+
+fn create_effect_interrupt_fn() -> Value {
+    Value::NativeFunction(native_fn(|_args: &[Value]| {
+        let entries = vec![
+            (string_key("__effect"), Value::Bool(true)),
+            (string_key("__kind"), Value::string("interrupt")),
+        ];
+        Ok(NativeCallResult::Return(Value::map(entries.into_iter().collect())))
+    }))
+}
+
+fn create_effect_from_result_fn() -> Value {
+    Value::NativeFunction(native_fn(|args: &[Value]| {
+        let res = args.first().cloned().unwrap_or(Value::Nil);
+        if let Value::Enum(e) = &res {
+            if e.variant.as_str() == "Ok" {
+                let val = e.values.as_ref().and_then(|v| v.first()).cloned().unwrap_or(Value::Nil);
+                return Ok(NativeCallResult::Return(Value::map(vec![
+                    (string_key("__effect"), Value::Bool(true)),
+                    (string_key("__kind"), Value::string("succeed")),
+                    (string_key("__value"), val),
+                ].into_iter().collect())));
+            } else if e.variant.as_str() == "Err" {
+                let err = e.values.as_ref().and_then(|v| v.first()).cloned().unwrap_or(Value::Nil);
+                return Ok(NativeCallResult::Return(Value::map(vec![
+                    (string_key("__effect"), Value::Bool(true)),
+                    (string_key("__kind"), Value::string("fail")),
+                    (string_key("__error"), err),
+                ].into_iter().collect())));
+            }
+        }
+        Ok(NativeCallResult::Return(Value::map(vec![
+            (string_key("__effect"), Value::Bool(true)),
+            (string_key("__kind"), Value::string("succeed")),
+            (string_key("__value"), res),
+        ].into_iter().collect())))
+    }))
+}
+
+fn create_effect_suspend_fn() -> Value {
+    Value::NativeFunction(native_fn(|args: &[Value]| {
+        if args.is_empty() {
+            return Err("effect.suspend requires a function/thunk".to_string());
+        }
+        let thunk = args[0].clone();
+        let entries = vec![
+            (string_key("__effect"), Value::Bool(true)),
+            (string_key("__kind"), Value::string("suspend")),
+            (string_key("__thunk"), thunk),
+        ];
+        Ok(NativeCallResult::Return(Value::map(entries.into_iter().collect())))
+    }))
+}
+
+fn create_effect_run_sync_fn() -> Value {
+    Value::NativeFunction(native_fn(|args: &[Value]| {
+        if args.is_empty() {
+            return Err("effect.run_sync requires an effect argument".to_string());
+        }
+        let eff = &args[0];
+        match eff {
+            Value::Closure(_) | Value::Function(_) => {
+                let res = VM::with_current(|vm| {
+                    vm.call_value(eff, vec![]).map_err(|e| e.to_string())
+                });
+                match res {
+                    Ok(val) => {
+                        if let Value::Enum(e) = &val {
+                            if e.enum_name == "Exit" {
+                                return Ok(NativeCallResult::Return(val));
+                            }
+                        }
+                        Ok(NativeCallResult::Return(Value::enum_variant(
+                            "Exit",
+                            "Success",
+                            vec![val],
+                        )))
+                    }
+                    Err(e) => {
+                        if e.to_lowercase().contains("out of gas") || e.contains("Interrupt") {
+                            Ok(NativeCallResult::Return(Value::enum_variant(
+                                "Exit",
+                                "Interrupt",
+                                vec![],
+                            )))
+                        } else {
+                            Ok(NativeCallResult::Return(Value::enum_variant(
+                                "Exit",
+                                "Fail",
+                                vec![Value::string(e)],
+                            )))
+                        }
+                    }
+                }
+            }
+            Value::Map(m) => {
+                let borrowed = m.borrow();
+                let kind = borrowed.get(&string_key("__kind"));
+                match kind {
+                    Some(Value::String(s)) if s.as_str() == "succeed" => {
+                        let val = borrowed.get(&string_key("__value")).cloned().unwrap_or(Value::Nil);
+                        Ok(NativeCallResult::Return(Value::enum_variant(
+                            "Exit",
+                            "Success",
+                            vec![val],
+                        )))
+                    }
+                    Some(Value::String(s)) if s.as_str() == "fail" => {
+                        let err = borrowed.get(&string_key("__error")).cloned().unwrap_or(Value::Nil);
+                        Ok(NativeCallResult::Return(Value::enum_variant(
+                            "Exit",
+                            "Fail",
+                            vec![err],
+                        )))
+                    }
+                    Some(Value::String(s)) if s.as_str() == "die" => {
+                        let msg = borrowed.get(&string_key("__defect")).cloned().unwrap_or(Value::string("defect"));
+                        Ok(NativeCallResult::Return(Value::enum_variant(
+                            "Exit",
+                            "Die",
+                            vec![msg],
+                        )))
+                    }
+                    Some(Value::String(s)) if s.as_str() == "interrupt" => {
+                        Ok(NativeCallResult::Return(Value::enum_variant(
+                            "Exit",
+                            "Interrupt",
+                            vec![],
+                        )))
+                    }
+                    Some(Value::String(s)) if s.as_str() == "suspend" => {
+                        if let Some(thunk) = borrowed.get(&string_key("__thunk")).cloned() {
+                            let res = VM::with_current(|vm| {
+                                vm.call_value(&thunk, vec![]).map_err(|e| e.to_string())
+                            });
+                            match res {
+                                Ok(val) => {
+                                    if let Value::Enum(e) = &val {
+                                        if e.enum_name == "Exit" {
+                                            return Ok(NativeCallResult::Return(val));
+                                        }
+                                    }
+                                    Ok(NativeCallResult::Return(Value::enum_variant(
+                                        "Exit",
+                                        "Success",
+                                        vec![val],
+                                    )))
+                                }
+                                Err(e) => {
+                                    if e.to_lowercase().contains("out of gas") || e.contains("Interrupt") {
+                                        Ok(NativeCallResult::Return(Value::enum_variant(
+                                            "Exit",
+                                            "Interrupt",
+                                            vec![],
+                                        )))
+                                    } else {
+                                        Ok(NativeCallResult::Return(Value::enum_variant(
+                                            "Exit",
+                                            "Fail",
+                                            vec![Value::string(e)],
+                                        )))
+                                    }
+                                }
+                            }
+                        } else {
+                            Err("effect.run_sync: invalid suspend effect without __thunk".to_string())
+                        }
+                    }
+                    _ => {
+                        Ok(NativeCallResult::Return(Value::enum_variant(
+                            "Exit",
+                            "Success",
+                            vec![eff.clone()],
+                        )))
+                    }
+                }
+            }
+            Value::Enum(e) if e.enum_name == "Exit" => {
+                Ok(NativeCallResult::Return(eff.clone()))
+            }
+            other => {
+                Ok(NativeCallResult::Return(Value::enum_variant(
+                    "Exit",
+                    "Success",
+                    vec![other.clone()],
+                )))
+            }
+        }
+    }))
 }
 
 fn create_map_module(vm: &VM) -> Value {
