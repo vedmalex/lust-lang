@@ -148,37 +148,49 @@ impl Compiler {
 
     pub fn configure_stdlib(&mut self, config: &LustConfig) {
         self.stdlib_symbols.clear();
-        self.stdlib_symbols.extend(
-            [
-                "print",
-                "println",
-                "type",
-                "tostring",
-                "unpack",
-                "select",
-                "task",
-                "lua",
-                "array",
-                "map",
-                "math",
-                "string",
-                "error",
-                "assert",
-                "tonumber",
-                "pairs",
-                "ipairs",
-                "setmetatable",
-            ]
-            .into_iter()
-            .map(String::from),
-        );
-        for module in config.enabled_modules() {
-            match module {
-                "io" | "os" => {
-                    self.stdlib_symbols.insert(module.to_string());
-                }
+        match config.prelude_mode() {
+            crate::config::PreludeMode::Pure => {
+                // In Pure mode, no ambient stdlib symbols are exposed.
+            }
+            crate::config::PreludeMode::Custom { auto_globals, .. } => {
+                self.stdlib_symbols.extend(auto_globals.iter().cloned());
+            }
+            crate::config::PreludeMode::Standard => {
+                self.stdlib_symbols.extend(
+                    [
+                        "print",
+                        "println",
+                        "type",
+                        "tostring",
+                        "unpack",
+                        "select",
+                        "task",
+                        "lua",
+                        "array",
+                        "map",
+                        "math",
+                        "string",
+                        "error",
+                        "assert",
+                        "tonumber",
+                        "pairs",
+                        "ipairs",
+                        "setmetatable",
+                        "random",
+                        "randomseed",
+                    ]
+                    .into_iter()
+                    .map(String::from),
+                );
+                for module in config.enabled_modules() {
+                    match module {
+                        "io" | "os" => {
+                            self.stdlib_symbols.insert(module.to_string());
+                        }
 
-                _ => {}
+                        _ => {}
+                    }
+                }
             }
         }
     }
@@ -326,6 +338,7 @@ impl Compiler {
             ExprKind::Block(_) => "block expression",
             ExprKind::Return(_) => "return expression",
             ExprKind::Range { .. } => "range expression",
+            ExprKind::EffectBlock(_) => "effect expression",
         }
     }
 
@@ -404,6 +417,24 @@ impl Compiler {
 
             TypeKind::Trait(name) => name.clone(),
             TypeKind::TraitBound(traits) => traits.join(" + "),
+            TypeKind::Never => "never".to_string(),
+            TypeKind::Effect {
+                success,
+                error,
+                requirements,
+            } => {
+                let s = Self::type_to_string(&success.kind);
+                let e = Self::type_to_string(&error.kind);
+                if requirements.is_empty() {
+                    format!("Effect<{}, {}>", s, e)
+                } else {
+                    let req_strs: Vec<String> = requirements
+                        .iter()
+                        .map(|t| Self::type_to_string(&t.kind))
+                        .collect();
+                    format!("Effect<{}, {}, {}>", s, e, req_strs.join(" + "))
+                }
+            }
         }
     }
 

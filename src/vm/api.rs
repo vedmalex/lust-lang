@@ -169,6 +169,9 @@ impl VM {
             use std::hash::{Hash, Hasher};
             let mut hasher = std::collections::hash_map::DefaultHasher::new();
             config.jit_enabled().hash(&mut hasher);
+            config.prelude_mode().hash(&mut hasher);
+            config.capability_mask().hash(&mut hasher);
+            config.strict_capabilities().hash(&mut hasher);
             for m in config.enabled_modules() {
                 m.hash(&mut hasher);
             }

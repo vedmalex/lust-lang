@@ -180,7 +180,12 @@ fn collect_inlay_hints_from_stmt(
             }
         }
 
-        StmtKind::Block(stmts) => collect_inlay_hints_from_stmts(stmts, module, range, hints),
+        StmtKind::Defer(inner) | StmtKind::ErrDefer(inner) => {
+            collect_inlay_hints_from_stmt(inner, module, range, hints);
+        }
+        StmtKind::Scoped(stmts) | StmtKind::Block(stmts) => {
+            collect_inlay_hints_from_stmts(stmts, module, range, hints);
+        }
         StmtKind::Break | StmtKind::Continue => {}
     }
 }
@@ -272,7 +277,9 @@ fn collect_inlay_hints_from_expr(
             }
         }
 
-        ExprKind::Block(stmts) => collect_inlay_hints_from_stmts(stmts, module, range, hints),
+        ExprKind::Block(stmts) | ExprKind::EffectBlock(stmts) => {
+            collect_inlay_hints_from_stmts(stmts, module, range, hints);
+        }
         ExprKind::Range { start, end, .. } => {
             collect_inlay_hints_from_expr(start, module, range, hints);
             collect_inlay_hints_from_expr(end, module, range, hints);

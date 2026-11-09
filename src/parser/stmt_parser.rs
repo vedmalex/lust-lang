@@ -4,7 +4,7 @@ use crate::{
     error::Result,
     lexer::TokenKind,
 };
-use alloc::{vec, vec::Vec};
+use alloc::{boxed::Box, vec, vec::Vec};
 
 impl Parser {
     #[inline(never)]
@@ -198,6 +198,65 @@ impl Parser {
 
                 self.consume(TokenKind::End, "Expected 'end' after do block")?;
                 StmtKind::Block(statements)
+            }
+
+            TokenKind::Defer => {
+                self.advance();
+                let stmt = if self.match_token(&[TokenKind::LeftBrace]) {
+                    let block_start = self.tokens[self.current - 1].clone();
+                    let mut statements = Vec::new();
+                    while !self.check(TokenKind::RightBrace) && !self.is_at_end() {
+                        statements.push(self.parse_stmt()?);
+                    }
+                    self.consume(TokenKind::RightBrace, "Expected '}' after defer block")?;
+                    let block_end = self.tokens[self.current - 1].clone();
+                    Stmt::new(
+                        StmtKind::Block(statements),
+                        self.make_span(&block_start, &block_end),
+                    )
+                } else {
+                    self.parse_stmt()?
+                };
+                StmtKind::Defer(Box::new(stmt))
+            }
+
+            TokenKind::ErrDefer => {
+                self.advance();
+                let stmt = if self.match_token(&[TokenKind::LeftBrace]) {
+                    let block_start = self.tokens[self.current - 1].clone();
+                    let mut statements = Vec::new();
+                    while !self.check(TokenKind::RightBrace) && !self.is_at_end() {
+                        statements.push(self.parse_stmt()?);
+                    }
+                    self.consume(TokenKind::RightBrace, "Expected '}' after errdefer block")?;
+                    let block_end = self.tokens[self.current - 1].clone();
+                    Stmt::new(
+                        StmtKind::Block(statements),
+                        self.make_span(&block_start, &block_end),
+                    )
+                } else {
+                    self.parse_stmt()?
+                };
+                StmtKind::ErrDefer(Box::new(stmt))
+            }
+
+            TokenKind::Scoped => {
+                self.advance();
+                let mut statements = Vec::new();
+                if self.match_token(&[TokenKind::LeftBrace]) {
+                    while !self.check(TokenKind::RightBrace) && !self.is_at_end() {
+                        statements.push(self.parse_stmt()?);
+                    }
+                    self.consume(TokenKind::RightBrace, "Expected '}' after scoped block")?;
+                } else if self.match_token(&[TokenKind::Do]) {
+                    while !self.check(TokenKind::End) && !self.is_at_end() {
+                        statements.push(self.parse_stmt()?);
+                    }
+                    self.consume(TokenKind::End, "Expected 'end' after scoped block")?;
+                } else {
+                    return Err(self.error("Expected 'do' or '{' after 'scoped'"));
+                }
+                StmtKind::Scoped(statements)
             }
 
             _ => {

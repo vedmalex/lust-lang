@@ -41,13 +41,13 @@ impl Compiler {
                     return Ok(reg);
                 }
 
-                let mut lookup_name = name.clone();
-                if let Some(module) = &self.current_module
-                    && let Some(imports) = self.imports_by_module.get(module)
-                    && let Some(fq) = imports.function_aliases.get(name)
-                {
-                    lookup_name = fq.clone();
-                }
+                let imported_fn = self
+                    .current_module
+                    .as_ref()
+                    .and_then(|module| self.imports_by_module.get(module))
+                    .and_then(|imports| imports.function_aliases.get(name).cloned());
+
+                let lookup_name = imported_fn.clone().unwrap_or_else(|| name.clone());
 
                 if let Some(&func_idx) = self.function_table.get(&lookup_name) {
                     let reg = self.allocate_register();
@@ -59,6 +59,13 @@ impl Compiler {
                 if self.is_stdlib_symbol(name) {
                     let reg = self.allocate_register();
                     let name_idx = self.add_string_constant(name);
+                    self.emit(Instruction::LoadGlobal(reg, name_idx), 0);
+                    return Ok(reg);
+                }
+
+                if let Some(target) = imported_fn {
+                    let reg = self.allocate_register();
+                    let name_idx = self.add_string_constant(&target);
                     self.emit(Instruction::LoadGlobal(reg, name_idx), 0);
                     return Ok(reg);
                 }
@@ -90,6 +97,13 @@ impl Compiler {
                     let name_idx = self.add_string_constant(&real_module);
                     self.emit(Instruction::LoadGlobal(reg, name_idx), 0);
                     return Ok(reg);
+                }
+
+                if let Some(hint) = crate::builtins::std_symbol_import_hint(name) {
+                    return Err(LustError::CompileError(format!(
+                        "Undefined function '{}'; {}",
+                        name, hint
+                    )));
                 }
 
                 Err(LustError::CompileError(format!(

@@ -17,6 +17,38 @@ impl Expr {
     pub fn new(kind: ExprKind, span: Span) -> Self {
         Self { kind, span }
     }
+
+    pub fn return_spec(&self) -> Option<super::ReturnSpec> {
+        match &self.kind {
+            ExprKind::Lambda { return_type, .. } => {
+                match return_type {
+                    Some(Type {
+                        kind: super::TypeKind::Effect { success, error, requirements },
+                        ..
+                    }) => Some(super::ReturnSpec {
+                        return_type: Some((**success).clone()),
+                        error_type: if matches!(error.kind, super::TypeKind::Never) {
+                            None
+                        } else {
+                            Some((**error).clone())
+                        },
+                        requirements: requirements.clone(),
+                    }),
+                    Some(t) => Some(super::ReturnSpec {
+                        return_type: Some(t.clone()),
+                        error_type: None,
+                        requirements: Vec::new(),
+                    }),
+                    None => Some(super::ReturnSpec {
+                        return_type: None,
+                        error_type: None,
+                        requirements: Vec::new(),
+                    }),
+                }
+            }
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -87,6 +119,7 @@ pub enum ExprKind {
         else_branch: Option<Box<Expr>>,
     },
     Block(Vec<super::stmt::Stmt>),
+    EffectBlock(Vec<super::stmt::Stmt>),
     Return(Vec<Expr>),
     Range {
         start: Box<Expr>,

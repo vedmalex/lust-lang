@@ -369,12 +369,7 @@ impl<'a> Lexer<'a> {
                     self.advance();
                     return Ok(Token::simple(TokenKind::NotEqual, start_line, start_column));
                 } else {
-                    return Err(LustError::LexerError {
-                        line: start_line,
-                        column: start_column,
-                        message: format!("Unexpected character: {}", ch),
-                        module: None,
-                    });
+                    return Ok(Token::simple(TokenKind::Bang, start_line, start_column));
                 }
             }
             '<' => {

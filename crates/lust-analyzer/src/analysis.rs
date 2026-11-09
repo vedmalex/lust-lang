@@ -1666,7 +1666,10 @@ impl<'a> IndexerContext<'a> {
                 self.walk_stmts(body);
                 self.pop_scope();
             }
-            StmtKind::Block(stmts) => {
+            StmtKind::Defer(inner) | StmtKind::ErrDefer(inner) => {
+                self.walk_stmt(inner);
+            }
+            StmtKind::Scoped(stmts) | StmtKind::Block(stmts) => {
                 self.push_scope();
                 self.walk_stmts(stmts);
                 self.pop_scope();
@@ -1915,7 +1918,7 @@ impl<'a> IndexerContext<'a> {
                     self.walk_expr(eb);
                 }
             }
-            ExprKind::Block(stmts) => {
+            ExprKind::Block(stmts) | ExprKind::EffectBlock(stmts) => {
                 self.push_scope();
                 self.walk_stmts(stmts);
                 self.pop_scope();

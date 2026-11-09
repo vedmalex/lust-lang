@@ -1726,6 +1726,19 @@ fn collect_locals_from_stmt(
             }
         }
 
+        StmtKind::Defer(inner) | StmtKind::ErrDefer(inner) => {
+            if span_contains_position(stmt.span, position) {
+                return collect_locals_from_stmt(
+                    inner, module, position, pos_line, pos_col, results,
+                );
+            }
+        }
+        StmtKind::Scoped(stmts) => {
+            if span_contains_position(stmt.span, position) {
+                collect_locals_from_stmts(stmts, module, position, results);
+                return false;
+            }
+        }
         StmtKind::Expr(_)
         | StmtKind::Return(_)
         | StmtKind::Break

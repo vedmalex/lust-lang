@@ -284,7 +284,47 @@ impl TypeEnv {
                 doc: None,
             },
         );
-        self.register_builtin_function_slice(builtins::base_functions(), dummy_span);
+        match config.prelude_mode() {
+            crate::config::PreludeMode::Pure => {
+                // In Pure mode, base functions and ambient global modules are not registered into global scope.
+            }
+            crate::config::PreludeMode::Custom { auto_globals, .. } => {
+                for builtin in builtins::base_functions() {
+                    if auto_globals.contains(builtin.name) {
+                        self.functions
+                            .insert(builtin.name.to_string(), builtin.to_signature(dummy_span));
+                    }
+                }
+                if let Some(global_scope) = self.scopes.first_mut() {
+                    for mod_name in ["array", "table", "map", "math", "string", "task", "lua"] {
+                        if auto_globals.contains(mod_name) {
+                            global_scope.insert(mod_name.to_string(), Type::new(TypeKind::Unknown, dummy_span));
+                        }
+                    }
+                }
+            }
+            crate::config::PreludeMode::Standard => {
+                self.register_builtin_function_slice(builtins::base_functions(), dummy_span);
+                if let Some(global_scope) = self.scopes.first_mut() {
+                    global_scope.insert(
+                        "array".to_string(),
+                        Type::new(TypeKind::Unknown, dummy_span),
+                    );
+                    global_scope.insert(
+                        "table".to_string(),
+                        Type::new(TypeKind::Unknown, dummy_span),
+                    );
+                    global_scope.insert("map".to_string(), Type::new(TypeKind::Unknown, dummy_span));
+                    global_scope.insert("math".to_string(), Type::new(TypeKind::Unknown, dummy_span));
+                    global_scope.insert(
+                        "string".to_string(),
+                        Type::new(TypeKind::Unknown, dummy_span),
+                    );
+                    global_scope.insert("task".to_string(), Type::new(TypeKind::Unknown, dummy_span));
+                    global_scope.insert("lua".to_string(), Type::new(TypeKind::Unknown, dummy_span));
+                }
+            }
+        }
         self.register_builtin_function_slice(builtins::array_functions(), dummy_span);
         self.register_builtin_function_slice(builtins::table_functions(), dummy_span);
         self.register_builtin_function_slice(builtins::map_functions(), dummy_span);
@@ -292,24 +332,6 @@ impl TypeEnv {
         self.register_builtin_function_slice(builtins::string_functions(), dummy_span);
         self.register_builtin_function_slice(builtins::task_functions(), dummy_span);
         self.register_builtin_function_slice(builtins::lua_functions(), dummy_span);
-        if let Some(global_scope) = self.scopes.first_mut() {
-            global_scope.insert(
-                "array".to_string(),
-                Type::new(TypeKind::Unknown, dummy_span),
-            );
-            global_scope.insert(
-                "table".to_string(),
-                Type::new(TypeKind::Unknown, dummy_span),
-            );
-            global_scope.insert("map".to_string(), Type::new(TypeKind::Unknown, dummy_span));
-            global_scope.insert("math".to_string(), Type::new(TypeKind::Unknown, dummy_span));
-            global_scope.insert(
-                "string".to_string(),
-                Type::new(TypeKind::Unknown, dummy_span),
-            );
-            global_scope.insert("task".to_string(), Type::new(TypeKind::Unknown, dummy_span));
-            global_scope.insert("lua".to_string(), Type::new(TypeKind::Unknown, dummy_span));
-        }
 
         let task_status_enum = EnumDef {
             name: "TaskStatus".to_string(),
@@ -408,19 +430,24 @@ impl TypeEnv {
             doc: None,
         };
         self.enums.insert("LuaValue".to_string(), lua_value_enum);
-        if config.is_module_enabled("io") {
-            if let Some(global_scope) = self.scopes.first_mut() {
-                global_scope.insert("io".to_string(), Type::new(TypeKind::Unknown, dummy_span));
+        if config.prelude_mode() == crate::config::PreludeMode::Standard {
+            if config.is_module_enabled("io") {
+                if let Some(global_scope) = self.scopes.first_mut() {
+                    global_scope.insert("io".to_string(), Type::new(TypeKind::Unknown, dummy_span));
+                }
+
+                self.register_builtin_function_slice(builtins::io_functions(), dummy_span);
             }
 
+            if config.is_module_enabled("os") {
+                if let Some(global_scope) = self.scopes.first_mut() {
+                    global_scope.insert("os".to_string(), Type::new(TypeKind::Unknown, dummy_span));
+                }
+
+                self.register_builtin_function_slice(builtins::os_functions(), dummy_span);
+            }
+        } else {
             self.register_builtin_function_slice(builtins::io_functions(), dummy_span);
-        }
-
-        if config.is_module_enabled("os") {
-            if let Some(global_scope) = self.scopes.first_mut() {
-                global_scope.insert("os".to_string(), Type::new(TypeKind::Unknown, dummy_span));
-            }
-
             self.register_builtin_function_slice(builtins::os_functions(), dummy_span);
         }
 
@@ -758,6 +785,10 @@ impl TypeEnv {
 
     pub fn lookup_function(&self, name: &str) -> Option<&FunctionSignature> {
         self.functions.get(name)
+    }
+
+    pub fn remove_function(&mut self, name: &str) {
+        self.functions.remove(name);
     }
 
     pub fn function_signatures(&self) -> HashMap<String, FunctionSignature> {

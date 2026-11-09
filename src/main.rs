@@ -124,6 +124,7 @@ fn main() {
     let mut use_mir = false;
     let mut strict_mir = false;
     let mut no_gc = false;
+    let mut pure_core = false;
     let mut backend_mode: Option<String> = None;
     let mut script_file: Option<String> = None;
 
@@ -146,6 +147,7 @@ fn main() {
                 use_mir = true;
             }
             "--no-gc" => no_gc = true,
+            "--pure-core" | "--no-prelude" => pure_core = true,
             "--backend" => {
                 i += 1;
                 let Some(val) = run_args.get(i) else {
@@ -204,7 +206,7 @@ fn main() {
         if is_zig_aot {
             run_file_zig_aot(&file);
         } else {
-            run_file_with_options(&file, disassemble, use_mir, strict_mir, no_gc);
+            run_file_with_options(&file, disassemble, use_mir, strict_mir, no_gc, pure_core);
         }
     } else {
         print_usage(&args[0]);
@@ -215,7 +217,7 @@ fn main() {
 fn print_usage(program: &str) {
     eprintln!("Usage: {} [options] <script.lust>", program);
     eprintln!(
-        "       {} run <file> --backend [vm|cranelift|zig|auto] [--strict]",
+        "       {} run <file> [--pure-core|--no-prelude] --backend [vm|cranelift|zig|auto] [--strict]",
         program
     );
     eprintln!(
@@ -273,6 +275,10 @@ fn print_help(program: &str) {
     );
     println!(
         "    {} --no-gc <script.lust>           Run script with cycle collector GC disabled",
+        program
+    );
+    println!(
+        "    {} --pure-core, --no-prelude       Run with pure core (no ambient globals, require explicit use std.*)",
         program
     );
     println!(
@@ -1737,6 +1743,7 @@ fn run_file_with_options(
     use_mir: bool,
     strict_mir: bool,
     no_gc: bool,
+    pure_core: bool,
 ) {
     let source = match fs::read_to_string(filename) {
         Ok(content) => content,
@@ -1757,6 +1764,9 @@ fn run_file_with_options(
             process::exit(1);
         }
     };
+    if pure_core {
+        config.set_prelude_mode(lust::config::PreludeMode::Pure);
+    }
     if use_mir {
         config.set_use_mir(true);
     }
@@ -2036,6 +2046,7 @@ fn compile_program(
     let entry_path = Path::new(entry_filename);
     let entry_dir = entry_path.parent().unwrap_or_else(|| Path::new("."));
     let mut loader = ModuleLoader::new(entry_dir.to_path_buf());
+    loader.set_config(config.clone());
     #[cfg(all(feature = "packages", not(target_arch = "wasm32")))]
     if let Some(resolution) = deps {
         for dependency in resolution.lust() {

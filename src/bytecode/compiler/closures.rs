@@ -157,6 +157,13 @@ impl Compiler {
             }
 
             ExprKind::Literal(_) => {}
+
+            ExprKind::EffectBlock(stmts) => {
+                let mut scope_bound = bound_vars.clone();
+                for stmt in stmts {
+                    self.find_free_vars_in_stmt(stmt, free_vars, &mut scope_bound);
+                }
+            }
         }
     }
 
@@ -283,6 +290,14 @@ impl Compiler {
             }
 
             StmtKind::Break | StmtKind::Continue => {}
+            StmtKind::Defer(s) | StmtKind::ErrDefer(s) => {
+                self.find_free_vars_in_stmt(s, free_vars, bound_vars);
+            }
+            StmtKind::Scoped(stmts) => {
+                for stmt in stmts {
+                    self.find_free_vars_in_stmt(stmt, free_vars, bound_vars);
+                }
+            }
         }
     }
 }

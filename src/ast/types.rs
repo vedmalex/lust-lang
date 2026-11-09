@@ -70,6 +70,12 @@ pub enum TypeKind {
     TraitBound(Vec<String>),
     Unit,
     Infer,
+    Never,
+    Effect {
+        success: Box<Type>,
+        error: Box<Type>,
+        requirements: Vec<Type>,
+    },
 }
 
 impl TypeKind {
@@ -148,6 +154,34 @@ impl fmt::Display for TypeKind {
             TypeKind::TraitBound(traits) => write!(f, "{}", traits.join(" + ")),
             TypeKind::Unit => write!(f, "()"),
             TypeKind::Infer => write!(f, "_"),
+            TypeKind::Never => write!(f, "never"),
+            TypeKind::Effect {
+                success,
+                error,
+                requirements,
+            } => {
+                if requirements.is_empty() {
+                    if matches!(error.kind, TypeKind::Never) {
+                        write!(f, "Effect<{}>", success)
+                    } else {
+                        write!(f, "Effect<{}, {}>", success, error)
+                    }
+                } else {
+                    let reqs = requirements
+                        .iter()
+                        .map(|t| t.to_string())
+                        .collect::<Vec<_>>()
+                        .join(" + ");
+                    write!(f, "Effect<{}, {}, {}>", success, error, reqs)
+                }
+            }
         }
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ReturnSpec {
+    pub return_type: Option<Type>,
+    pub error_type: Option<Type>,
+    pub requirements: Vec<Type>,
 }

@@ -2274,6 +2274,8 @@ impl VM {
             }
             TypeKind::Ref(inner) | TypeKind::MutRef(inner) => self.value_matches_type(value, inner),
             TypeKind::Pointer { .. } => true,
+            TypeKind::Never => false,
+            TypeKind::Effect { .. } => true,
         }
     }
 

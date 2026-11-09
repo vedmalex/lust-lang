@@ -87,9 +87,24 @@ impl TypeChecker {
                     return Ok(const_type);
                 }
 
-                if builtins::base_functions()
-                    .iter()
-                    .any(|builtin| builtin.name == name)
+                if self.prelude_mode == crate::config::PreludeMode::Pure
+                    && self.env.lookup_variable(name).is_none()
+                    && self.env.lookup_function(&self.resolve_function_key(name)).is_none()
+                    && self.resolve_module_alias(name).is_none()
+                    && self.env.lookup_constant(&self.resolve_value_key(name)).is_none()
+                {
+                    if let Some(hint) = crate::builtins::std_symbol_import_hint(name) {
+                        return Err(self.type_error_at(
+                            format!("Undefined function '{}'; {}", name, hint),
+                            expr.span,
+                        ));
+                    }
+                }
+
+                if self.prelude_mode != crate::config::PreludeMode::Pure
+                    && builtins::base_functions()
+                        .iter()
+                        .any(|builtin| builtin.name == name)
                 {
                     return Ok(Type::new(TypeKind::Unknown, expr.span));
                 }
@@ -348,6 +363,14 @@ impl TypeChecker {
             }
 
             ExprKind::Paren(inner) => self.check_expr_with_hint(inner, expected_type),
+            ExprKind::EffectBlock(stmts) => {
+                self.env.push_scope();
+                for stmt in stmts {
+                    self.check_stmt(stmt)?;
+                }
+                self.env.pop_scope();
+                Ok(Type::new(TypeKind::Unknown, expr.span))
+            }
         }
     }
 

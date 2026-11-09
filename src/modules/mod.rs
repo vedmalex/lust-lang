@@ -48,7 +48,7 @@ pub struct Program {
     pub entry_module: String,
 }
 
-pub use embedded::{EmbeddedModule, build_directory_map, load_program_from_embedded};
+pub use embedded::{EmbeddedModule, build_directory_map, load_program_from_embedded, load_program_from_embedded_with_config};
 
 use crate::LustConfig;
 use crate::bytecode::Compiler;
@@ -158,6 +158,7 @@ pub struct ModuleLoader {
     visited: HashSet<String>,
     source_overrides: HashMap<PathBuf, String>,
     module_roots: HashMap<String, Vec<ModuleRoot>>,
+    config: LustConfig,
 }
 
 #[cfg(feature = "std")]
@@ -176,7 +177,21 @@ impl ModuleLoader {
             visited: HashSet::new(),
             source_overrides: HashMap::new(),
             module_roots: HashMap::new(),
+            config: LustConfig::default(),
         }
+    }
+
+    pub fn with_config(mut self, config: LustConfig) -> Self {
+        self.config = config;
+        self
+    }
+
+    pub fn set_config(&mut self, config: LustConfig) {
+        self.config = config;
+    }
+
+    pub fn config(&self) -> &LustConfig {
+        &self.config
     }
 
     pub fn set_source_overrides(&mut self, overrides: HashMap<PathBuf, String>) {
@@ -622,6 +637,14 @@ impl ModuleLoader {
                 }
             }
             StmtKind::Break | StmtKind::Continue => {}
+            StmtKind::Defer(s) | StmtKind::ErrDefer(s) => {
+                self.collect_deps_from_lua_require_stmt(s, deps);
+            }
+            StmtKind::Scoped(stmts) => {
+                for stmt in stmts {
+                    self.collect_deps_from_lua_require_stmt(stmt, deps);
+                }
+            }
         }
     }
 
@@ -728,6 +751,11 @@ impl ModuleLoader {
             ExprKind::Literal(Literal::String(_))
             | ExprKind::Literal(_)
             | ExprKind::Identifier(_) => {}
+            ExprKind::EffectBlock(stmts) => {
+                for stmt in stmts {
+                    self.collect_deps_from_lua_require_stmt(stmt, deps);
+                }
+            }
         }
     }
 
@@ -806,31 +834,45 @@ impl ModuleLoader {
                 let full_file = self.file_for_module_path(&full);
                 if self.module_source_known(&full, &full_file) {
                     deps.insert(full);
+                } else if crate::builtins::is_virtual_std_module(&full) {
+                    // Virtual standard module — do not attempt to load from disk
                 } else if path.len() > 1 {
-                    deps.insert(path[..path.len() - 1].join("."));
+                    let parent = path[..path.len() - 1].join(".");
+                    if !crate::builtins::is_virtual_std_module(&parent) {
+                        deps.insert(parent);
+                    }
                 }
             }
 
             UseTree::Group { prefix, items } => {
                 let module = prefix.join(".");
-                if !module.is_empty() {
-                    deps.insert(module);
-                }
+                if crate::builtins::is_virtual_std_module(&module) {
+                    // Virtual standard module — do not attempt to load from disk
+                } else {
+                    if !module.is_empty() {
+                        deps.insert(module);
+                    }
 
-                for item in items {
-                    if item.path.len() > 1 {
-                        let mut combined: Vec<String> = prefix.clone();
-                        combined.extend(item.path[..item.path.len() - 1].iter().cloned());
-                        let module_path = combined.join(".");
-                        if !module_path.is_empty() {
-                            deps.insert(module_path);
+                    for item in items {
+                        if item.path.len() > 1 {
+                            let mut combined: Vec<String> = prefix.clone();
+                            combined.extend(item.path[..item.path.len() - 1].iter().cloned());
+                            let module_path = combined.join(".");
+                            if !module_path.is_empty()
+                                && !crate::builtins::is_virtual_std_module(&module_path)
+                            {
+                                deps.insert(module_path);
+                            }
                         }
                     }
                 }
             }
 
             UseTree::Glob { prefix } => {
-                deps.insert(prefix.join("."));
+                let module = prefix.join(".");
+                if !crate::builtins::is_virtual_std_module(&module) {
+                    deps.insert(module);
+                }
             }
         }
     }
@@ -845,79 +887,152 @@ impl ModuleLoader {
                         .clone()
                         .unwrap_or_else(|| path.last().unwrap().clone());
                     imports.module_aliases.insert(alias_name, full);
+                } else if crate::builtins::is_virtual_std_module(&full) {
+                    if !self.config.is_std_module_allowed(&full) {
+                        return Err(LustError::CompileError(format!(
+                            "CapabilityDenied: module '{}' is not enabled in this sandbox",
+                            full
+                        )));
+                    }
+                    let canon = crate::builtins::canonical_std_module_name(&full);
+                    let alias_name = alias.clone().unwrap_or_else(|| canon.to_string());
+                    imports
+                        .module_aliases
+                        .insert(alias_name, canon.to_string());
                 } else if path.len() > 1 {
                     let module = path[..path.len() - 1].join(".");
                     let item = path.last().unwrap().clone();
                     let alias_name = alias.clone().unwrap_or_else(|| item.clone());
-                    let classification = self.classify_import_target(&module, &item);
-                    let fq = format!("{}.{}", module, item);
-                    if classification.import_value {
-                        imports
-                            .function_aliases
-                            .insert(alias_name.clone(), fq.clone());
-                    }
+                    if crate::builtins::is_virtual_std_module(&module) {
+                        if !self.config.is_std_module_allowed(&module) {
+                            return Err(LustError::CompileError(format!(
+                                "CapabilityDenied: module '{}' is not enabled in this sandbox",
+                                module
+                            )));
+                        }
+                        let fq = crate::builtins::resolve_std_function(&module, &item)
+                            .map(String::from)
+                            .unwrap_or_else(|| {
+                                format!(
+                                    "{}.{}",
+                                    crate::builtins::canonical_std_module_name(&module),
+                                    item
+                                )
+                            });
+                        imports.function_aliases.insert(alias_name, fq);
+                    } else {
+                        let classification = self.classify_import_target(&module, &item);
+                        let fq = format!("{}.{}", module, item);
+                        if classification.import_value {
+                            imports
+                                .function_aliases
+                                .insert(alias_name.clone(), fq.clone());
+                        }
 
-                    if classification.import_type {
-                        imports.type_aliases.insert(alias_name, fq);
+                        if classification.import_type {
+                            imports.type_aliases.insert(alias_name, fq);
+                        }
                     }
                 }
             }
 
             UseTree::Group { prefix, items } => {
-                for item in items {
-                    if item.path.is_empty() {
-                        continue;
+                let module = prefix.join(".");
+                let is_virtual = crate::builtins::is_virtual_std_module(&module);
+                if is_virtual {
+                    if !self.config.is_std_module_allowed(&module) {
+                        return Err(LustError::CompileError(format!(
+                            "CapabilityDenied: module '{}' is not enabled in this sandbox",
+                            module
+                        )));
                     }
-
-                    let alias_name = item
-                        .alias
-                        .clone()
-                        .unwrap_or_else(|| item.path.last().unwrap().clone());
-                    let mut full_segments = prefix.clone();
-                    full_segments.extend(item.path.clone());
-                    let full = full_segments.join(".");
-                    let full_file = self.file_for_module_path(&full);
-                    if self.module_source_known(&full, &full_file) {
-                        imports.module_aliases.insert(alias_name, full);
-                        continue;
+                    for item in items {
+                        if item.path.is_empty() {
+                            continue;
+                        }
+                        let item_name = item.path.last().unwrap().clone();
+                        let alias_name = item.alias.clone().unwrap_or_else(|| item_name.clone());
+                        let fq = crate::builtins::resolve_std_function(&module, &item_name)
+                            .map(String::from)
+                            .unwrap_or_else(|| {
+                                format!(
+                                    "{}.{}",
+                                    crate::builtins::canonical_std_module_name(&module),
+                                    item_name
+                                )
+                            });
+                        imports.function_aliases.insert(alias_name, fq);
                     }
+                } else {
+                    for item in items {
+                        if item.path.is_empty() {
+                            continue;
+                        }
 
-                    let mut module_segments = full_segments.clone();
-                    let item_name = module_segments.pop().unwrap();
-                    let module_path = module_segments.join(".");
-                    let fq_name = if module_path.is_empty() {
-                        item_name.clone()
-                    } else {
-                        format!("{}.{}", module_path, item_name)
-                    };
-                    let classification = self.classify_import_target(&module_path, &item_name);
-                    if classification.import_value {
-                        imports
-                            .function_aliases
-                            .insert(alias_name.clone(), fq_name.clone());
-                    }
+                        let alias_name = item
+                            .alias
+                            .clone()
+                            .unwrap_or_else(|| item.path.last().unwrap().clone());
+                        let mut full_segments = prefix.clone();
+                        full_segments.extend(item.path.clone());
+                        let full = full_segments.join(".");
+                        let full_file = self.file_for_module_path(&full);
+                        if self.module_source_known(&full, &full_file) {
+                            imports.module_aliases.insert(alias_name, full);
+                            continue;
+                        }
 
-                    if classification.import_type {
-                        imports.type_aliases.insert(alias_name.clone(), fq_name);
+                        let mut module_segments = full_segments.clone();
+                        let item_name = module_segments.pop().unwrap();
+                        let module_path = module_segments.join(".");
+                        let fq_name = if module_path.is_empty() {
+                            item_name.clone()
+                        } else {
+                            format!("{}.{}", module_path, item_name)
+                        };
+                        let classification = self.classify_import_target(&module_path, &item_name);
+                        if classification.import_value {
+                            imports
+                                .function_aliases
+                                .insert(alias_name.clone(), fq_name.clone());
+                        }
+
+                        if classification.import_type {
+                            imports.type_aliases.insert(alias_name.clone(), fq_name);
+                        }
                     }
                 }
             }
 
             UseTree::Glob { prefix } => {
                 let module = prefix.join(".");
-                if let Some(loaded) = self.cache.get(&module) {
-                    for (name, fq) in &loaded.exports.functions {
-                        imports.function_aliases.insert(name.clone(), fq.clone());
+                if crate::builtins::is_virtual_std_module(&module) {
+                    if !self.config.is_std_module_allowed(&module) {
+                        return Err(LustError::CompileError(format!(
+                            "CapabilityDenied: module '{}' is not enabled in this sandbox",
+                            module
+                        )));
+                    }
+                    let canon = crate::builtins::canonical_std_module_name(&module);
+                    for (fn_name, fq) in crate::builtins::virtual_std_module_functions(&module) {
+                        imports.function_aliases.insert(fn_name.to_string(), fq.to_string());
+                    }
+                    imports.module_aliases.insert(canon.to_string(), canon.to_string());
+                } else {
+                    if let Some(loaded) = self.cache.get(&module) {
+                        for (name, fq) in &loaded.exports.functions {
+                            imports.function_aliases.insert(name.clone(), fq.clone());
+                        }
+
+                        for (name, fq) in &loaded.exports.types {
+                            imports.type_aliases.insert(name.clone(), fq.clone());
+                        }
                     }
 
-                    for (name, fq) in &loaded.exports.types {
-                        imports.type_aliases.insert(name.clone(), fq.clone());
+                    let alias_name = prefix.last().cloned().unwrap_or_else(|| module.clone());
+                    if !module.is_empty() {
+                        imports.module_aliases.insert(alias_name, module);
                     }
-                }
-
-                let alias_name = prefix.last().cloned().unwrap_or_else(|| module.clone());
-                if !module.is_empty() {
-                    imports.module_aliases.insert(alias_name, module);
                 }
             }
         }

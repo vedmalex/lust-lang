@@ -22,6 +22,7 @@ pub use type_env::FunctionSignature;
 pub use type_env::TypeEnv;
 pub struct TypeChecker {
     env: TypeEnv,
+    prelude_mode: crate::config::PreludeMode,
     current_function_return_type: Option<Type>,
     in_loop: bool,
     pending_generic_instances: Option<HashMap<String, Type>>,
@@ -65,6 +66,7 @@ impl TypeChecker {
     pub fn with_config(config: &LustConfig) -> Self {
         Self {
             env: TypeEnv::with_config(config),
+            prelude_mode: config.prelude_mode().clone(),
             current_function_return_type: None,
             in_loop: false,
             pending_generic_instances: None,
@@ -86,6 +88,7 @@ impl TypeChecker {
     /// Configure the typechecker with a LustConfig
     pub fn configure(&mut self, config: &LustConfig) {
         self.low_memory_mode = config.low_memory_mode();
+        self.prelude_mode = config.prelude_mode().clone();
     }
 
     fn dummy_span() -> Span {
@@ -120,11 +123,26 @@ impl TypeChecker {
         for m in modules {
             self.current_module = Some(m.path.clone());
             self.env.push_scope();
+            let mut registered_fn_aliases = Vec::new();
+            if let Some(imports) = self.imports_by_module.get(&m.path) {
+                for (alias, target) in &imports.function_aliases {
+                    if let Some(builtin) = crate::builtins::find_builtin_function(target) {
+                        let _ = self.env.register_function(alias.clone(), builtin.to_signature(Self::dummy_span()));
+                        registered_fn_aliases.push(alias.clone());
+                    }
+                }
+                for (alias, _real_mod) in &imports.module_aliases {
+                    let _ = self.env.declare_variable(alias.clone(), Type::new(TypeKind::Unknown, Self::dummy_span()));
+                }
+            }
             self.register_module_init_locals(&m.items)?;
             for item in &m.items {
                 self.check_item(item)?;
             }
 
+            for alias in registered_fn_aliases {
+                self.env.remove_function(&alias);
+            }
             self.env.pop_scope();
         }
 
@@ -1291,7 +1309,19 @@ impl TypeChecker {
             | TypeKind::Bool
             | TypeKind::Unknown
             | TypeKind::Unit
+            | TypeKind::Never
             | TypeKind::Infer => {}
+            TypeKind::Effect {
+                success,
+                error,
+                requirements,
+            } => {
+                self.validate_type(success)?;
+                self.validate_type(error)?;
+                for r in requirements {
+                    self.validate_type(r)?;
+                }
+            }
         }
         Ok(())
     }

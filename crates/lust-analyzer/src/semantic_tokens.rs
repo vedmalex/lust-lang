@@ -410,7 +410,11 @@ fn collect_tokens_from_stmt(
             collect_tokens_from_stmts(body, text, line_offsets, tokens, seen);
         }
 
-        StmtKind::Block(stmts) => {
+        StmtKind::Defer(inner) | StmtKind::ErrDefer(inner) => {
+            collect_tokens_from_stmt(inner, text, line_offsets, tokens, seen);
+        }
+
+        StmtKind::Scoped(stmts) | StmtKind::Block(stmts) => {
             collect_tokens_from_stmts(stmts, text, line_offsets, tokens, seen);
         }
 
@@ -543,7 +547,7 @@ fn collect_tokens_from_expr(
             }
         }
 
-        ExprKind::Block(stmts) => {
+        ExprKind::Block(stmts) | ExprKind::EffectBlock(stmts) => {
             collect_tokens_from_stmts(stmts, text, line_offsets, tokens, seen);
         }
 
@@ -662,6 +666,18 @@ fn collect_tokens_from_type(
             );
         }
 
+        TypeKind::Effect {
+            success,
+            error,
+            requirements,
+        } => {
+            collect_tokens_from_type(success, text, line_offsets, tokens, seen);
+            collect_tokens_from_type(error, text, line_offsets, tokens, seen);
+            for req in requirements {
+                collect_tokens_from_type(req, text, line_offsets, tokens, seen);
+            }
+        }
+
         TypeKind::String
         | TypeKind::Int
         | TypeKind::Float
@@ -669,6 +685,7 @@ fn collect_tokens_from_type(
         | TypeKind::Unknown
         | TypeKind::Infer
         | TypeKind::Unit
+        | TypeKind::Never
         | TypeKind::TraitBound(_) => {}
     }
 }

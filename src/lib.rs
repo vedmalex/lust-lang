@@ -52,7 +52,10 @@ pub use jit::{JitCompiler, JitState, JitStats};
 pub use lexer::{Lexer, Token, TokenKind};
 #[cfg(feature = "std")]
 pub use lust_macros::LustStructView;
-pub use modules::embedded::{EmbeddedModule, build_directory_map, load_program_from_embedded};
+pub use modules::embedded::{
+    EmbeddedModule, build_directory_map, load_program_from_embedded,
+    load_program_from_embedded_with_config,
+};
 pub use modules::{
     LoadedModule, ModuleImports, ModuleLoader, Program, compile_program_with_config,
 };

@@ -1,5 +1,5 @@
 use super::{Expr, Span, Type};
-use alloc::{string::String, vec::Vec};
+use alloc::{boxed::Box, string::String, vec::Vec};
 #[derive(Debug, Clone, PartialEq)]
 pub struct Stmt {
     pub kind: StmtKind,
@@ -61,4 +61,7 @@ pub enum StmtKind {
     Break,
     Continue,
     Block(Vec<Stmt>),
+    Defer(Box<Stmt>),
+    ErrDefer(Box<Stmt>),
+    Scoped(Vec<Stmt>),
 }

@@ -2,11 +2,11 @@ pub mod runtime;
 
 use crate::ast::{
     BinaryOp, EnumDef, Expr, ExprKind, FunctionDef, Item, ItemKind, Literal, Pattern, Stmt,
-    StmtKind, StructDef, Type, TypeKind, UnaryOp,
+    StmtKind, StructDef, Type, TypeKind, UnaryOp, UseTree,
 };
 use crate::error::{LustError, Result};
 use runtime::{RuntimeOptions, generate_runtime};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -71,6 +71,80 @@ pub fn parse_memory_size(s: &str) -> Option<usize> {
     }
 }
 
+pub fn is_math_function(name: &str) -> bool {
+    matches!(
+        name,
+        "sqrt"
+            | "abs"
+            | "floor"
+            | "ceil"
+            | "round"
+            | "sin"
+            | "cos"
+            | "tan"
+            | "asin"
+            | "acos"
+            | "atan"
+            | "atan2"
+            | "clamp"
+            | "min"
+            | "max"
+            | "deg"
+            | "rad"
+            | "exp"
+            | "log"
+            | "mod"
+    )
+}
+
+pub fn collect_use_imports(items: &[Item]) -> HashMap<String, String> {
+    let mut imports = HashMap::new();
+    for item in items {
+        if let ItemKind::Use { tree, .. } = &item.kind {
+            match tree {
+                UseTree::Path { path, alias, .. } => {
+                    if let Some(last) = path.last() {
+                        let short_name = alias.clone().unwrap_or_else(|| last.clone());
+                        imports.insert(short_name, path.join("."));
+                    }
+                }
+                UseTree::Group { prefix, items } => {
+                    for it in items {
+                        if let Some(last) = it.path.last() {
+                            let short_name = it.alias.clone().unwrap_or_else(|| last.clone());
+                            let mut full_path = prefix.clone();
+                            full_path.extend(it.path.clone());
+                            imports.insert(short_name, full_path.join("."));
+                        }
+                    }
+                }
+                UseTree::Glob { prefix } => {
+                    let full_prefix = prefix.join(".");
+                    if full_prefix == "std.math" || full_prefix == "math" {
+                        for fn_name in &[
+                            "sqrt", "abs", "floor", "ceil", "round", "sin", "cos", "tan",
+                            "asin", "acos", "atan", "atan2", "clamp", "min", "max",
+                            "deg", "rad", "exp", "log", "mod",
+                        ] {
+                            imports.entry((*fn_name).to_string())
+                                .or_insert_with(|| format!("{}.{}", full_prefix, fn_name));
+                        }
+                    } else if full_prefix == "std.io" || full_prefix == "io" {
+                        for fn_name in &[
+                            "print", "println", "read_file", "write_file", "write_stdout",
+                            "read_stdin", "read_line",
+                        ] {
+                            imports.entry((*fn_name).to_string())
+                                .or_insert_with(|| format!("{}.{}", full_prefix, fn_name));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    imports
+}
+
 pub struct ZigCodegen {
     out: String,
     indent_level: usize,
@@ -78,6 +152,7 @@ pub struct ZigCodegen {
     known_enums: HashSet<String>,
     temp_var_counter: usize,
     runtime_opts: RuntimeOptions,
+    imports: HashMap<String, String>,
 }
 
 impl Default for ZigCodegen {
@@ -99,6 +174,7 @@ impl ZigCodegen {
             known_enums: HashSet::new(),
             temp_var_counter: 0,
             runtime_opts: opts,
+            imports: HashMap::new(),
         }
     }
 
@@ -131,6 +207,7 @@ impl ZigCodegen {
 
     pub fn generate_program(&mut self, items: &[Item]) -> Result<String> {
         self.out.clear();
+        self.imports = collect_use_imports(items);
         self.out.push_str(&generate_runtime(&self.runtime_opts));
         self.out.push('\n');
 
@@ -736,6 +813,29 @@ impl ZigCodegen {
                 let expr_str = self.emit_expr_to_string(expr)?;
                 self.emit_line(&format!("_ = {};", expr_str));
             }
+            StmtKind::Defer(s) => {
+                self.emit_line("defer {");
+                self.indent();
+                self.emit_stmt(s)?;
+                self.dedent();
+                self.emit_line("}");
+            }
+            StmtKind::ErrDefer(s) => {
+                self.emit_line("errdefer {");
+                self.indent();
+                self.emit_stmt(s)?;
+                self.dedent();
+                self.emit_line("}");
+            }
+            StmtKind::Scoped(stmts) => {
+                self.emit_line("{");
+                self.indent();
+                for s in stmts {
+                    self.emit_stmt(s)?;
+                }
+                self.dedent();
+                self.emit_line("}");
+            }
         }
         Ok(())
     }
@@ -888,6 +988,99 @@ impl ZigCodegen {
         Ok(())
     }
 
+    fn emit_math_call(&mut self, fn_name: &str, args: &[Expr]) -> Result<Option<String>> {
+        let call_str = match fn_name {
+            "mod" if args.len() == 2 => {
+                let a = self.emit_expr_to_string(&args[0])?;
+                let b = self.emit_expr_to_string(&args[1])?;
+                format!("__lust_math_mod({}, {})", a, b)
+            }
+            "abs" if args.len() == 1 => {
+                let x = self.emit_expr_to_string(&args[0])?;
+                format!("__lust_math_abs({})", x)
+            }
+            "floor" if args.len() == 1 => {
+                let x = self.emit_expr_to_string(&args[0])?;
+                format!("__lust_math_floor({})", x)
+            }
+            "ceil" if args.len() == 1 => {
+                let x = self.emit_expr_to_string(&args[0])?;
+                format!("__lust_math_ceil({})", x)
+            }
+            "round" if args.len() == 1 => {
+                let x = self.emit_expr_to_string(&args[0])?;
+                format!("__lust_math_round({})", x)
+            }
+            "sqrt" if args.len() == 1 => {
+                let x = self.emit_expr_to_string(&args[0])?;
+                format!("__lust_math_sqrt({})", x)
+            }
+            "sin" if args.len() == 1 => {
+                let x = self.emit_expr_to_string(&args[0])?;
+                format!("__lust_math_sin({})", x)
+            }
+            "cos" if args.len() == 1 => {
+                let x = self.emit_expr_to_string(&args[0])?;
+                format!("__lust_math_cos({})", x)
+            }
+            "tan" if args.len() == 1 => {
+                let x = self.emit_expr_to_string(&args[0])?;
+                format!("__lust_math_tan({})", x)
+            }
+            "asin" if args.len() == 1 => {
+                let x = self.emit_expr_to_string(&args[0])?;
+                format!("__lust_math_asin({})", x)
+            }
+            "acos" if args.len() == 1 => {
+                let x = self.emit_expr_to_string(&args[0])?;
+                format!("__lust_math_acos({})", x)
+            }
+            "atan" if args.len() == 1 => {
+                let x = self.emit_expr_to_string(&args[0])?;
+                format!("__lust_math_atan({})", x)
+            }
+            "atan2" if args.len() == 2 => {
+                let y = self.emit_expr_to_string(&args[0])?;
+                let x = self.emit_expr_to_string(&args[1])?;
+                format!("__lust_math_atan2({}, {})", y, x)
+            }
+            "clamp" if args.len() == 3 => {
+                let v = self.emit_expr_to_string(&args[0])?;
+                let l = self.emit_expr_to_string(&args[1])?;
+                let u = self.emit_expr_to_string(&args[2])?;
+                format!("__lust_math_clamp({}, {}, {})", v, l, u)
+            }
+            "min" if args.len() == 2 => {
+                let a = self.emit_expr_to_string(&args[0])?;
+                let b = self.emit_expr_to_string(&args[1])?;
+                format!("__lust_math_min({}, {})", a, b)
+            }
+            "max" if args.len() == 2 => {
+                let a = self.emit_expr_to_string(&args[0])?;
+                let b = self.emit_expr_to_string(&args[1])?;
+                format!("__lust_math_max({}, {})", a, b)
+            }
+            "deg" if args.len() == 1 => {
+                let x = self.emit_expr_to_string(&args[0])?;
+                format!("__lust_math_deg({})", x)
+            }
+            "rad" if args.len() == 1 => {
+                let x = self.emit_expr_to_string(&args[0])?;
+                format!("__lust_math_rad({})", x)
+            }
+            "exp" if args.len() == 1 => {
+                let x = self.emit_expr_to_string(&args[0])?;
+                format!("__lust_math_exp({})", x)
+            }
+            "log" if args.len() == 1 => {
+                let x = self.emit_expr_to_string(&args[0])?;
+                format!("__lust_math_log({})", x)
+            }
+            _ => return Ok(None),
+        };
+        Ok(Some(call_str))
+    }
+
     fn emit_expr_to_string(&mut self, expr: &Expr) -> Result<String> {
         match &expr.kind {
             ExprKind::Literal(lit) => match lit {
@@ -981,6 +1174,12 @@ impl ZigCodegen {
                         let sep = self.emit_expr_to_string(&args[0])?;
                         Ok(format!("try {}.concat({})", rec_str, sep))
                     }
+                    "split" if args.len() == 1 => {
+                        let sep = self.emit_expr_to_string(&args[0])?;
+                        Ok(format!("try __lust_string_split({}, {})", rec_str, sep))
+                    }
+                    "chars" if args.is_empty() => Ok(format!("try __lust_string_chars({})", rec_str)),
+                    "lines" if args.is_empty() => Ok(format!("try __lust_string_lines({})", rec_str)),
                     "insert" if args.len() == 1 => {
                         let val = self.emit_expr_to_string(&args[0])?;
                         Ok(format!("try {}.push({})", rec_str, val))
@@ -1070,8 +1269,49 @@ impl ZigCodegen {
                         }
                         _ => {}
                     }
+
+                    let imported = self.imports.get(fn_name.as_str()).cloned();
+                    if let Some(imported) = imported {
+                        if imported == "std.io.print" || imported == "io.print" {
+                            if let Some(arg) = args.first() {
+                                let arg_str = self.emit_expr_to_string(arg)?;
+                                return Ok(format!("__lust_print({})", arg_str));
+                            }
+                        } else if imported == "std.io.println" || imported == "io.println" {
+                            if let Some(arg) = args.first() {
+                                let arg_str = self.emit_expr_to_string(arg)?;
+                                return Ok(format!("__lust_println({})", arg_str));
+                            }
+                        } else if imported.starts_with("std.math.") || imported.starts_with("math.") {
+                            let math_fn = imported.rsplit('.').next().unwrap_or(fn_name.as_str());
+                            if let Some(m_call) = self.emit_math_call(math_fn, args)? {
+                                return Ok(m_call);
+                            }
+                        }
+                    }
+                    if is_math_function(fn_name.as_str()) {
+                        if let Some(m_call) = self.emit_math_call(fn_name.as_str(), args)? {
+                            return Ok(m_call);
+                        }
+                    }
                 } else if let ExprKind::FieldAccess { object, field } = &callee.kind {
-                    if let ExprKind::Identifier(mod_name) = &object.kind {
+                    let mod_name_opt = if let ExprKind::Identifier(mod_name) = &object.kind {
+                        Some(mod_name.as_str())
+                    } else if let ExprKind::FieldAccess { object: inner_obj, field: inner_field } = &object.kind {
+                        if let ExprKind::Identifier(root) = &inner_obj.kind {
+                            if root == "std" {
+                                Some(inner_field.as_str())
+                            } else {
+                                None
+                            }
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    };
+
+                    if let Some(mod_name) = mod_name_opt {
                         if self.known_enums.contains(mod_name) {
                             if args.is_empty() {
                                 return Ok(format!("{}{{ .{} = {{}} }}", mod_name, field));
@@ -1092,7 +1332,7 @@ impl ZigCodegen {
                             }
                         }
 
-                        match mod_name.as_str() {
+                        match mod_name {
                             "Option" => {
                                 if field == "Some" {
                                     if let Some(first_arg) = args.first() {
@@ -1237,6 +1477,14 @@ impl ZigCodegen {
                                 _ => {}
                             },
                             "io" => match field.as_str() {
+                                "print" if args.len() == 1 => {
+                                    let arg_str = self.emit_expr_to_string(&args[0])?;
+                                    return Ok(format!("__lust_print({})", arg_str));
+                                }
+                                "println" if args.len() == 1 => {
+                                    let arg_str = self.emit_expr_to_string(&args[0])?;
+                                    return Ok(format!("__lust_println({})", arg_str));
+                                }
                                 "read_file" if args.len() == 1 => {
                                     let path_str = self.emit_expr_to_string(&args[0])?;
                                     return Ok(format!("try io.read_file({})", path_str));
@@ -1362,97 +1610,21 @@ impl ZigCodegen {
                                     let needle_str = self.emit_expr_to_string(&args[1])?;
                                     return Ok(format!("__lust_string_index_of({}, {})", s_str, needle_str));
                                 }
-                                _ => {}
-                            },
-                            "math" => match field.as_str() {
-                                "mod" if args.len() == 2 => {
-                                    let a = self.emit_expr_to_string(&args[0])?;
-                                    let b = self.emit_expr_to_string(&args[1])?;
-                                    return Ok(format!("__lust_math_mod({}, {})", a, b));
+                                "chars" if args.len() == 1 => {
+                                    let s_str = self.emit_expr_to_string(&args[0])?;
+                                    return Ok(format!("try __lust_string_chars({})", s_str));
                                 }
-                                "abs" if args.len() == 1 => {
-                                    let x = self.emit_expr_to_string(&args[0])?;
-                                    return Ok(format!("__lust_math_abs({})", x));
-                                }
-                                "floor" if args.len() == 1 => {
-                                    let x = self.emit_expr_to_string(&args[0])?;
-                                    return Ok(format!("__lust_math_floor({})", x));
-                                }
-                                "ceil" if args.len() == 1 => {
-                                    let x = self.emit_expr_to_string(&args[0])?;
-                                    return Ok(format!("__lust_math_ceil({})", x));
-                                }
-                                "round" if args.len() == 1 => {
-                                    let x = self.emit_expr_to_string(&args[0])?;
-                                    return Ok(format!("__lust_math_round({})", x));
-                                }
-                                "sqrt" if args.len() == 1 => {
-                                    let x = self.emit_expr_to_string(&args[0])?;
-                                    return Ok(format!("__lust_math_sqrt({})", x));
-                                }
-                                "sin" if args.len() == 1 => {
-                                    let x = self.emit_expr_to_string(&args[0])?;
-                                    return Ok(format!("__lust_math_sin({})", x));
-                                }
-                                "cos" if args.len() == 1 => {
-                                    let x = self.emit_expr_to_string(&args[0])?;
-                                    return Ok(format!("__lust_math_cos({})", x));
-                                }
-                                "tan" if args.len() == 1 => {
-                                    let x = self.emit_expr_to_string(&args[0])?;
-                                    return Ok(format!("__lust_math_tan({})", x));
-                                }
-                                "asin" if args.len() == 1 => {
-                                    let x = self.emit_expr_to_string(&args[0])?;
-                                    return Ok(format!("__lust_math_asin({})", x));
-                                }
-                                "acos" if args.len() == 1 => {
-                                    let x = self.emit_expr_to_string(&args[0])?;
-                                    return Ok(format!("__lust_math_acos({})", x));
-                                }
-                                "atan" if args.len() == 1 => {
-                                    let x = self.emit_expr_to_string(&args[0])?;
-                                    return Ok(format!("__lust_math_atan({})", x));
-                                }
-                                "atan2" if args.len() == 2 => {
-                                    let y = self.emit_expr_to_string(&args[0])?;
-                                    let x = self.emit_expr_to_string(&args[1])?;
-                                    return Ok(format!("__lust_math_atan2({}, {})", y, x));
-                                }
-                                "clamp" if args.len() == 3 => {
-                                    let v = self.emit_expr_to_string(&args[0])?;
-                                    let l = self.emit_expr_to_string(&args[1])?;
-                                    let u = self.emit_expr_to_string(&args[2])?;
-                                    return Ok(format!("__lust_math_clamp({}, {}, {})", v, l, u));
-                                }
-                                "min" if args.len() == 2 => {
-                                    let a = self.emit_expr_to_string(&args[0])?;
-                                    let b = self.emit_expr_to_string(&args[1])?;
-                                    return Ok(format!("__lust_math_min({}, {})", a, b));
-                                }
-                                "max" if args.len() == 2 => {
-                                    let a = self.emit_expr_to_string(&args[0])?;
-                                    let b = self.emit_expr_to_string(&args[1])?;
-                                    return Ok(format!("__lust_math_max({}, {})", a, b));
-                                }
-                                "deg" if args.len() == 1 => {
-                                    let x = self.emit_expr_to_string(&args[0])?;
-                                    return Ok(format!("__lust_math_deg({})", x));
-                                }
-                                "rad" if args.len() == 1 => {
-                                    let x = self.emit_expr_to_string(&args[0])?;
-                                    return Ok(format!("__lust_math_rad({})", x));
-                                }
-                                "exp" if args.len() == 1 => {
-                                    let x = self.emit_expr_to_string(&args[0])?;
-                                    return Ok(format!("__lust_math_exp({})", x));
-                                }
-                                "log" if args.len() == 1 => {
-                                    let x = self.emit_expr_to_string(&args[0])?;
-                                    return Ok(format!("__lust_math_log({})", x));
+                                "lines" if args.len() == 1 => {
+                                    let s_str = self.emit_expr_to_string(&args[0])?;
+                                    return Ok(format!("try __lust_string_lines({})", s_str));
                                 }
                                 _ => {}
                             },
+                            "math" => {
+                                if let Some(m_call) = self.emit_math_call(field.as_str(), args)? {
+                                    return Ok(m_call);
+                                }
+                            }
                             _ => {}
                         }
                     }
@@ -1470,11 +1642,12 @@ impl ZigCodegen {
                         "sort" | "remove" | "pop" | "clear" | "reverse" | "len" | "is_empty"
                             | "first" | "last" | "contains" | "get" | "has" | "delete"
                             | "time" | "sleep" | "get_env" | "remove_file" | "remove_dir" | "rename"
-                            | "write_stdout"
-                    ),
+                            | "write_stdout" | "print" | "println"
+                    ) || is_math_function(field.as_str()),
                     ExprKind::Identifier(fn_name) => {
                         matches!(fn_name.as_str(), "print" | "println" | "assert" | "type")
                             || fn_name.starts_with("__lust_math_")
+                            || is_math_function(fn_name.as_str())
                     }
                     _ => false,
                 };
@@ -2013,9 +2186,14 @@ pub fn analyze_runtime_requirements(
         needs_pow: false,
         needs_io: false,
         needs_os: false,
+        needs_print: false,
+        needs_tostring: false,
+        used_builtins: std::collections::BTreeSet::new(),
         max_memory_bytes,
         is_library,
     };
+
+    let imports = collect_use_imports(items);
 
     for item in items {
         match &item.kind {
@@ -2027,7 +2205,7 @@ pub fn analyze_runtime_requirements(
                     scan_type(ret, &mut opts);
                 }
                 for stmt in &f.body {
-                    scan_stmt(stmt, &mut opts);
+                    scan_stmt(stmt, &mut opts, &imports);
                 }
             }
             ItemKind::Struct(s) => {
@@ -2037,25 +2215,18 @@ pub fn analyze_runtime_requirements(
             }
             ItemKind::Script(stmts) => {
                 for stmt in stmts {
-                    scan_stmt(stmt, &mut opts);
+                    scan_stmt(stmt, &mut opts, &imports);
                 }
             }
             ItemKind::Impl(imp) => {
                 for m in &imp.methods {
                     for stmt in &m.body {
-                        scan_stmt(stmt, &mut opts);
+                        scan_stmt(stmt, &mut opts, &imports);
                     }
                 }
             }
             _ => {}
         }
-    }
-
-    if opts.needs_string {
-        opts.needs_array = true;
-    }
-    if opts.needs_array {
-        opts.needs_string = true;
     }
 
     opts
@@ -2094,161 +2265,251 @@ fn scan_type(ty: &Type, opts: &mut RuntimeOptions) {
     }
 }
 
-fn scan_stmt(stmt: &Stmt, opts: &mut RuntimeOptions) {
+fn scan_stmt(stmt: &Stmt, opts: &mut RuntimeOptions, imports: &HashMap<String, String>) {
     match &stmt.kind {
         StmtKind::Local { initializer, .. } => {
             if let Some(inits) = initializer {
                 for e in inits {
-                    scan_expr(e, opts);
+                    scan_expr(e, opts, imports);
                 }
             }
         }
         StmtKind::Assign { targets, values } => {
             for t in targets {
-                scan_expr(t, opts);
+                scan_expr(t, opts, imports);
             }
             for v in values {
-                scan_expr(v, opts);
+                scan_expr(v, opts, imports);
             }
         }
         StmtKind::CompoundAssign { target, op, value } => {
-            scan_expr(target, opts);
-            scan_expr(value, opts);
+            scan_expr(target, opts, imports);
+            scan_expr(value, opts, imports);
             match op {
                 BinaryOp::Pow => opts.needs_pow = true,
                 BinaryOp::Div | BinaryOp::FloorDiv | BinaryOp::Mod => opts.needs_math = true,
-                BinaryOp::Concat => opts.needs_string = true,
+                BinaryOp::Concat => {
+                    opts.needs_string = true;
+                    opts.needs_tostring = true;
+                }
                 _ => {}
             }
         }
         StmtKind::While { condition, body } => {
-            scan_expr(condition, opts);
+            scan_expr(condition, opts, imports);
             for s in body {
-                scan_stmt(s, opts);
+                scan_stmt(s, opts, imports);
             }
         }
         StmtKind::ForNumeric { start, end, step, body, .. } => {
-            scan_expr(start, opts);
-            scan_expr(end, opts);
+            scan_expr(start, opts, imports);
+            scan_expr(end, opts, imports);
             if let Some(st) = step {
-                scan_expr(st, opts);
+                scan_expr(st, opts, imports);
             }
             for s in body {
-                scan_stmt(s, opts);
+                scan_stmt(s, opts, imports);
             }
         }
         StmtKind::ForIn { iterator, body, .. } => {
             opts.needs_array = true;
-            scan_expr(iterator, opts);
+            scan_expr(iterator, opts, imports);
             for s in body {
-                scan_stmt(s, opts);
+                scan_stmt(s, opts, imports);
             }
         }
         StmtKind::If { condition, then_block, elseif_branches, else_block } => {
-            scan_expr(condition, opts);
+            scan_expr(condition, opts, imports);
             for s in then_block {
-                scan_stmt(s, opts);
+                scan_stmt(s, opts, imports);
             }
             for (c, b) in elseif_branches {
-                scan_expr(c, opts);
+                scan_expr(c, opts, imports);
                 for s in b {
-                    scan_stmt(s, opts);
+                    scan_stmt(s, opts, imports);
                 }
             }
             if let Some(eb) = else_block {
                 for s in eb {
-                    scan_stmt(s, opts);
+                    scan_stmt(s, opts, imports);
                 }
             }
         }
         StmtKind::Return(exprs) => {
             for e in exprs {
-                scan_expr(e, opts);
+                scan_expr(e, opts, imports);
             }
         }
         StmtKind::Expr(e) => {
-            scan_expr(e, opts);
+            scan_expr(e, opts, imports);
         }
         StmtKind::Block(stmts) => {
             for s in stmts {
-                scan_stmt(s, opts);
+                scan_stmt(s, opts, imports);
+            }
+        }
+        StmtKind::Defer(s) => {
+            scan_stmt(s, opts, imports);
+        }
+        StmtKind::ErrDefer(s) => {
+            scan_stmt(s, opts, imports);
+        }
+        StmtKind::Scoped(stmts) => {
+            for s in stmts {
+                scan_stmt(s, opts, imports);
             }
         }
         _ => {}
     }
 }
 
-fn scan_expr(expr: &Expr, opts: &mut RuntimeOptions) {
+fn scan_expr(expr: &Expr, opts: &mut RuntimeOptions, imports: &HashMap<String, String>) {
     match &expr.kind {
         ExprKind::Binary { left, op, right } => {
-            scan_expr(left, opts);
-            scan_expr(right, opts);
+            scan_expr(left, opts, imports);
+            scan_expr(right, opts, imports);
             match op {
                 BinaryOp::Pow => opts.needs_pow = true,
                 BinaryOp::Div | BinaryOp::FloorDiv | BinaryOp::Mod => opts.needs_math = true,
-                BinaryOp::Concat => opts.needs_string = true,
+                BinaryOp::Concat => {
+                    opts.needs_string = true;
+                    opts.needs_tostring = true;
+                }
                 _ => {}
             }
         }
         ExprKind::Array(elements) => {
             opts.needs_array = true;
             for e in elements {
-                scan_expr(e, opts);
+                scan_expr(e, opts, imports);
             }
         }
         ExprKind::Map(entries) => {
             opts.needs_map = true;
             for (k, v) in entries {
-                scan_expr(k, opts);
-                scan_expr(v, opts);
+                scan_expr(k, opts, imports);
+                scan_expr(v, opts, imports);
             }
         }
         ExprKind::Index { object, index } => {
             opts.needs_array = true;
-            scan_expr(object, opts);
-            scan_expr(index, opts);
+            scan_expr(object, opts, imports);
+            scan_expr(index, opts, imports);
         }
         ExprKind::FieldAccess { object, field } => {
-            scan_expr(object, opts);
-            if let ExprKind::Identifier(mod_name) = &object.kind {
-                match mod_name.as_str() {
-                    "io" => opts.needs_io = true,
+            scan_expr(object, opts, imports);
+            let mod_name_opt = if let ExprKind::Identifier(mod_name) = &object.kind {
+                Some(mod_name.as_str())
+            } else if let ExprKind::FieldAccess { object: inner_obj, field: inner_field } = &object.kind {
+                if let ExprKind::Identifier(root) = &inner_obj.kind {
+                    if root == "std" {
+                        Some(inner_field.as_str())
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+
+            if let Some(mod_name) = mod_name_opt {
+                match mod_name {
+                    "io" => {
+                        opts.needs_io = true;
+                        if field == "print" || field == "println" {
+                            opts.needs_print = true;
+                            opts.needs_tostring = true;
+                            opts.used_builtins.insert(format!("io.{}", field));
+                        }
+                    }
                     "os" => opts.needs_os = true,
-                    "math" => opts.needs_math = true,
-                    "string" => opts.needs_string = true,
-                    "array" | "table" => opts.needs_array = true,
+                    "math" => {
+                        opts.needs_math = true;
+                        opts.used_builtins.insert(format!("math.{}", field));
+                    }
+                    "string" => {
+                        opts.needs_string = true;
+                        if field == "split" || field == "chars" || field == "lines" {
+                            opts.needs_array = true;
+                        }
+                        opts.used_builtins.insert(format!("string.{}", field));
+                    }
+                    "array" | "table" => {
+                        opts.needs_array = true;
+                        if field == "concat" {
+                            opts.needs_string = true;
+                            opts.needs_tostring = true;
+                        }
+                        opts.used_builtins.insert(format!("{}.{}", mod_name, field));
+                    }
                     "map" => opts.needs_map = true,
                     _ => {}
                 }
             }
-            if field == "len" || field == "push" || field == "pop" {
+            if field == "push" || field == "pop" {
                 opts.needs_array = true;
             }
         }
         ExprKind::Call { callee, args, .. } => {
-            scan_expr(callee, opts);
+            scan_expr(callee, opts, imports);
             for a in args {
-                scan_expr(a, opts);
+                scan_expr(a, opts, imports);
             }
             if let ExprKind::Identifier(name) = &callee.kind {
+                if let Some(imported) = imports.get(name.as_str()) {
+                    if imported == "std.io.print" || imported == "io.print" {
+                        opts.needs_print = true;
+                        opts.needs_tostring = true;
+                        opts.used_builtins.insert("print".to_string());
+                    } else if imported == "std.io.println" || imported == "io.println" {
+                        opts.needs_print = true;
+                        opts.needs_tostring = true;
+                        opts.used_builtins.insert("println".to_string());
+                    } else if imported.starts_with("std.math.") || imported.starts_with("math.") {
+                        opts.needs_math = true;
+                        opts.used_builtins.insert(imported.clone());
+                    }
+                }
                 match name.as_str() {
-                    "tostring" => opts.needs_string = true,
-                    "print" | "println" => opts.needs_string = true,
+                    "tostring" => {
+                        opts.needs_string = true;
+                        opts.needs_tostring = true;
+                        opts.used_builtins.insert("tostring".to_string());
+                    }
+                    "print" | "println" => {
+                        opts.needs_print = true;
+                        opts.needs_tostring = true;
+                        opts.used_builtins.insert(name.clone());
+                    }
+                    other if is_math_function(other) => {
+                        opts.needs_math = true;
+                        opts.used_builtins.insert(format!("math.{}", other));
+                    }
                     _ => {}
                 }
             }
         }
         ExprKind::MethodCall { receiver, method, args, .. } => {
-            scan_expr(receiver, opts);
+            scan_expr(receiver, opts, imports);
             for a in args {
-                scan_expr(a, opts);
+                scan_expr(a, opts, imports);
             }
             match method.as_str() {
-                "push" | "pop" | "insert" | "remove" | "sort" | "slice" | "contains" | "reverse" | "concat" => {
+                "push" | "pop" | "insert" | "remove" | "sort" | "slice" | "contains" | "reverse" => {
                     opts.needs_array = true;
-                    if method == "concat" {
-                        opts.needs_string = true;
-                    }
+                }
+                "concat" => {
+                    opts.needs_array = true;
+                    opts.needs_string = true;
+                    opts.needs_tostring = true;
+                    opts.used_builtins.insert("array.concat".to_string());
+                }
+                "split" | "chars" | "lines" => {
+                    opts.needs_string = true;
+                    opts.needs_array = true;
+                    opts.used_builtins.insert(format!("string.{}", method));
                 }
                 "set" | "get" | "has" | "delete" => {
                     opts.needs_map = true;
@@ -2257,14 +2518,14 @@ fn scan_expr(expr: &Expr, opts: &mut RuntimeOptions) {
             }
         }
         ExprKind::If { condition, then_branch, else_branch } => {
-            scan_expr(condition, opts);
-            scan_expr(then_branch, opts);
+            scan_expr(condition, opts, imports);
+            scan_expr(then_branch, opts, imports);
             if let Some(eb) = else_branch {
-                scan_expr(eb, opts);
+                scan_expr(eb, opts, imports);
             }
         }
         ExprKind::Paren(inner) | ExprKind::Unary { operand: inner, .. } => {
-            scan_expr(inner, opts);
+            scan_expr(inner, opts, imports);
         }
         _ => {}
     }

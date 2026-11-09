@@ -55,6 +55,37 @@ impl EmbeddedBuilder {
         Self::default()
     }
 
+    pub fn pure() -> Self {
+        let mut builder = Self::default();
+        builder.config = LustConfig::pure();
+        builder
+    }
+
+    pub fn prelude_mode(mut self, mode: crate::config::PreludeMode) -> Self {
+        self.config.set_prelude_mode(mode);
+        self
+    }
+
+    pub fn with_prelude_mode(mut self, mode: crate::config::PreludeMode) -> Self {
+        self.config.set_prelude_mode(mode);
+        self
+    }
+
+    pub fn with_capability_mask(mut self, mask: crate::config::CapabilityMask) -> Self {
+        self.config.set_capability_mask(mask);
+        self
+    }
+
+    pub fn strict_capabilities(mut self, strict: bool) -> Self {
+        self.config.set_strict_capabilities(strict);
+        self
+    }
+
+    pub fn allow_std_module<S: AsRef<str>>(mut self, module: S) -> Self {
+        self.config.allow_std_module(module);
+        self
+    }
+
     /// Set the root directory used to resolve Lust module files.
     ///
     /// Modules registered in memory with [`Self::module`] or [`Self::add_module`]
@@ -1544,6 +1575,9 @@ impl EmbeddedProgram {
             TypeKind::Union(_) => Err(PreflightError::type_error(
                 "Union schema is strictly rejected",
             )),
+            TypeKind::Never | TypeKind::Effect { .. } => Err(PreflightError::type_error(
+                "Effect/Never schema is not supported in embed parameters",
+            )),
         }
     }
 
@@ -2199,6 +2233,12 @@ pub(crate) fn compile_to_bytecode(
         config.jit_enabled().hash(&mut hasher);
         config.minimal_runtime_types().hash(&mut hasher);
         config.low_memory_mode().hash(&mut hasher);
+        config.prelude_mode().hash(&mut hasher);
+        config.capability_mask().hash(&mut hasher);
+        config.strict_capabilities().hash(&mut hasher);
+        for m in config.enabled_modules() {
+            m.hash(&mut hasher);
+        }
         let key = format!("{:016x}", hasher.finish());
         let cached = BYTECODE_CACHE.with(|cache| cache.borrow().get(&key).cloned());
         if let Some(cached) = cached {
@@ -2210,6 +2250,7 @@ pub(crate) fn compile_to_bytecode(
     };
 
     let mut loader = ModuleLoader::new(base_dir.clone());
+    loader.set_config(config.clone());
     loader.set_source_overrides(overrides);
     let entry_path = module_path_to_file(&base_dir, &entry_module);
     let entry_path_str = entry_path

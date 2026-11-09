@@ -1,6 +1,9 @@
 use super::Parser;
 use crate::{
-    ast::{BinaryOp, Expr, ExprKind, Literal, Pattern, Span, StructLiteralField, UnaryOp},
+    ast::{
+        BinaryOp, Expr, ExprKind, Literal, Pattern, Span, StructLiteralField, Type, TypeKind,
+        UnaryOp,
+    },
     error::{LustError, Result},
     lexer::{Token, TokenKind},
     number::{LustInt, parse_float},
@@ -679,7 +682,53 @@ impl Parser {
                 ExprKind::Literal(Literal::Bool(false))
             }
 
+            TokenKind::EffectKw => {
+                self.advance();
+                let mut statements = Vec::new();
+                if self.match_token(&[TokenKind::LeftBrace]) {
+                    while !self.check(TokenKind::RightBrace) && !self.is_at_end() {
+                        statements.push(self.parse_stmt()?);
+                    }
+                    self.consume(TokenKind::RightBrace, "Expected '}' after effect block")?;
+                } else if self.match_token(&[TokenKind::Do]) {
+                    while !self.check(TokenKind::End) && !self.is_at_end() {
+                        statements.push(self.parse_stmt()?);
+                    }
+                    self.consume(TokenKind::End, "Expected 'end' after effect block")?;
+                } else {
+                    return Err(self.error("Expected 'do' or '{' after 'effect'"));
+                }
+                let end_token = self.tokens[self.current - 1].clone();
+                return Ok(Expr::new(
+                    ExprKind::EffectBlock(statements),
+                    self.make_span(&start_token, &end_token),
+                ));
+            }
+
             TokenKind::Identifier => {
+                if self.current_token().lexeme == "effect"
+                    && (self.peek_ahead(1).is_some_and(|t| t.kind == TokenKind::Do || t.kind == TokenKind::LeftBrace))
+                {
+                    self.advance();
+                    let mut statements = Vec::new();
+                    if self.match_token(&[TokenKind::LeftBrace]) {
+                        while !self.check(TokenKind::RightBrace) && !self.is_at_end() {
+                            statements.push(self.parse_stmt()?);
+                        }
+                        self.consume(TokenKind::RightBrace, "Expected '}' after effect block")?;
+                    } else if self.match_token(&[TokenKind::Do]) {
+                        while !self.check(TokenKind::End) && !self.is_at_end() {
+                            statements.push(self.parse_stmt()?);
+                        }
+                        self.consume(TokenKind::End, "Expected 'end' after effect block")?;
+                    }
+                    let end_token = self.tokens[self.current - 1].clone();
+                    return Ok(Expr::new(
+                        ExprKind::EffectBlock(statements),
+                        self.make_span(&start_token, &end_token),
+                    ));
+                }
+
                 let name = self.expect_identifier()?;
                 if self.check(TokenKind::LeftBrace) {
                     return self.parse_struct_literal(name);
@@ -1057,6 +1106,24 @@ impl Parser {
             Some(self.parse_type()?)
         } else {
             None
+        };
+        let (error_type, requirements) = self.parse_optional_effects_spec()?;
+        let return_type = if error_type.is_some() || !requirements.is_empty() {
+            let span = return_type.as_ref().map(|t| t.span).unwrap_or_else(Span::dummy);
+            let success = Box::new(return_type.unwrap_or_else(|| Type::new(TypeKind::Unit, span)));
+            let error = Box::new(
+                error_type.unwrap_or_else(|| Type::new(TypeKind::Never, Span::dummy())),
+            );
+            Some(Type::new(
+                TypeKind::Effect {
+                    success,
+                    error,
+                    requirements,
+                },
+                span,
+            ))
+        } else {
+            return_type
         };
         let mut statements = Vec::new();
         while !self.check(TokenKind::End) && !self.is_at_end() {

@@ -81,9 +81,103 @@ impl DependencySpec {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PreludeMode {
+    Standard,
+    Pure,
+    Custom {
+        auto_globals: HashSet<String>,
+        allowed_modules: HashSet<String>,
+    },
+}
+
+impl Default for PreludeMode {
+    fn default() -> Self {
+        PreludeMode::Standard
+    }
+}
+
+impl PartialEq<PreludeMode> for &PreludeMode {
+    fn eq(&self, other: &PreludeMode) -> bool {
+        **self == *other
+    }
+}
+
+impl std::hash::Hash for PreludeMode {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        core::mem::discriminant(self).hash(state);
+        match self {
+            PreludeMode::Standard | PreludeMode::Pure => {}
+            PreludeMode::Custom {
+                auto_globals,
+                allowed_modules,
+            } => {
+                let mut globals: Vec<&String> = auto_globals.iter().collect();
+                globals.sort();
+                globals.hash(state);
+                let mut modules: Vec<&String> = allowed_modules.iter().collect();
+                modules.sort();
+                modules.hash(state);
+            }
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CapabilityMask {
+    pub allow_io: bool,
+    pub allow_fs: bool,
+    pub allow_os: bool,
+    pub allow_net: bool,
+    pub allow_task: bool,
+    pub custom_capabilities: HashSet<String>,
+}
+
+impl Default for CapabilityMask {
+    fn default() -> Self {
+        Self {
+            allow_io: true,
+            allow_fs: true,
+            allow_os: true,
+            allow_net: true,
+            allow_task: true,
+            custom_capabilities: HashSet::new(),
+        }
+    }
+}
+
+impl std::hash::Hash for CapabilityMask {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.allow_io.hash(state);
+        self.allow_fs.hash(state);
+        self.allow_os.hash(state);
+        self.allow_net.hash(state);
+        self.allow_task.hash(state);
+        let mut customs: Vec<&String> = self.custom_capabilities.iter().collect();
+        customs.sort();
+        customs.hash(state);
+    }
+}
+
+impl CapabilityMask {
+    pub fn none() -> Self {
+        Self {
+            allow_io: false,
+            allow_fs: false,
+            allow_os: false,
+            allow_net: false,
+            allow_task: false,
+            custom_capabilities: HashSet::new(),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct LustConfig {
     enabled_modules: HashSet<String>,
+    prelude_mode: PreludeMode,
+    capability_mask: CapabilityMask,
+    strict_capabilities: bool,
     jit_enabled: bool,
     gc_enabled: bool,
     /// When enabled, minimizes memory usage during compilation by:
@@ -123,6 +217,9 @@ impl Default for LustConfig {
         };
         Self {
             enabled_modules: HashSet::new(),
+            prelude_mode: PreludeMode::Standard,
+            capability_mask: CapabilityMask::default(),
+            strict_capabilities: false,
             jit_enabled: true,
             gc_enabled,
             low_memory_mode: false,
@@ -166,6 +263,152 @@ impl LustConfig {
         let entry_path = entry_file.as_ref();
         let dir = entry_path.parent().unwrap_or_else(|| Path::new("."));
         Self::load_from_dir(dir)
+    }
+
+    pub fn pure() -> Self {
+        let mut config = Self::default();
+        config.prelude_mode = PreludeMode::Pure;
+        config.capability_mask = CapabilityMask::none();
+        config.enabled_modules.clear();
+        config
+    }
+
+    pub fn prelude_mode(&self) -> &PreludeMode {
+        &self.prelude_mode
+    }
+
+    pub fn set_prelude_mode(&mut self, mode: PreludeMode) {
+        self.prelude_mode = mode;
+    }
+
+    pub fn with_prelude_mode(mut self, mode: PreludeMode) -> Self {
+        self.prelude_mode = mode;
+        self
+    }
+
+    pub fn capability_mask(&self) -> &CapabilityMask {
+        &self.capability_mask
+    }
+
+    pub fn capability_mask_mut(&mut self) -> &mut CapabilityMask {
+        &mut self.capability_mask
+    }
+
+    pub fn set_capability_mask(&mut self, mask: CapabilityMask) {
+        self.capability_mask = mask;
+    }
+
+    pub fn with_capability_mask(mut self, mask: CapabilityMask) -> Self {
+        self.capability_mask = mask;
+        self
+    }
+
+    pub fn strict_capabilities(&self) -> bool {
+        self.strict_capabilities
+    }
+
+    pub fn set_strict_capabilities(&mut self, strict: bool) {
+        self.strict_capabilities = strict;
+    }
+
+    pub fn with_strict_capabilities(mut self, strict: bool) -> Self {
+        self.strict_capabilities = strict;
+        self
+    }
+
+    pub fn allow_std_module<S: AsRef<str>>(&mut self, module: S) {
+        let m = module.as_ref().trim();
+        let key = if let Some(stripped) = m.strip_prefix("std.") {
+            stripped
+        } else {
+            m
+        }
+        .to_ascii_lowercase();
+
+        self.enable_module(&key);
+        match key.as_str() {
+            "io" => {
+                self.capability_mask.allow_io = true;
+                self.capability_mask.allow_fs = true;
+            }
+            "os" => {
+                self.capability_mask.allow_os = true;
+            }
+            "task" => {
+                self.capability_mask.allow_task = true;
+            }
+            "net" => {
+                self.capability_mask.allow_net = true;
+            }
+            other => {
+                self.capability_mask.custom_capabilities.insert(other.to_string());
+            }
+        }
+        if let PreludeMode::Custom { allowed_modules, .. } = &mut self.prelude_mode {
+            allowed_modules.insert(key.clone());
+            allowed_modules.insert(format!("std.{}", key));
+        }
+    }
+
+    pub fn allow_all_pure_std(&mut self) {
+        for mod_name in ["math", "string", "array", "map", "table", "fmt", "assert", "iter"] {
+            self.allow_std_module(mod_name);
+        }
+    }
+
+    pub fn is_std_module_allowed(&self, module: &str) -> bool {
+        let m = module.trim();
+        let key = if let Some(stripped) = m.strip_prefix("std.") {
+            stripped
+        } else {
+            m
+        }
+        .to_ascii_lowercase();
+
+        if self.strict_capabilities {
+            return self.is_module_enabled(&key)
+                || self.capability_mask.custom_capabilities.contains(&key)
+                || (key == "io" && self.capability_mask.allow_io)
+                || (key == "os" && self.capability_mask.allow_os)
+                || (key == "task" && self.capability_mask.allow_task);
+        }
+
+        match &self.prelude_mode {
+            PreludeMode::Standard => {
+                match key.as_str() {
+                    "io" => self.is_module_enabled("io") || self.capability_mask.allow_io,
+                    "os" => self.is_module_enabled("os") || self.capability_mask.allow_os,
+                    _ => true,
+                }
+            }
+            PreludeMode::Pure => {
+                match key.as_str() {
+                    "math" | "string" | "array" | "map" | "table" | "fmt" | "assert" | "iter" => {
+                        true
+                    }
+                    "io" => self.is_module_enabled("io") || self.capability_mask.allow_io,
+                    "os" => self.is_module_enabled("os") || self.capability_mask.allow_os,
+                    "random" => {
+                        self.is_module_enabled("random")
+                            || self.capability_mask.custom_capabilities.contains("random")
+                    }
+                    "task" => self.is_module_enabled("task") || self.capability_mask.allow_task,
+                    "lua" => {
+                        self.is_module_enabled("lua")
+                            || self.capability_mask.custom_capabilities.contains("lua")
+                    }
+                    other => {
+                        self.is_module_enabled(other)
+                            || self.capability_mask.custom_capabilities.contains(other)
+                    }
+                }
+            }
+            PreludeMode::Custom { allowed_modules, .. } => {
+                allowed_modules.contains(&key)
+                    || allowed_modules.contains(&format!("std.{}", key))
+                    || self.is_module_enabled(&key)
+            }
+        }
     }
 
     pub fn jit_enabled(&self) -> bool {
@@ -384,6 +627,9 @@ impl LustConfig {
 
         Ok(Self {
             enabled_modules: modules,
+            prelude_mode: PreludeMode::Standard,
+            capability_mask: CapabilityMask::default(),
+            strict_capabilities: false,
             jit_enabled: jit,
             gc_enabled: gc_val,
             low_memory_mode: false,

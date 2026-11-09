@@ -46,6 +46,10 @@ impl Parser {
                         "string" => TypeKind::String,
                         "bool" => TypeKind::Bool,
                         "unknown" => TypeKind::Unknown,
+                        "never" => TypeKind::Never,
+                        "Effect" if self.check(TokenKind::Less) => {
+                            return self.parse_effect_type_args(&start_token);
+                        }
                         _ => {
                             if self.check(TokenKind::Less) {
                                 let type_args = self.parse_type_arguments()?;
@@ -126,6 +130,22 @@ impl Parser {
                 } else {
                     Box::new(Type::new(TypeKind::Unit, Span::dummy()))
                 };
+                let (error_type, requirements) = self.parse_optional_effects_spec()?;
+                let return_type = if error_type.is_some() || !requirements.is_empty() {
+                    let span = return_type.span;
+                    Box::new(Type::new(
+                        TypeKind::Effect {
+                            success: return_type,
+                            error: Box::new(
+                                error_type.unwrap_or_else(|| Type::new(TypeKind::Never, Span::dummy())),
+                            ),
+                            requirements,
+                        },
+                        span,
+                    ))
+                } else {
+                    return_type
+                };
                 TypeKind::Function {
                     params,
                     return_type,
@@ -197,5 +217,82 @@ impl Parser {
                 module: None,
             })
         }
+    }
+
+    fn parse_effect_type_args(&mut self, start_token: &crate::lexer::Token) -> Result<Type> {
+        self.consume(TokenKind::Less, "Expected '<' after 'Effect'")?;
+        let success = Box::new(self.parse_type()?);
+        let (error, requirements) = if self.match_token(&[TokenKind::Comma]) {
+            let err = Box::new(self.parse_type()?);
+            let reqs = if self.match_token(&[TokenKind::Comma]) {
+                let mut r = Vec::new();
+                if !self.check(TokenKind::Greater) && !self.check(TokenKind::DoubleGreater) {
+                    if self.match_token(&[TokenKind::LeftParen]) {
+                        if !self.check(TokenKind::RightParen) {
+                            r.push(self.parse_type()?);
+                            while self.match_token(&[TokenKind::Plus]) {
+                                r.push(self.parse_type()?);
+                            }
+                        }
+                        self.consume(TokenKind::RightParen, "Expected ')' after requirements")?;
+                    } else {
+                        r.push(self.parse_type()?);
+                        while self.match_token(&[TokenKind::Plus]) {
+                            r.push(self.parse_type()?);
+                        }
+                    }
+                }
+                r
+            } else {
+                Vec::new()
+            };
+            (err, reqs)
+        } else {
+            (
+                Box::new(Type::new(TypeKind::Never, Span::dummy())),
+                Vec::new(),
+            )
+        };
+        self.consume_closing_angle_bracket("Expected '>' after type arguments")?;
+        let end_token = self.tokens[self.current - 1].clone();
+        Ok(Type::new(
+            TypeKind::Effect {
+                success,
+                error,
+                requirements,
+            },
+            self.make_span(start_token, &end_token),
+        ))
+    }
+
+    pub(super) fn parse_requirements_row(&mut self) -> Result<Vec<Type>> {
+        let mut reqs = Vec::new();
+        if self.match_token(&[TokenKind::LeftParen]) {
+            if !self.check(TokenKind::RightParen) {
+                reqs.push(self.parse_type()?);
+                while self.match_token(&[TokenKind::Plus]) {
+                    reqs.push(self.parse_type()?);
+                }
+            }
+            self.consume(TokenKind::RightParen, "Expected ')' after requirements list")?;
+        } else {
+            reqs.push(self.parse_type()?);
+            while self.match_token(&[TokenKind::Plus]) {
+                reqs.push(self.parse_type()?);
+            }
+        }
+        Ok(reqs)
+    }
+
+    pub(super) fn parse_optional_effects_spec(&mut self) -> Result<(Option<Type>, Vec<Type>)> {
+        let mut error_type = None;
+        let mut requirements = Vec::new();
+        if self.match_token(&[TokenKind::Bang]) {
+            error_type = Some(self.parse_type()?);
+        }
+        if self.match_token(&[TokenKind::Tilde]) {
+            requirements = self.parse_requirements_row()?;
+        }
+        Ok((error_type, requirements))
     }
 }

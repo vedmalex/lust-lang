@@ -293,6 +293,18 @@ impl Compiler {
             } => {
                 self.compile_for_in_loop(variables, iterator, body)?;
             }
+
+            StmtKind::Defer(s) | StmtKind::ErrDefer(s) => {
+                self.compile_stmt(s)?;
+            }
+
+            StmtKind::Scoped(stmts) => {
+                self.begin_scope();
+                for s in stmts {
+                    self.compile_stmt(s)?;
+                }
+                self.end_scope();
+            }
         }
 
         // Reset temporary registers after each statement to prevent accumulation

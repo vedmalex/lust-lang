@@ -48,6 +48,21 @@ pub mod zig_engine {
         CompilationFailed,
     }
 
+    fn function_has_io_or_print(func: &MirFunction) -> bool {
+        for block in &func.blocks {
+            if let Some(Terminator::Call { callee, .. }) = &block.terminator {
+                if callee == "print" || callee == "println" || callee.starts_with("io.") {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    fn module_has_io_or_print(module: &MirModule) -> bool {
+        module.functions.iter().any(function_has_io_or_print)
+    }
+
     pub struct MirToZigCompiler;
 
     impl MirToZigCompiler {
@@ -59,7 +74,8 @@ pub mod zig_engine {
             func: &MirFunction,
             opts: &ZigCompileOptions,
         ) -> Result<String, MirZigBackendError> {
-            let mut s = Self::generate_preamble(opts);
+            let needs_io_print = function_has_io_or_print(func);
+            let mut s = Self::generate_preamble(opts, needs_io_print);
             s.push_str(&Self::generate_function_code(func)?);
             Ok(s)
         }
@@ -68,7 +84,8 @@ pub mod zig_engine {
             module: &MirModule,
             opts: &ZigCompileOptions,
         ) -> Result<String, MirZigBackendError> {
-            let mut s = Self::generate_preamble(opts);
+            let needs_io_print = module_has_io_or_print(module);
+            let mut s = Self::generate_preamble(opts, needs_io_print);
             for func in &module.functions {
                 s.push_str(&Self::generate_function_code(func)?);
                 s.push('\n');
@@ -76,9 +93,14 @@ pub mod zig_engine {
             Ok(s)
         }
 
-        fn generate_preamble(opts: &ZigCompileOptions) -> String {
+        fn generate_preamble(opts: &ZigCompileOptions, needs_io_print: bool) -> String {
             let mut s = String::new();
             s.push_str("const std = @import(\"std\");\n\n");
+            if needs_io_print {
+                s.push_str("fn __lust_mir_print(val: anytype) void {\n");
+                s.push_str("    std.debug.print(\"{any}\\n\", .{val});\n");
+                s.push_str("}\n\n");
+            }
             s.push_str("var __arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);\n");
             s.push_str("var __gas_remaining: i64 = 1000000000;\n");
             let mem_limit_str = match opts.max_memory_bytes {
@@ -267,9 +289,9 @@ pub mod zig_engine {
                                 args_strs.push(lower_operand(arg)?);
                             }
                             let dest_expr = lower_place(destination);
-                            if callee == "print" || callee == "println" {
+                            if callee == "print" || callee == "println" || callee.starts_with("io.") {
                                 let first = args_strs.first().cloned().unwrap_or("0".to_string());
-                                s.push_str(&format!("                std.debug.print(\"{{d}}\\n\", .{{{first}}});\n"));
+                                s.push_str(&format!("                __lust_mir_print({first});\n"));
                                 s.push_str(&format!("                block_id = {};\n                continue;\n", success.0));
                             } else {
                                 let call_expr = match callee.as_str() {

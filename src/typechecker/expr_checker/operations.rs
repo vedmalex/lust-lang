@@ -786,6 +786,18 @@ impl TypeChecker {
                     );
                 }
             }
+
+            if self.prelude_mode == crate::config::PreludeMode::Pure
+                && self.resolve_module_alias(type_name).is_none()
+                && self.env.lookup_variable(type_name).is_none()
+            {
+                if let Some(hint) = crate::builtins::std_symbol_import_hint(type_name) {
+                    return Err(self.type_error_at(
+                        format!("Undefined module or function '{}.{}'; {}", type_name, field, hint),
+                        callee.span,
+                    ));
+                }
+            }
         }
 
         if let ExprKind::Identifier(name) = &callee.kind {
@@ -870,6 +882,17 @@ impl TypeChecker {
             let resolved = self.resolve_function_key(name);
             let sig_opt = self.env.lookup_function(&resolved).cloned();
             if sig_opt.is_none() {
+                if self.prelude_mode == crate::config::PreludeMode::Pure
+                    && self.env.lookup_variable(name).is_none()
+                    && self.resolve_module_alias(name).is_none()
+                {
+                    if let Some(hint) = crate::builtins::std_symbol_import_hint(name) {
+                        return Err(self.type_error_at(
+                            format!("Undefined function '{}'; {}", name, hint),
+                            callee.span,
+                        ));
+                    }
+                }
                 if !explicit_type_args.is_empty() {
                     return Err(self.type_error_at(
                         format!("Unknown generic function '{}'", name),

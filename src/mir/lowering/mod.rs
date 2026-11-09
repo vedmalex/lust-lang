@@ -875,6 +875,14 @@ impl<'a> AstLowering<'a> {
                 }
                 self.pop_scope();
             }
+            StmtKind::Defer(_) | StmtKind::ErrDefer(_) => {}
+            StmtKind::Scoped(stmts) => {
+                self.push_scope();
+                for s in stmts {
+                    self.lower_statement(s)?;
+                }
+                self.pop_scope();
+            }
         }
         Ok(())
     }

@@ -1693,6 +1693,442 @@ pub fn lookup_builtin_method(
     None
 }
 
+pub fn is_virtual_std_module(module_path: &str) -> bool {
+    let m = module_path.trim();
+    if let Some(stripped) = m.strip_prefix("std.") {
+        matches!(
+            stripped,
+            "math"
+                | "string"
+                | "array"
+                | "map"
+                | "table"
+                | "io"
+                | "os"
+                | "task"
+                | "lua"
+                | "fmt"
+                | "assert"
+                | "iter"
+                | "random"
+        )
+    } else {
+        matches!(
+            m,
+            "math"
+                | "string"
+                | "array"
+                | "map"
+                | "table"
+                | "io"
+                | "os"
+                | "task"
+                | "lua"
+                | "fmt"
+                | "assert"
+                | "iter"
+                | "random"
+        )
+    }
+}
+
+pub fn canonical_std_module_name(module_path: &str) -> &'static str {
+    let m = module_path.trim();
+    let stripped = m.strip_prefix("std.").unwrap_or(m);
+    match stripped {
+        "math" => "math",
+        "string" => "string",
+        "array" => "array",
+        "map" => "map",
+        "table" => "table",
+        "io" => "io",
+        "os" => "os",
+        "task" => "task",
+        "lua" => "lua",
+        "fmt" => "fmt",
+        "assert" => "assert",
+        "iter" => "iter",
+        "random" => "random",
+        _ => "unknown",
+    }
+}
+
+pub fn resolve_std_function(module_path: &str, item_name: &str) -> Option<&'static str> {
+    let canon = canonical_std_module_name(module_path);
+    match canon {
+        "math" => match item_name {
+            "abs" => Some("math.abs"),
+            "floor" => Some("math.floor"),
+            "ceil" => Some("math.ceil"),
+            "round" => Some("math.round"),
+            "sqrt" => Some("math.sqrt"),
+            "sin" => Some("math.sin"),
+            "cos" => Some("math.cos"),
+            "tan" => Some("math.tan"),
+            "asin" => Some("math.asin"),
+            "acos" => Some("math.acos"),
+            "atan" => Some("math.atan"),
+            "atan2" => Some("math.atan2"),
+            "min" => Some("math.min"),
+            "max" => Some("math.max"),
+            "clamp" => Some("math.clamp"),
+            "random" => Some("math.random"),
+            "randomseed" => Some("math.randomseed"),
+            "deg" => Some("math.deg"),
+            "rad" => Some("math.rad"),
+            "exp" => Some("math.exp"),
+            "log" => Some("math.log"),
+            "tointeger" => Some("math.tointeger"),
+            "tofloat" => Some("math.tofloat"),
+            "mod" => Some("math.mod"),
+            _ => None,
+        },
+        "io" => match item_name {
+            "print" => Some("print"),
+            "println" => Some("println"),
+            "read_file" => Some("io.read_file"),
+            "write_file" => Some("io.write_file"),
+            _ => None,
+        },
+        "fmt" => match item_name {
+            "tostring" => Some("tostring"),
+            "tonumber" => Some("tonumber"),
+            "type" => Some("type"),
+            _ => None,
+        },
+        "assert" => match item_name {
+            "assert" => Some("assert"),
+            "error" => Some("error"),
+            _ => None,
+        },
+        "iter" => match item_name {
+            "ipairs" => Some("ipairs"),
+            "pairs" => Some("pairs"),
+            _ => None,
+        },
+        "random" => match item_name {
+            "random" => Some("random"),
+            "randomseed" => Some("randomseed"),
+            _ => None,
+        },
+        "table" => match item_name {
+            "len" => Some("table.len"),
+            "is_empty" => Some("table.is_empty"),
+            "get" => Some("table.get"),
+            "first" => Some("table.first"),
+            "last" => Some("table.last"),
+            "push" => Some("table.push"),
+            "pop" => Some("table.pop"),
+            "insert" => Some("table.insert"),
+            "remove" => Some("table.remove"),
+            "clear" => Some("table.clear"),
+            "slice" => Some("table.slice"),
+            "concat" => Some("table.concat"),
+            "sort" => Some("table.sort"),
+            "reverse" => Some("table.reverse"),
+            "contains" => Some("table.contains"),
+            "map" => Some("table.map"),
+            "filter" => Some("table.filter"),
+            "reduce" => Some("table.reduce"),
+            "iter" => Some("table.iter"),
+            "unpack" => Some("table.unpack"),
+            _ => None,
+        },
+        "string" => match item_name {
+            "len" => Some("string.len"),
+            "sub" => Some("string.sub"),
+            "find" => Some("string.find"),
+            "byte" => Some("string.byte"),
+            "char" => Some("string.char"),
+            "rep" => Some("string.rep"),
+            "reverse" => Some("string.reverse"),
+            "lower" => Some("string.lower"),
+            "upper" => Some("string.upper"),
+            "format" => Some("string.format"),
+            "slice" => Some("string.slice"),
+            "index_of" => Some("string.index_of"),
+            _ => None,
+        },
+        "array" => match item_name {
+            "len" => Some("array.len"),
+            "push" => Some("array.push"),
+            "pop" => Some("array.pop"),
+            "get" => Some("array.get"),
+            "set" => Some("array.set"),
+            "is_empty" => Some("array.is_empty"),
+            "first" => Some("array.first"),
+            "last" => Some("array.last"),
+            "insert" => Some("array.insert"),
+            "remove" => Some("array.remove"),
+            "clear" => Some("array.clear"),
+            "slice" => Some("array.slice"),
+            "concat" => Some("array.concat"),
+            "sort" => Some("array.sort"),
+            "reverse" => Some("array.reverse"),
+            "contains" => Some("array.contains"),
+            "map" => Some("array.map"),
+            "filter" => Some("array.filter"),
+            "reduce" => Some("array.reduce"),
+            "iter" => Some("array.iter"),
+            _ => None,
+        },
+        "map" => match item_name {
+            "len" => Some("map.len"),
+            "is_empty" => Some("map.is_empty"),
+            "get" => Some("map.get"),
+            "set" => Some("map.set"),
+            "has" => Some("map.has"),
+            "delete" => Some("map.delete"),
+            "clear" => Some("map.clear"),
+            "keys" => Some("map.keys"),
+            "values" => Some("map.values"),
+            "iter" => Some("map.iter"),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+pub fn virtual_std_module_functions(module_path: &str) -> Vec<(&'static str, &'static str)> {
+    let canon = canonical_std_module_name(module_path);
+    match canon {
+        "math" => vec![
+            ("abs", "math.abs"),
+            ("floor", "math.floor"),
+            ("ceil", "math.ceil"),
+            ("round", "math.round"),
+            ("sqrt", "math.sqrt"),
+            ("sin", "math.sin"),
+            ("cos", "math.cos"),
+            ("tan", "math.tan"),
+            ("asin", "math.asin"),
+            ("acos", "math.acos"),
+            ("atan", "math.atan"),
+            ("atan2", "math.atan2"),
+            ("min", "math.min"),
+            ("max", "math.max"),
+            ("clamp", "math.clamp"),
+            ("random", "math.random"),
+            ("randomseed", "math.randomseed"),
+            ("deg", "math.deg"),
+            ("rad", "math.rad"),
+            ("exp", "math.exp"),
+            ("log", "math.log"),
+            ("tointeger", "math.tointeger"),
+            ("tofloat", "math.tofloat"),
+            ("mod", "math.mod"),
+        ],
+        "table" => vec![
+            ("len", "table.len"),
+            ("is_empty", "table.is_empty"),
+            ("get", "table.get"),
+            ("first", "table.first"),
+            ("last", "table.last"),
+            ("push", "table.push"),
+            ("pop", "table.pop"),
+            ("insert", "table.insert"),
+            ("remove", "table.remove"),
+            ("clear", "table.clear"),
+            ("slice", "table.slice"),
+            ("concat", "table.concat"),
+            ("sort", "table.sort"),
+            ("reverse", "table.reverse"),
+            ("contains", "table.contains"),
+            ("map", "table.map"),
+            ("filter", "table.filter"),
+            ("reduce", "table.reduce"),
+            ("iter", "table.iter"),
+            ("unpack", "table.unpack"),
+        ],
+        "string" => vec![
+            ("len", "string.len"),
+            ("sub", "string.sub"),
+            ("find", "string.find"),
+            ("byte", "string.byte"),
+            ("char", "string.char"),
+            ("rep", "string.rep"),
+            ("reverse", "string.reverse"),
+            ("lower", "string.lower"),
+            ("upper", "string.upper"),
+            ("format", "string.format"),
+            ("slice", "string.slice"),
+            ("index_of", "string.index_of"),
+        ],
+        "array" => vec![
+            ("len", "array.len"),
+            ("push", "array.push"),
+            ("pop", "array.pop"),
+            ("get", "array.get"),
+            ("set", "array.set"),
+            ("is_empty", "array.is_empty"),
+            ("first", "array.first"),
+            ("last", "array.last"),
+            ("insert", "array.insert"),
+            ("remove", "array.remove"),
+            ("clear", "array.clear"),
+            ("slice", "array.slice"),
+            ("concat", "array.concat"),
+            ("sort", "array.sort"),
+            ("reverse", "array.reverse"),
+            ("contains", "array.contains"),
+            ("map", "array.map"),
+            ("filter", "array.filter"),
+            ("reduce", "array.reduce"),
+            ("iter", "array.iter"),
+        ],
+        "map" => vec![
+            ("len", "map.len"),
+            ("is_empty", "map.is_empty"),
+            ("get", "map.get"),
+            ("set", "map.set"),
+            ("has", "map.has"),
+            ("delete", "map.delete"),
+            ("clear", "map.clear"),
+            ("keys", "map.keys"),
+            ("values", "map.values"),
+            ("iter", "map.iter"),
+        ],
+        "io" => vec![
+            ("print", "print"),
+            ("println", "println"),
+            ("read_file", "io.read_file"),
+            ("write_file", "io.write_file"),
+        ],
+        "fmt" => vec![
+            ("tostring", "tostring"),
+            ("tonumber", "tonumber"),
+            ("type", "type"),
+        ],
+        "assert" => vec![
+            ("assert", "assert"),
+            ("error", "error"),
+        ],
+        "iter" => vec![
+            ("ipairs", "ipairs"),
+            ("pairs", "pairs"),
+        ],
+        "random" => vec![
+            ("random", "random"),
+            ("randomseed", "randomseed"),
+        ],
+        _ => Vec::new(),
+    }
+}
+
+pub fn find_builtin_function(name: &str) -> Option<&'static BuiltinFunction> {
+    for func in base_functions() {
+        if func.name == name {
+            return Some(func);
+        }
+    }
+    for func in math_functions() {
+        if func.name == name || func.name.strip_prefix("math.") == Some(name) {
+            return Some(func);
+        }
+    }
+    for func in table_functions() {
+        if func.name == name || func.name.strip_prefix("table.") == Some(name) {
+            return Some(func);
+        }
+    }
+    for func in string_functions() {
+        if func.name == name || func.name.strip_prefix("string.") == Some(name) {
+            return Some(func);
+        }
+    }
+    for func in array_functions() {
+        if func.name == name || func.name.strip_prefix("array.") == Some(name) {
+            return Some(func);
+        }
+    }
+    for func in map_functions() {
+        if func.name == name || func.name.strip_prefix("map.") == Some(name) {
+            return Some(func);
+        }
+    }
+    for func in io_functions() {
+        if func.name == name || func.name.strip_prefix("io.") == Some(name) {
+            return Some(func);
+        }
+    }
+    for func in os_functions() {
+        if func.name == name || func.name.strip_prefix("os.") == Some(name) {
+            return Some(func);
+        }
+    }
+    for func in task_functions() {
+        if func.name == name || func.name.strip_prefix("task.") == Some(name) {
+            return Some(func);
+        }
+    }
+    for func in lua_functions() {
+        if func.name == name || func.name.strip_prefix("lua.") == Some(name) {
+            return Some(func);
+        }
+    }
+    None
+}
+
+pub fn std_symbol_import_hint(name: &str) -> Option<&'static str> {
+    match name {
+        "print" => Some("help: import it with 'use std.io.{print};'"),
+        "println" => Some("help: import it with 'use std.io.{println};'"),
+        "assert" => Some("help: import it with 'use std.assert.{assert};'"),
+        "error" => Some("help: import it with 'use std.assert.{error};'"),
+        "tostring" => Some("help: import it with 'use std.fmt.{tostring};'"),
+        "tonumber" => Some("help: import it with 'use std.fmt.{tonumber};'"),
+        "type" => Some("help: import it with 'use std.fmt.{type};'"),
+        "ipairs" => Some("help: import it with 'use std.iter.{ipairs};'"),
+        "pairs" => Some("help: import it with 'use std.iter.{pairs};'"),
+        "random" => Some("help: import it with 'use std.random.{random};'"),
+        "randomseed" => Some("help: import it with 'use std.random.{randomseed};'"),
+        "unpack" => Some("help: import it with 'use std.table.{unpack};'"),
+        "select" => Some("help: import it with 'use std.io.{select};'"),
+        "math" => Some("help: import it with 'use std.math;'"),
+        "table" => Some("help: import it with 'use std.table;'"),
+        "string" => Some("help: import it with 'use std.string;'"),
+        "array" => Some("help: import it with 'use std.array;'"),
+        "map" => Some("help: import it with 'use std.map;'"),
+        "io" => Some("help: import it with 'use std.io;'"),
+        "os" => Some("help: import it with 'use std.os;'"),
+        "task" => Some("help: import it with 'use std.task;'"),
+        "lua" => Some("help: import it with 'use std.lua;'"),
+        _ => {
+            if math_functions()
+                .iter()
+                .any(|f| f.name.strip_prefix("math.") == Some(name))
+            {
+                return Some("help: import it with 'use std.math;' or 'use std.math.{...};'");
+            }
+            if string_functions()
+                .iter()
+                .any(|f| f.name.strip_prefix("string.") == Some(name))
+            {
+                return Some("help: import it with 'use std.string;' or 'use std.string.{...};'");
+            }
+            if table_functions()
+                .iter()
+                .any(|f| f.name.strip_prefix("table.") == Some(name))
+            {
+                return Some("help: import it with 'use std.table;' or 'use std.table.{...};'");
+            }
+            if array_functions()
+                .iter()
+                .any(|f| f.name.strip_prefix("array.") == Some(name))
+            {
+                return Some("help: import it with 'use std.array;' or 'use std.array.{...};'");
+            }
+            if map_functions()
+                .iter()
+                .any(|f| f.name.strip_prefix("map.") == Some(name))
+            {
+                return Some("help: import it with 'use std.map;' or 'use std.map.{...};'");
+            }
+            None
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

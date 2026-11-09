@@ -9,7 +9,7 @@ pub use items::{
     UseTreeItem, Visibility,
 };
 pub use stmt::{LocalBinding, Stmt, StmtKind};
-pub use types::{Type, TypeKind};
+pub use types::{ReturnSpec, Type, TypeKind};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Span {
     pub start_line: usize,

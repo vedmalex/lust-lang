@@ -66,6 +66,16 @@ impl TypeChecker {
                 self.env.pop_scope();
                 Ok(())
             }
+
+            StmtKind::Defer(stmt) | StmtKind::ErrDefer(stmt) => self.check_stmt(stmt),
+            StmtKind::Scoped(stmts) => {
+                self.env.push_scope();
+                for stmt in stmts {
+                    self.check_stmt(stmt)?;
+                }
+                self.env.pop_scope();
+                Ok(())
+            }
         }
     }
 

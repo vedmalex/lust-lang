@@ -2,7 +2,7 @@ use super::Parser;
 use crate::{
     ast::{
         EnumDef, EnumVariant, ExternItem, ExternParam, FieldOwnership, FunctionDef, FunctionParam,
-        ImplBlock, Item, ItemKind, StructDef, StructField, TraitBound, TraitDef, TraitMethod, Type,
+        ImplBlock, Item, ItemKind, Span, StructDef, StructField, TraitBound, TraitDef, TraitMethod, Type,
         TypeKind, Visibility,
     },
     error::Result,
@@ -324,6 +324,24 @@ impl Parser {
         } else {
             None
         };
+        let (error_type, requirements) = self.parse_optional_effects_spec()?;
+        let return_type = if error_type.is_some() || !requirements.is_empty() {
+            let span = return_type.as_ref().map(|t| t.span).unwrap_or_else(Span::dummy);
+            let success = Box::new(return_type.unwrap_or_else(|| Type::new(TypeKind::Unit, span)));
+            let error = Box::new(
+                error_type.unwrap_or_else(|| Type::new(TypeKind::Never, Span::dummy())),
+            );
+            Some(Type::new(
+                TypeKind::Effect {
+                    success,
+                    error,
+                    requirements,
+                },
+                span,
+            ))
+        } else {
+            return_type
+        };
 
         #[cfg(feature = "esp32c6-logging")]
         log::info!("    parsing body for function '{}'", name);
@@ -534,6 +552,24 @@ impl Parser {
                 Some(self.parse_type()?)
             } else {
                 None
+            };
+            let (error_type, requirements) = self.parse_optional_effects_spec()?;
+            let return_type = if error_type.is_some() || !requirements.is_empty() {
+                let span = return_type.as_ref().map(|t| t.span).unwrap_or_else(Span::dummy);
+                let success = Box::new(return_type.unwrap_or_else(|| Type::new(TypeKind::Unit, span)));
+                let error = Box::new(
+                    error_type.unwrap_or_else(|| Type::new(TypeKind::Never, Span::dummy())),
+                );
+                Some(Type::new(
+                    TypeKind::Effect {
+                        success,
+                        error,
+                        requirements,
+                    },
+                    span,
+                ))
+            } else {
+                return_type
             };
             let default_impl = if !self.check(TokenKind::Function) && !self.check(TokenKind::End) {
                 let mut body = Vec::new();

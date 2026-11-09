@@ -9,6 +9,9 @@ pub struct RuntimeOptions {
     pub needs_pow: bool,
     pub needs_io: bool,
     pub needs_os: bool,
+    pub needs_print: bool,
+    pub needs_tostring: bool,
+    pub used_builtins: std::collections::BTreeSet<String>,
     pub max_memory_bytes: Option<usize>,
     pub is_library: bool,
 }
@@ -23,6 +26,9 @@ impl Default for RuntimeOptions {
             needs_pow: true,
             needs_io: true,
             needs_os: true,
+            needs_print: true,
+            needs_tostring: true,
+            used_builtins: std::collections::BTreeSet::new(),
             max_memory_bytes: None,
             is_library: false,
         }
@@ -44,8 +50,18 @@ pub fn generate_runtime(opts: &RuntimeOptions) -> String {
     out.push_str(&generate_core_runtime(opts));
     out.push('\n');
 
+    if opts.needs_tostring || opts.needs_string {
+        out.push_str(TOSTRING_RUNTIME_SRC);
+        out.push('\n');
+    }
+
+    if opts.needs_print {
+        out.push_str(PRINT_RUNTIME_SRC);
+        out.push('\n');
+    }
+
     if opts.needs_array {
-        out.push_str(ARRAY_RUNTIME_SRC);
+        out.push_str(&generate_array_runtime(opts));
         out.push('\n');
     }
 
@@ -57,6 +73,10 @@ pub fn generate_runtime(opts: &RuntimeOptions) -> String {
     if opts.needs_string {
         out.push_str(STRING_RUNTIME_SRC);
         out.push('\n');
+        if opts.needs_array {
+            out.push_str(STRING_ARRAY_RUNTIME_SRC);
+            out.push('\n');
+        }
     }
 
     if opts.needs_pow {
@@ -272,7 +292,16 @@ pub fn __lust_try_unwrap(val: anytype) !@TypeOf(switch (@typeInfo(@TypeOf(val)))
     }
 }
 
-pub fn __lust_print(val: anytype) void {
+pub fn __lust_assert(cond: bool, msg: []const u8) void {
+    if (!cond) {
+        std.debug.panic("Assertion failed: {s}", .{msg});
+    }
+}
+"#);
+    s
+}
+
+pub const PRINT_RUNTIME_SRC: &str = r#"pub fn __lust_print(val: anytype) void {
     const T = @TypeOf(val);
     switch (@typeInfo(T)) {
         .pointer => |ptr_info| {
@@ -313,17 +342,9 @@ pub fn __lust_println(val: anytype) void {
     const s = std.fmt.allocPrint(__lust_allocator, "{any}\n", .{val}) catch return;
     _ = std.c.write(1, s.ptr, s.len);
 }
+"#;
 
-pub fn __lust_assert(cond: bool, msg: []const u8) void {
-    if (!cond) {
-        std.debug.panic("Assertion failed: {s}", .{msg});
-    }
-}
-"#);
-    s
-}
-
-const ARRAY_RUNTIME_SRC: &str = r#"pub fn LustArray(comptime T: type) type {
+const ARRAY_BASE_SRC: &str = r#"pub fn LustArray(comptime T: type) type {
     return struct {
         items: []T,
         capacity: usize,
@@ -468,8 +489,9 @@ const ARRAY_RUNTIME_SRC: &str = r#"pub fn LustArray(comptime T: type) type {
             }
             return res;
         }
+"#;
 
-        pub fn concat(self: *const @This(), sep: []const u8) ![]const u8 {
+const ARRAY_CONCAT_SRC: &str = r#"        pub fn concat(self: *const @This(), sep: []const u8) ![]const u8 {
             if (self.items.len == 0) return "";
             var total_len: usize = 0;
             const str_list = try self.allocator.alloc([]const u8, self.items.len);
@@ -491,9 +513,23 @@ const ARRAY_RUNTIME_SRC: &str = r#"pub fn LustArray(comptime T: type) type {
             }
             return buf;
         }
-    };
-}
 "#;
+
+pub fn generate_array_runtime(opts: &RuntimeOptions) -> String {
+    let mut s = String::new();
+    s.push_str(ARRAY_BASE_SRC);
+    if opts.needs_string
+        || opts.needs_tostring
+        || opts.used_builtins.contains("array.concat")
+        || opts.used_builtins.contains("table.concat")
+    {
+        s.push_str(ARRAY_CONCAT_SRC);
+    }
+    s.push_str("    };\n}\n");
+    s
+}
+
+pub const ARRAY_RUNTIME_SRC: &str = ARRAY_BASE_SRC;
 
 const MAP_RUNTIME_SRC: &str = r#"pub fn LustMap(comptime K: type, comptime V: type) type {
     const MapType = if (K == []const u8) std.StringHashMap(V) else std.AutoHashMap(K, V);
@@ -544,7 +580,7 @@ const MAP_RUNTIME_SRC: &str = r#"pub fn LustMap(comptime K: type, comptime V: ty
 }
 "#;
 
-const STRING_RUNTIME_SRC: &str = r#"pub fn __lust_tostring(val: anytype) ![]const u8 {
+pub const TOSTRING_RUNTIME_SRC: &str = r#"pub fn __lust_tostring(val: anytype) ![]const u8 {
     const T = @TypeOf(val);
     if (T == []const u8) return val;
     switch (@typeInfo(T)) {
@@ -563,8 +599,9 @@ const STRING_RUNTIME_SRC: &str = r#"pub fn __lust_tostring(val: anytype) ![]cons
     }
     return std.fmt.allocPrint(__lust_allocator, "{any}", .{val});
 }
+"#;
 
-pub fn __lust_str_concat(a_in: anytype, b_in: anytype) ![]const u8 {
+pub const STRING_RUNTIME_SRC: &str = r#"pub fn __lust_str_concat(a_in: anytype, b_in: anytype) ![]const u8 {
     const a = try __lust_tostring(a_in);
     const b = try __lust_tostring(b_in);
     const total_len = a.len + b.len;
@@ -665,15 +702,6 @@ pub fn __lust_string_replace(s: []const u8, needle: []const u8, repl: []const u8
     return std.mem.replaceOwned(u8, __lust_allocator, s, needle, repl);
 }
 
-pub fn __lust_string_split(s: []const u8, delim: []const u8) !LustArray([]const u8) {
-    var res = LustArray([]const u8).init(__lust_allocator);
-    var it = std.mem.splitSequence(u8, s, delim);
-    while (it.next()) |chunk| {
-        try res.push(chunk);
-    }
-    return res;
-}
-
 pub fn __lust_string_slice(s: []const u8, start: i64, end: i64) []const u8 {
     const len_i64: i64 = @as(i64, @intCast(s.len));
     var st = start;
@@ -693,6 +721,35 @@ pub fn __lust_string_index_of(s: []const u8, needle: []const u8) ?i64 {
         return @as(i64, @intCast(idx));
     }
     return null;
+}
+"#;
+
+pub const STRING_ARRAY_RUNTIME_SRC: &str = r#"pub fn __lust_string_split(s: []const u8, delim: []const u8) !LustArray([]const u8) {
+    var res = LustArray([]const u8).init(__lust_allocator);
+    var it = std.mem.splitSequence(u8, s, delim);
+    while (it.next()) |chunk| {
+        try res.push(chunk);
+    }
+    return res;
+}
+
+pub fn __lust_string_chars(s: []const u8) !LustArray([]const u8) {
+    var res = LustArray([]const u8).init(__lust_allocator);
+    var i: usize = 0;
+    while (i < s.len) : (i += 1) {
+        try res.push(s[i..i + 1]);
+    }
+    return res;
+}
+
+pub fn __lust_string_lines(s: []const u8) !LustArray([]const u8) {
+    var res = LustArray([]const u8).init(__lust_allocator);
+    var it = std.mem.splitScalar(u8, s, '\n');
+    while (it.next()) |line| {
+        const trimmed = std.mem.trimRight(u8, line, "\r");
+        try res.push(trimmed);
+    }
+    return res;
 }
 "#;
 

@@ -60,6 +60,43 @@ pub struct FunctionDef {
     pub doc: Option<String>,
 }
 
+impl FunctionDef {
+    pub fn return_spec(&self) -> super::ReturnSpec {
+        match &self.return_type {
+            Some(Type {
+                kind: super::TypeKind::Effect { success, error, requirements },
+                ..
+            }) => super::ReturnSpec {
+                return_type: Some((**success).clone()),
+                error_type: if matches!(error.kind, super::TypeKind::Never) {
+                    None
+                } else {
+                    Some((**error).clone())
+                },
+                requirements: requirements.clone(),
+            },
+            Some(t) => super::ReturnSpec {
+                return_type: Some(t.clone()),
+                error_type: None,
+                requirements: Vec::new(),
+            },
+            None => super::ReturnSpec {
+                return_type: None,
+                error_type: None,
+                requirements: Vec::new(),
+            },
+        }
+    }
+
+    pub fn error_type(&self) -> Option<Type> {
+        self.return_spec().error_type
+    }
+
+    pub fn requirements(&self) -> Vec<Type> {
+        self.return_spec().requirements
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct FunctionParam {
     pub name: String,
@@ -125,6 +162,43 @@ pub struct TraitMethod {
     pub return_type: Option<Type>,
     pub default_impl: Option<Vec<Stmt>>,
     pub doc: Option<String>,
+}
+
+impl TraitMethod {
+    pub fn return_spec(&self) -> super::ReturnSpec {
+        match &self.return_type {
+            Some(Type {
+                kind: super::TypeKind::Effect { success, error, requirements },
+                ..
+            }) => super::ReturnSpec {
+                return_type: Some((**success).clone()),
+                error_type: if matches!(error.kind, super::TypeKind::Never) {
+                    None
+                } else {
+                    Some((**error).clone())
+                },
+                requirements: requirements.clone(),
+            },
+            Some(t) => super::ReturnSpec {
+                return_type: Some(t.clone()),
+                error_type: None,
+                requirements: Vec::new(),
+            },
+            None => super::ReturnSpec {
+                return_type: None,
+                error_type: None,
+                requirements: Vec::new(),
+            },
+        }
+    }
+
+    pub fn error_type(&self) -> Option<Type> {
+        self.return_spec().error_type
+    }
+
+    pub fn requirements(&self) -> Vec<Type> {
+        self.return_spec().requirements
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
