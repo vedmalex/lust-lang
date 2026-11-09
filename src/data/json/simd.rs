@@ -487,11 +487,6 @@ impl<'a> SimdJsonParser<'a> {
             Ok(DataValue::Number(ExactNumber::Int(i)))
         } else if let Ok(u) = raw_str.parse::<u64>() {
             Ok(DataValue::Number(ExactNumber::UInt(u)))
-        } else if let Ok(f) = raw_str.parse::<f64>() {
-            if !f.is_finite() {
-                return Err(JsonError::InvalidNumber(start));
-            }
-            Ok(DataValue::Number(ExactNumber::Float(f)))
         } else {
             Err(JsonError::InvalidNumber(start))
         }
