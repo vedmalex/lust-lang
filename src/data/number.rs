@@ -163,13 +163,31 @@ impl ExactNumber {
         }
     }
 
-    pub fn as_f64(&self) -> f64 {
+    pub fn try_as_f64(&self) -> Option<f64> {
+        const MAX_SAFE_INTEGER: i64 = 9_007_199_254_740_991; // 2^53 - 1
+        const MIN_SAFE_INTEGER: i64 = -9_007_199_254_740_991;
         match self {
-            ExactNumber::Int(i) => *i as f64,
-            ExactNumber::UInt(u) => *u as f64,
-            ExactNumber::Float(f) => *f,
-            ExactNumber::Decimal128(_) => 0.0,
+            ExactNumber::Int(i) => {
+                if *i >= MIN_SAFE_INTEGER && *i <= MAX_SAFE_INTEGER {
+                    Some(*i as f64)
+                } else {
+                    None
+                }
+            }
+            ExactNumber::UInt(u) => {
+                if *u <= MAX_SAFE_INTEGER as u64 {
+                    Some(*u as f64)
+                } else {
+                    None
+                }
+            }
+            ExactNumber::Float(f) => Some(*f),
+            ExactNumber::Decimal128(_) => None,
         }
+    }
+
+    pub fn as_f64(&self) -> Option<f64> {
+        self.try_as_f64()
     }
 }
 

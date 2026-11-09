@@ -113,7 +113,7 @@ impl BudgetTracker {
         self.units_since_poll += units;
 
         if self.units_since_poll >= self.poll_interval {
-            self.units_since_poll = 0;
+            self.units_since_poll %= self.poll_interval;
             Ok(true) // Caller should poll for interruption
         } else {
             Ok(false)

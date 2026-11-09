@@ -8,7 +8,7 @@ pub mod view;
 
 pub use budget::{BudgetError, BudgetTracker};
 pub use document::{Document, DuplicateKeyError};
-pub use layout::{CanonicalTypeTag, LogicalFieldDesc, LogicalLayoutV1};
+pub use layout::{CanonicalTypeTag, LogicalFieldDesc, LogicalLayoutV1, TargetAbi};
 pub use number::{DataError, DateTimeUtc, Decimal128, ExactNumber, ObjectId};
 pub use owner::{LeaseError, LeaseLifecycleState, OwnerId, OwnerRegistry, SlotEntry};
 pub use value::DataValue;

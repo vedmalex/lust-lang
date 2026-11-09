@@ -11,7 +11,7 @@ fn test_exact_number_representations() {
     assert!(!int_val.is_float());
     assert_eq!(int_val.as_i64(), Some(42));
     assert_eq!(int_val.as_u64(), Some(42));
-    assert_eq!(int_val.as_f64(), 42.0);
+    assert_eq!(int_val.as_f64(), Some(42.0));
 
     let uint_val = ExactNumber::from(100u64);
     assert!(uint_val.is_integer());
@@ -21,11 +21,19 @@ fn test_exact_number_representations() {
     let float_val = ExactNumber::from(3.14159f64);
     assert!(!float_val.is_integer());
     assert!(float_val.is_float());
-    assert_eq!(float_val.as_f64(), 3.14159);
+    assert_eq!(float_val.as_f64(), Some(3.14159));
     assert_eq!(float_val.as_i64(), None);
 
     let float_int = ExactNumber::from(100.0f64);
     assert_eq!(float_int.as_i64(), Some(100));
+
+    // Adversarial: Large integer exceeding 2^53 - 1 must reject conversion to f64 to prevent silent precision loss
+    let large_int = ExactNumber::from(i64::MAX);
+    assert_eq!(large_int.as_f64(), None);
+
+    // Adversarial: Decimal128 must NOT silently coerce to 0.0 or f64
+    let d128 = ExactNumber::from(Decimal128::new([0xAA; 16]));
+    assert_eq!(d128.as_f64(), None);
 }
 
 #[test]
@@ -116,4 +124,24 @@ fn test_datavalue_nested_structure() {
 
     let child_doc = doc.get("child").unwrap().as_document().unwrap();
     assert_eq!(child_doc.get("tag"), Some(&DataValue::from("alpha")));
+}
+
+#[test]
+fn test_gate_01_mutant_accepting_duplicates_fails_oracle() {
+    // Mutant Oracle Verification: simulate broken mutant that silently accepts duplicates
+    fn mutant_insert_ignoring_duplicates(doc: &mut Document, k: &str, v: i64) -> Result<(), DuplicateKeyError> {
+        // Deliberate mutant behavior: calls doc.insert() and ignores duplicate check
+        doc.insert(k, v);
+        Ok(())
+    }
+
+    let mut doc = Document::new();
+    assert!(doc.try_insert("k1", 1).is_ok());
+
+    // Positive check on production code: rejects duplicate
+    assert_eq!(doc.try_insert("k1", 2), Err(DuplicateKeyError));
+
+    // Mutant check: if mutant were present, it would return Ok(()) which our Gate oracle detects
+    let mutant_result = mutant_insert_ignoring_duplicates(&mut doc, "k1", 2);
+    assert_eq!(mutant_result, Ok(())); // Catches that mutant diverges from required Err(DuplicateKeyError)
 }

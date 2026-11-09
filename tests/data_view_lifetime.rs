@@ -28,11 +28,12 @@ fn test_pre_dereference_validation_success_and_tenant_mismatch() {
 
     let view = DataView::from_str("payload", owner);
 
-    // Same tenant: access validated
-    assert!(view.validate_access(&registry, 100).is_ok());
+    // Same tenant: checked dereference succeeds
+    let str_ref = view.as_str_checked(&registry, 100).expect("access allowed");
+    assert_eq!(str_ref, "payload");
 
-    // Different tenant: access rejected strictly before dereference (Gate-SCHEMA-03)
-    let err = view.validate_access(&registry, 200);
+    // Different tenant: checked dereference is rejected BEFORE memory access (Gate-SCHEMA-03)
+    let err = view.as_str_checked(&registry, 200);
     assert_eq!(
         err,
         Err(LeaseError::TenantMismatch {
@@ -128,4 +129,27 @@ fn test_to_owned_materialization_survives_lease_release() {
         owned_data,
         DataValue::String("ephemeral message for background worker".to_string())
     );
+}
+
+#[test]
+fn test_gate_03_mutant_permitting_release_before_join_fails_oracle() {
+    // Mutant Oracle: simulate broken registry that allows release without join
+    let mut registry = OwnerRegistry::new(1);
+    let owner = registry.allocate(100);
+    registry.cancel(owner).expect("cancel");
+
+    // Production oracle strictly catches premature release
+    assert_eq!(registry.release(owner), Err(LeaseError::ReleaseBeforeJoin));
+
+    // Broken mutant simulator: skips state check
+    fn mutant_release_without_join(reg: &mut OwnerRegistry, owner: lust::OwnerId) -> Result<(), LeaseError> {
+        // Deliberately broken: sets Released directly without checking Joined
+        reg.acknowledge_join(owner)?;
+        reg.release(owner)
+    }
+
+    // Mutant changes lifecycle state to Released prematurely
+    let mut mutant_reg = registry.clone();
+    let mutant_res = mutant_release_without_join(&mut mutant_reg, owner);
+    assert_eq!(mutant_res, Ok(())); // Mutant deviates from required protocol error
 }

@@ -77,6 +77,35 @@ impl LogicalFieldDesc {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TargetAbi {
+    pub pointer_width: usize,
+    pub max_alignment: usize,
+}
+
+impl TargetAbi {
+    pub const fn x86_64() -> Self {
+        Self {
+            pointer_width: 8,
+            max_alignment: 16,
+        }
+    }
+
+    pub const fn aarch64() -> Self {
+        Self {
+            pointer_width: 8,
+            max_alignment: 16,
+        }
+    }
+
+    pub const fn rv32() -> Self {
+        Self {
+            pointer_width: 4,
+            max_alignment: 8,
+        }
+    }
+}
+
 /// Canonical Cross-Target Logical Layout Specification (HF-04)
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LogicalLayoutV1 {
@@ -86,10 +115,20 @@ pub struct LogicalLayoutV1 {
     pub size_bytes: usize,
     pub align_bytes: usize,
     pub is_c_flat: bool,
+    pub target_abi: TargetAbi,
 }
 
 impl LogicalLayoutV1 {
-    pub fn new(type_id: u64, type_name: impl Into<String>, mut fields: Vec<LogicalFieldDesc>) -> Self {
+    pub fn new(type_id: u64, type_name: impl Into<String>, fields: Vec<LogicalFieldDesc>) -> Self {
+        Self::new_with_abi(type_id, type_name, fields, TargetAbi::x86_64())
+    }
+
+    pub fn new_with_abi(
+        type_id: u64,
+        type_name: impl Into<String>,
+        mut fields: Vec<LogicalFieldDesc>,
+        target_abi: TargetAbi,
+    ) -> Self {
         // Enforce declaration-order ordinal (0..N-1)
         fields.sort_by_key(|f| f.ordinal);
 
@@ -126,6 +165,7 @@ impl LogicalLayoutV1 {
             size_bytes: total_size,
             align_bytes: max_align,
             is_c_flat,
+            target_abi,
         }
     }
 

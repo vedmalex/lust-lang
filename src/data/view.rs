@@ -83,6 +83,18 @@ impl<'s> DataView<'s> {
         }
     }
 
+    /// Checked dereference: strictly validates tenant and generation before returning borrowed &str
+    pub fn as_str_checked(&self, registry: &OwnerRegistry, current_tenant: u32) -> Result<&'s str, LeaseError> {
+        self.validate_access(registry, current_tenant)?;
+        self.as_str().ok_or(LeaseError::InvalidState("View is not a string"))
+    }
+
+    /// Checked dereference: strictly validates tenant and generation before returning borrowed &[u8]
+    pub fn as_bytes_checked(&self, registry: &OwnerRegistry, current_tenant: u32) -> Result<&'s [u8], LeaseError> {
+        self.validate_access(registry, current_tenant)?;
+        self.as_bytes().ok_or(LeaseError::InvalidState("View is not a binary or string buffer"))
+    }
+
     pub fn as_str(&self) -> Option<&'s str> {
         match self {
             DataView::Str(s, _) => Some(s),

@@ -68,7 +68,7 @@ impl DataValue {
 
     pub fn as_f64(&self) -> Option<f64> {
         match self {
-            DataValue::Number(n) => Some(n.as_f64()),
+            DataValue::Number(n) => n.as_f64(),
             _ => None,
         }
     }

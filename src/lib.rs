@@ -42,7 +42,7 @@ pub use config::{ConfigError, DependencyKind, DependencySpec, LustConfig};
 pub use data::{
     BudgetError, BudgetTracker, CanonicalTypeTag, DataValue, DataView, DateTimeUtc, Decimal128,
     Document, DuplicateKeyError, ExactNumber, LeaseError, LeaseLifecycleState, LogicalFieldDesc,
-    LogicalLayoutV1, ObjectId, OwnerId, OwnerRegistry,
+    LogicalLayoutV1, ObjectId, OwnerId, OwnerRegistry, TargetAbi,
 };
 #[cfg(feature = "std")]
 pub use embed::{
