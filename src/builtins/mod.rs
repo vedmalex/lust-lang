@@ -1720,6 +1720,7 @@ pub fn is_virtual_std_module(module_path: &str) -> bool {
             | "random"
             | "effect"
             | "schema"
+            | "regex"
             | "data"
             | "model"
             | "test"
@@ -1753,6 +1754,7 @@ pub fn canonical_std_module_name(module_path: &str) -> &'static str {
         "random" => "random",
         "effect" => "effect",
         "schema" => "schema",
+        "regex" => "regex",
         "data" => "data",
         "model" => "model",
         "test" | "test.clock" | "test.mock" => "test",
@@ -1795,6 +1797,13 @@ pub fn resolve_std_function(module_path: &str, item_name: &str) -> Option<&'stat
         },
         "schema" => match item_name {
             "s" => Some("schema.s"),
+            _ => None,
+        },
+        "regex" => match item_name {
+            "compile_bounded" => Some("regex.compile_bounded"),
+            "is_match" => Some("regex.is_match"),
+            "find" => Some("regex.find"),
+            "replace_all" => Some("regex.replace_all"),
             _ => None,
         },
         "data" => match item_name {
@@ -2069,6 +2078,15 @@ pub fn virtual_std_module_functions(module_path: &str) -> Vec<(&'static str, &'s
         "random" => vec![
             ("random", "random"),
             ("randomseed", "randomseed"),
+        ],
+        "schema" => vec![
+            ("s", "schema.s"),
+        ],
+        "regex" => vec![
+            ("compile_bounded", "regex.compile_bounded"),
+            ("is_match", "regex.is_match"),
+            ("find", "regex.find"),
+            ("replace_all", "regex.replace_all"),
         ],
         _ => Vec::new(),
     }

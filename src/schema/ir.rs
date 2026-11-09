@@ -1,4 +1,40 @@
+use std::fmt;
+use std::sync::Arc;
 use crate::data::DataValue;
+
+#[derive(Clone)]
+pub struct RefinePredicate {
+    pub f: Arc<dyn Fn(&DataValue) -> bool + Send + Sync>,
+}
+
+impl fmt::Debug for RefinePredicate {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "RefinePredicate(<fn>)")
+    }
+}
+
+impl PartialEq for RefinePredicate {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.f, &other.f)
+    }
+}
+
+#[derive(Clone)]
+pub struct TransformFn {
+    pub f: Arc<dyn Fn(DataValue) -> DataValue + Send + Sync>,
+}
+
+impl fmt::Debug for TransformFn {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "TransformFn(<fn>)")
+    }
+}
+
+impl PartialEq for TransformFn {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.f, &other.f)
+    }
+}
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct ObjectFieldIR {
@@ -53,4 +89,17 @@ pub enum SchemaIR {
     },
     Optional(Box<SchemaIR>),
     Nullable(Box<SchemaIR>),
+    Refine {
+        inner: Box<SchemaIR>,
+        predicate: RefinePredicate,
+        message: Option<String>,
+    },
+    Transform {
+        inner: Box<SchemaIR>,
+        transform: TransformFn,
+    },
+    InvalidRegex {
+        pattern: String,
+        error: String,
+    },
 }

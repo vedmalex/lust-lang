@@ -70,3 +70,43 @@ fn test_regex_pattern_size_limit() {
     let res = compile_bounded(&huge_pattern);
     assert!(matches!(res, Err(RegexError::PatternTooLarge(_))));
 }
+
+#[test]
+fn test_regex_find_on_empty_input_does_not_panic() {
+    let re_star = BoundedRegex::new("a*").unwrap();
+    let m = re_star.find("").unwrap();
+    assert!(m.is_some());
+    let m = m.unwrap();
+    assert_eq!(m.start, 0);
+    assert_eq!(m.end, 0);
+    assert_eq!(m.text, "");
+
+    let re_plus = BoundedRegex::new("a+").unwrap();
+    assert_eq!(re_plus.find("").unwrap(), None);
+}
+
+#[test]
+fn test_regex_find_1byte_match_at_eof_does_not_panic() {
+    let re = BoundedRegex::new("z").unwrap();
+    let m = re.find("z").unwrap().unwrap();
+    assert_eq!(m.start, 0);
+    assert_eq!(m.end, 1);
+    assert_eq!(m.text, "z");
+
+    let m2 = re.find("prefix-z").unwrap().unwrap();
+    assert_eq!(m2.start, 7);
+    assert_eq!(m2.end, 8);
+    assert_eq!(m2.text, "z");
+}
+
+#[test]
+fn test_regex_replace_all_no_match_stays_linear() {
+    let re = BoundedRegex::new("xyz").unwrap();
+    let text = "hello world without matches";
+    let res = re.replace_all(text, "replacement").unwrap();
+    assert_eq!(res, text);
+
+    let multiple = BoundedRegex::new(r"\d+").unwrap();
+    let res_mult = multiple.replace_all("a 1 b 22 c 333", "N").unwrap();
+    assert_eq!(res_mult, "a N b N c N");
+}

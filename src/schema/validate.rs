@@ -509,6 +509,41 @@ pub fn validate_ir(
                 validate_ir(inner, value, path, errors)
             }
         }
+
+        SchemaIR::Refine { inner, predicate, message } => {
+            if let Some(inner_val) = validate_ir(inner, value, path, errors) {
+                if (predicate.f)(&inner_val) {
+                    Some(inner_val)
+                } else {
+                    let msg = message.as_deref().unwrap_or("Value failed refinement predicate");
+                    errors.push(
+                        ValidationError::new(path.clone(), msg, "custom_refinement")
+                            .with_received(format!("{:?}", inner_val)),
+                    );
+                    None
+                }
+            } else {
+                None
+            }
+        }
+
+        SchemaIR::Transform { inner, transform } => {
+            if let Some(inner_val) = validate_ir(inner, value, path, errors) {
+                let transformed = (transform.f)(inner_val);
+                Some(transformed)
+            } else {
+                None
+            }
+        }
+
+        SchemaIR::InvalidRegex { pattern, error } => {
+            errors.push(ValidationError::new(
+                path.clone(),
+                format!("Invalid regex pattern '{}': {}", pattern, error),
+                "invalid_regex",
+            ));
+            None
+        }
     }
 }
 

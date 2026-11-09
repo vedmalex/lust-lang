@@ -15,6 +15,16 @@ fn schema_stdlib_is_available_to_lust_compiler() {
         .module("main", "use std.schema\nfunction test(): int return 1 end")
         .entry_module("main").compile();
     assert!(result.is_ok(), "frozen schema library unavailable: {:?}", result.err());
+
+    let result_scoped = EmbeddedProgram::builder()
+        .module("main", "use std.schema.{s}\nfunction test(): int return 1 end")
+        .entry_module("main").compile();
+    assert!(result_scoped.is_ok(), "std.schema.{{s}} unavailable: {:?}", result_scoped.err());
+
+    let result_regex = EmbeddedProgram::builder()
+        .module("main", "use std.regex\nfunction test(): int return 1 end")
+        .entry_module("main").compile();
+    assert!(result_regex.is_ok(), "std.regex unavailable: {:?}", result_regex.err());
 }
 
 #[test]

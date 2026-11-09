@@ -43,4 +43,8 @@ impl BoundedRegex {
     pub fn replace(&self, text: &str, replacement: &str) -> Result<String, RegexError> {
         replace_all(&self.plan, text, replacement)
     }
+
+    pub fn replace_all(&self, text: &str, replacement: &str) -> Result<String, RegexError> {
+        replace_all(&self.plan, text, replacement)
+    }
 }

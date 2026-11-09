@@ -157,3 +157,121 @@ fn test_schema_discriminated_union() {
     let err = shape_schema.parse(&invalid_val).unwrap_err();
     assert_eq!(err.errors[0].code, "invalid_discriminator");
 }
+
+#[test]
+fn test_schema_fluent_refine_and_transform() {
+    let username_schema = s
+        .string()
+        .min(3)
+        .max(20)
+        .refine(|val| match val {
+            DataValue::String(str_val) => str_val.starts_with("user_"),
+            _ => false,
+        })
+        .transform(|val| match val {
+            DataValue::String(str_val) => DataValue::String(str_val.to_uppercase()),
+            other => other,
+        });
+
+    let valid = DataValue::String("user_alex".to_string());
+    let parsed = username_schema.parse(&valid).unwrap();
+    assert_eq!(parsed, DataValue::String("USER_ALEX".to_string()));
+
+    let invalid_prefix = DataValue::String("admin_alex".to_string());
+    let err = username_schema.parse(&invalid_prefix).unwrap_err();
+    assert_eq!(err.errors[0].code, "custom_refinement");
+
+    let too_short = DataValue::String("u".to_string());
+    let err = username_schema.parse(&too_short).unwrap_err();
+    assert_eq!(err.errors[0].code, "too_small");
+}
+
+#[test]
+fn test_schema_int_refine_and_transform() {
+    let even_positive = s
+        .int()
+        .min(1)
+        .refine_with_message(
+            |val| match val {
+                DataValue::Number(ExactNumber::Int(i)) => i % 2 == 0,
+                _ => false,
+            },
+            "Must be an even integer",
+        )
+        .transform(|val| match val {
+            DataValue::Number(ExactNumber::Int(i)) => DataValue::Number(ExactNumber::Int(i * 10)),
+            other => other,
+        });
+
+    let valid = DataValue::Number(ExactNumber::Int(4));
+    let parsed = even_positive.parse(&valid).unwrap();
+    assert_eq!(parsed, DataValue::Number(ExactNumber::Int(40)));
+
+    let odd = DataValue::Number(ExactNumber::Int(5));
+    let err = even_positive.parse(&odd).unwrap_err();
+    assert_eq!(err.errors[0].code, "custom_refinement");
+    assert_eq!(err.errors[0].message, "Must be an even integer");
+}
+
+#[test]
+fn test_schema_compile_to_schema_ir() {
+    use lust::schema::SchemaIR;
+
+    let str_builder = s.string().min(5).max(50);
+    let ir: SchemaIR = str_builder.compile();
+    assert!(matches!(ir, SchemaIR::String { min_len: Some(5), max_len: Some(50), regex: None }));
+
+    let schema = s.object().field("id", s.int().min(1)).build();
+    let obj_ir = schema.compile();
+    assert!(matches!(obj_ir, SchemaIR::Object { fields, strict: false } if fields.len() == 1));
+}
+
+#[test]
+fn test_schema_validation_returns_effect() {
+    let schema = s.string().min(2).max(10).build();
+
+    let valid = DataValue::String("hello".to_string());
+    let effect = schema.validate(&valid);
+    assert!(effect.is_success());
+    assert!(!effect.is_failure());
+    assert_eq!(effect.exit, lust::schema::Exit::Success(valid.clone()));
+
+    let invalid = DataValue::String("x".to_string());
+    let effect = schema.validate(&invalid);
+    assert!(effect.is_failure());
+    assert!(!effect.is_success());
+    match &effect.exit {
+        lust::schema::Exit::Failure(lust::schema::Cause::Fail(errors)) => {
+            assert_eq!(errors.errors[0].code, "too_small");
+        }
+        other => panic!("Expected Failure(Cause::Fail(_)), got {:?}", other),
+    }
+
+    // Single error effect
+    let single_effect = schema.validate_single(&invalid);
+    assert!(single_effect.is_failure());
+    match &single_effect.exit {
+        lust::schema::Exit::Failure(lust::schema::Cause::Fail(err)) => {
+            assert_eq!(err.code, "too_small");
+        }
+        other => panic!("Expected Failure(Cause::Fail(_)), got {:?}", other),
+    }
+}
+
+#[test]
+fn test_schema_invalid_regex_fails_closed_at_build() {
+    use lust::schema::SchemaIR;
+
+    let malformed_schema = s.string().regex("[").build();
+    assert!(matches!(malformed_schema.ir, SchemaIR::InvalidRegex { ref pattern, .. } if pattern == "["));
+
+    let val = DataValue::String("test string".to_string());
+    let effect = malformed_schema.validate(&val);
+    assert!(effect.is_failure());
+    match &effect.exit {
+        lust::schema::Exit::Failure(lust::schema::Cause::Fail(errs)) => {
+            assert_eq!(errs.errors[0].code, "invalid_regex");
+        }
+        other => panic!("Expected invalid_regex failure, got {:?}", other),
+    }
+}

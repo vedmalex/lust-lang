@@ -85,3 +85,19 @@ impl fmt::Display for ValidationErrors {
 }
 
 impl std::error::Error for ValidationErrors {}
+
+impl From<ValidationError> for ValidationErrors {
+    fn from(err: ValidationError) -> Self {
+        ValidationErrors::single(err)
+    }
+}
+
+impl From<ValidationErrors> for ValidationError {
+    fn from(mut errs: ValidationErrors) -> Self {
+        if !errs.errors.is_empty() {
+            errs.errors.remove(0)
+        } else {
+            ValidationError::new(vec![], "Validation failed", "validation_failed")
+        }
+    }
+}

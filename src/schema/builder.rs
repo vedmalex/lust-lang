@@ -1,6 +1,7 @@
+use std::sync::Arc;
 use crate::data::DataValue;
-use crate::schema::error::ValidationErrors;
-use crate::schema::ir::{ObjectFieldIR, SchemaIR};
+use crate::schema::error::{ValidationError, ValidationErrors};
+use crate::schema::ir::{ObjectFieldIR, RefinePredicate, SchemaIR, TransformFn};
 use crate::schema::validate::validate_ir;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -24,12 +25,116 @@ impl Schema {
         Err(ValidationErrors::new(errors))
     }
 
+    pub fn validate(&self, value: &DataValue) -> crate::schema::Effect<DataValue, ValidationErrors> {
+        match self.parse(value) {
+            Ok(val) => crate::schema::Effect::success(val),
+            Err(errs) => crate::schema::Effect::failure(errs),
+        }
+    }
+
+    pub fn validate_single(&self, value: &DataValue) -> crate::schema::Effect<DataValue, ValidationError> {
+        match self.parse(value) {
+            Ok(val) => crate::schema::Effect::success(val),
+            Err(errs) => crate::schema::Effect::failure(errs.into()),
+        }
+    }
+
     pub fn optional(self) -> Self {
         Schema::new(SchemaIR::Optional(Box::new(self.ir)))
     }
 
     pub fn nullable(self) -> Self {
         Schema::new(SchemaIR::Nullable(Box::new(self.ir)))
+    }
+
+    pub fn refine<F>(self, predicate: F) -> Self
+    where
+        F: Fn(&DataValue) -> bool + Send + Sync + 'static,
+    {
+        Schema::new(SchemaIR::Refine {
+            inner: Box::new(self.ir),
+            predicate: RefinePredicate {
+                f: Arc::new(predicate),
+            },
+            message: None,
+        })
+    }
+
+    pub fn refine_with_message<F>(self, predicate: F, message: impl Into<String>) -> Self
+    where
+        F: Fn(&DataValue) -> bool + Send + Sync + 'static,
+    {
+        Schema::new(SchemaIR::Refine {
+            inner: Box::new(self.ir),
+            predicate: RefinePredicate {
+                f: Arc::new(predicate),
+            },
+            message: Some(message.into()),
+        })
+    }
+
+    pub fn transform<F>(self, transform_fn: F) -> Self
+    where
+        F: Fn(DataValue) -> DataValue + Send + Sync + 'static,
+    {
+        Schema::new(SchemaIR::Transform {
+            inner: Box::new(self.ir),
+            transform: TransformFn {
+                f: Arc::new(transform_fn),
+            },
+        })
+    }
+
+    pub fn min(mut self, min: usize) -> Self {
+        match &mut self.ir {
+            SchemaIR::String { min_len, .. } => {
+                *min_len = Some(min);
+            }
+            SchemaIR::Int { min: m, .. } => {
+                *m = Some(min as i64);
+            }
+            SchemaIR::Float { min: m, .. } => {
+                *m = Some(min as f64);
+            }
+            SchemaIR::Array { min_items, .. } => {
+                *min_items = Some(min);
+            }
+            SchemaIR::Binary { min_len, .. } => {
+                *min_len = Some(min);
+            }
+            _ => {}
+        }
+        self
+    }
+
+    pub fn max(mut self, max: usize) -> Self {
+        match &mut self.ir {
+            SchemaIR::String { max_len, .. } => {
+                *max_len = Some(max);
+            }
+            SchemaIR::Int { max: m, .. } => {
+                *m = Some(max as i64);
+            }
+            SchemaIR::Float { max: m, .. } => {
+                *m = Some(max as f64);
+            }
+            SchemaIR::Array { max_items, .. } => {
+                *max_items = Some(max);
+            }
+            SchemaIR::Binary { max_len, .. } => {
+                *max_len = Some(max);
+            }
+            _ => {}
+        }
+        self
+    }
+
+    pub fn compile(self) -> SchemaIR {
+        self.ir
+    }
+
+    pub fn to_ir(&self) -> &SchemaIR {
+        &self.ir
     }
 }
 
@@ -64,11 +169,44 @@ impl StringBuilder {
     }
 
     pub fn build(self) -> Schema {
+        if let Some(ref pattern) = self.regex {
+            if let Err(e) = crate::regex::BoundedRegex::new(pattern) {
+                return Schema::new(SchemaIR::InvalidRegex {
+                    pattern: pattern.clone(),
+                    error: e.to_string(),
+                });
+            }
+        }
         Schema::new(SchemaIR::String {
             min_len: self.min_len,
             max_len: self.max_len,
             regex: self.regex,
         })
+    }
+
+    pub fn compile(self) -> SchemaIR {
+        self.build().ir
+    }
+
+    pub fn refine<F>(self, predicate: F) -> Schema
+    where
+        F: Fn(&DataValue) -> bool + Send + Sync + 'static,
+    {
+        self.build().refine(predicate)
+    }
+
+    pub fn refine_with_message<F>(self, predicate: F, message: impl Into<String>) -> Schema
+    where
+        F: Fn(&DataValue) -> bool + Send + Sync + 'static,
+    {
+        self.build().refine_with_message(predicate, message)
+    }
+
+    pub fn transform<F>(self, transform_fn: F) -> Schema
+    where
+        F: Fn(DataValue) -> DataValue + Send + Sync + 'static,
+    {
+        self.build().transform(transform_fn)
     }
 }
 
@@ -104,6 +242,31 @@ impl IntBuilder {
             max: self.max,
         })
     }
+
+    pub fn compile(self) -> SchemaIR {
+        self.build().ir
+    }
+
+    pub fn refine<F>(self, predicate: F) -> Schema
+    where
+        F: Fn(&DataValue) -> bool + Send + Sync + 'static,
+    {
+        self.build().refine(predicate)
+    }
+
+    pub fn refine_with_message<F>(self, predicate: F, message: impl Into<String>) -> Schema
+    where
+        F: Fn(&DataValue) -> bool + Send + Sync + 'static,
+    {
+        self.build().refine_with_message(predicate, message)
+    }
+
+    pub fn transform<F>(self, transform_fn: F) -> Schema
+    where
+        F: Fn(DataValue) -> DataValue + Send + Sync + 'static,
+    {
+        self.build().transform(transform_fn)
+    }
 }
 
 impl From<IntBuilder> for Schema {
@@ -137,6 +300,31 @@ impl FloatBuilder {
             min: self.min,
             max: self.max,
         })
+    }
+
+    pub fn compile(self) -> SchemaIR {
+        self.build().ir
+    }
+
+    pub fn refine<F>(self, predicate: F) -> Schema
+    where
+        F: Fn(&DataValue) -> bool + Send + Sync + 'static,
+    {
+        self.build().refine(predicate)
+    }
+
+    pub fn refine_with_message<F>(self, predicate: F, message: impl Into<String>) -> Schema
+    where
+        F: Fn(&DataValue) -> bool + Send + Sync + 'static,
+    {
+        self.build().refine_with_message(predicate, message)
+    }
+
+    pub fn transform<F>(self, transform_fn: F) -> Schema
+    where
+        F: Fn(DataValue) -> DataValue + Send + Sync + 'static,
+    {
+        self.build().transform(transform_fn)
     }
 }
 
@@ -177,6 +365,31 @@ impl ArrayBuilder {
             min_items: self.min_items,
             max_items: self.max_items,
         })
+    }
+
+    pub fn compile(self) -> SchemaIR {
+        self.build().ir
+    }
+
+    pub fn refine<F>(self, predicate: F) -> Schema
+    where
+        F: Fn(&DataValue) -> bool + Send + Sync + 'static,
+    {
+        self.build().refine(predicate)
+    }
+
+    pub fn refine_with_message<F>(self, predicate: F, message: impl Into<String>) -> Schema
+    where
+        F: Fn(&DataValue) -> bool + Send + Sync + 'static,
+    {
+        self.build().refine_with_message(predicate, message)
+    }
+
+    pub fn transform<F>(self, transform_fn: F) -> Schema
+    where
+        F: Fn(DataValue) -> DataValue + Send + Sync + 'static,
+    {
+        self.build().transform(transform_fn)
     }
 }
 
@@ -240,6 +453,31 @@ impl ObjectBuilder {
             fields: self.fields,
             strict: self.strict,
         })
+    }
+
+    pub fn compile(self) -> SchemaIR {
+        self.build().ir
+    }
+
+    pub fn refine<F>(self, predicate: F) -> Schema
+    where
+        F: Fn(&DataValue) -> bool + Send + Sync + 'static,
+    {
+        self.build().refine(predicate)
+    }
+
+    pub fn refine_with_message<F>(self, predicate: F, message: impl Into<String>) -> Schema
+    where
+        F: Fn(&DataValue) -> bool + Send + Sync + 'static,
+    {
+        self.build().refine_with_message(predicate, message)
+    }
+
+    pub fn transform<F>(self, transform_fn: F) -> Schema
+    where
+        F: Fn(DataValue) -> DataValue + Send + Sync + 'static,
+    {
+        self.build().transform(transform_fn)
     }
 }
 

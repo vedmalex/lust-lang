@@ -27,4 +27,64 @@ pub mod validate;
 pub use binding::{derive_schema_from_layout, StructSchemaBinding};
 pub use builder::{s, ArrayBuilder, FloatBuilder, IntBuilder, ObjectBuilder, Schema, StringBuilder};
 pub use error::{ValidationError, ValidationErrors};
-pub use ir::{ObjectFieldIR, SchemaIR};
+pub use ir::{ObjectFieldIR, RefinePredicate, SchemaIR, TransformFn};
+pub use crate::effect_abi::{Cause, Exit};
+
+/// Effect representation for schema validation returning Exit<T, E> with requirements R
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Effect<T = crate::data::DataValue, E = ValidationErrors, R = ()> {
+    pub exit: crate::effect_abi::Exit<T, E>,
+    _req: std::marker::PhantomData<fn() -> R>,
+}
+
+impl<T, E: std::fmt::Debug, R> Effect<T, E, R> {
+    pub fn success(val: T) -> Self {
+        Self {
+            exit: crate::effect_abi::Exit::Success(val),
+            _req: std::marker::PhantomData,
+        }
+    }
+
+    pub fn failure(err: E) -> Self {
+        Self {
+            exit: crate::effect_abi::Exit::Failure(crate::effect_abi::Cause::Fail(err)),
+            _req: std::marker::PhantomData,
+        }
+    }
+
+    pub fn is_success(&self) -> bool {
+        self.exit.is_success()
+    }
+
+    pub fn is_failure(&self) -> bool {
+        self.exit.is_failure()
+    }
+
+    pub fn into_exit(self) -> crate::effect_abi::Exit<T, E> {
+        self.exit
+    }
+
+    pub fn into_result(self) -> Result<T, E> {
+        match self.exit {
+            crate::effect_abi::Exit::Success(v) => Ok(v),
+            crate::effect_abi::Exit::Failure(crate::effect_abi::Cause::Fail(e)) => Err(e),
+            crate::effect_abi::Exit::Failure(other) => panic!("Effect defect or interruption: {:?}", other),
+        }
+    }
+}
+
+impl<T, E, R> std::ops::Deref for Effect<T, E, R> {
+    type Target = crate::effect_abi::Exit<T, E>;
+    fn deref(&self) -> &Self::Target {
+        &self.exit
+    }
+}
+
+impl<T, E, R> From<crate::effect_abi::Exit<T, E>> for Effect<T, E, R> {
+    fn from(exit: crate::effect_abi::Exit<T, E>) -> Self {
+        Self {
+            exit,
+            _req: std::marker::PhantomData,
+        }
+    }
+}
