@@ -255,3 +255,242 @@ fn test_pipe_operator_vm_logical_expression_pipe() {
     assert_eq!(res, Value::Int(1));
 }
 
+#[test]
+fn test_pipe_operator_chains_left_to_right() {
+    let source = r#"
+        function sub(a: int, b: int): int
+            return a - b
+        end
+
+        function test(): int
+            -- Left-to-right: sub(sub(100, 30), 10) = sub(70, 10) = 60
+            -- If right-to-left: sub(100, sub(30, 10)) = sub(100, 20) = 80
+            return 100 |> sub(30) |> sub(10)
+        end
+    "#;
+    let res = run_vm(source, "test").expect("execution should succeed");
+    assert_eq!(res, Value::Int(60));
+
+    // Also verify AST nesting for left-to-right chaining:
+    // a |> f |> g |> h  =>  h(g(f(a)))
+    let ast_source = r#"
+        function test()
+            local res = a |> f |> g |> h
+        end
+    "#;
+    let items = parse_program(ast_source);
+    if let ItemKind::Function(ref func) = items[0].kind {
+        if let StmtKind::Local { initializer: Some(ref inits), .. } = func.body[0].kind {
+            // Outermost call is h
+            if let ExprKind::Call { ref callee, ref args, .. } = inits[0].kind {
+                assert!(matches!(callee.kind, ExprKind::Identifier(ref name) if name == "h"));
+                assert_eq!(args.len(), 1);
+                // Middle call is g
+                if let ExprKind::Call { callee: ref mid_callee, args: ref mid_args, .. } = args[0].kind {
+                    assert!(matches!(mid_callee.kind, ExprKind::Identifier(ref name) if name == "g"));
+                    assert_eq!(mid_args.len(), 1);
+                    // Innermost call is f
+                    if let ExprKind::Call { callee: ref inner_callee, args: ref inner_args, .. } = mid_args[0].kind {
+                        assert!(matches!(inner_callee.kind, ExprKind::Identifier(ref name) if name == "f"));
+                        assert_eq!(inner_args.len(), 1);
+                        assert!(matches!(inner_args[0].kind, ExprKind::Identifier(ref name) if name == "a"));
+                    } else {
+                        panic!("Expected innermost Call to f");
+                    }
+                } else {
+                    panic!("Expected middle Call to g");
+                }
+            } else {
+                panic!("Expected outermost Call to h");
+            }
+        }
+    }
+}
+
+#[test]
+fn test_pipe_operator_with_existing_expression_grammar() {
+    let source = r#"
+        function double(x: int): int
+            return x * 2
+        end
+
+        function add(a: int, b: int): int
+            return a + b
+        end
+
+        function abs(x: int): int
+            if x < 0 then
+                return -x
+            else
+                return x
+            end
+        end
+
+        function test(): int
+            -- Arithmetic precedence: 1 + 2 * 3 = 7 |> double = 14
+            local r1 = 1 + 2 * 3 |> double
+
+            -- Unary operator precedence: -15 |> abs = 15 |> double = 30
+            local r2 = -15 |> abs |> double
+
+            -- Bitwise precedence: (5 | 2) = 7 |> double = 14
+            local r3 = 5 | 2 |> double
+
+            -- Pipe nested within arithmetic
+            local r4 = (10 |> double) + (5 |> double)
+
+            return r1 + r2 + r3 + r4
+        end
+    "#;
+    let res = run_vm(source, "test").expect("execution should succeed");
+    // r1 = 14, r2 = 30, r3 = 14, r4 = 20 + 10 = 30; total = 14 + 30 + 14 + 30 = 88
+    assert_eq!(res, Value::Int(88));
+}
+
+#[test]
+fn test_pipe_non_callable_same_error_as_direct_call_compile_time() {
+    // 1. Calling a typed non-callable variable
+    let pipe_source = r#"
+        function test(): int
+            local not_a_func: int = 42
+            return 10 |> not_a_func
+        end
+    "#;
+    let direct_source = r#"
+        function test(): int
+            local not_a_func: int = 42
+            return not_a_func(10)
+        end
+    "#;
+
+    let pipe_err = run_vm(pipe_source, "test").unwrap_err();
+    let direct_err = run_vm(direct_source, "test").unwrap_err();
+
+    assert_eq!(
+        pipe_err.to_string(),
+        direct_err.to_string(),
+        "Compile-time type error for non-callable pipe must match direct call error exactly"
+    );
+
+    // 2. Calling a literal non-callable
+    let pipe_lit = r#"
+        function test(): int
+            return 10 |> 42
+        end
+    "#;
+    let direct_lit = r#"
+        function test(): int
+            return 42(10)
+        end
+    "#;
+
+    let pipe_lit_err = run_vm(pipe_lit, "test").unwrap_err();
+    let direct_lit_err = run_vm(direct_lit, "test").unwrap_err();
+
+    assert_eq!(
+        pipe_lit_err.to_string(),
+        direct_lit_err.to_string(),
+        "Literal non-callable pipe error must match direct call error exactly"
+    );
+}
+
+#[test]
+fn test_pipe_non_callable_same_error_as_direct_call_runtime() {
+    // Calling a dynamic/any variable that holds a non-callable value at runtime
+    let pipe_source = r#"
+        function test(): any
+            local f: any = 42
+            return 10 |> f
+        end
+    "#;
+    let direct_source = r#"
+        function test(): any
+            local f: any = 42
+            return f(10)
+        end
+    "#;
+
+    let pipe_err = run_vm(pipe_source, "test").unwrap_err();
+    let direct_err = run_vm(direct_source, "test").unwrap_err();
+
+    assert_eq!(
+        pipe_err.to_string(),
+        direct_err.to_string(),
+        "Runtime error for non-callable pipe must match direct call error exactly"
+    );
+}
+
+#[test]
+fn test_pipe_strict_mir_zero_cost_pipeline() {
+    let source = r#"
+        function double(x: int): int
+            return x * 2
+        end
+
+        function add_five(x: int): int
+            return x + 5
+        end
+
+        function compute(x: int): int
+            return x |> double |> add_five
+        end
+    "#;
+
+    let mut prog = EmbeddedProgram::builder()
+        .with_config(lust::LustConfig::default().with_strict_mir(true))
+        .module("main", source)
+        .entry_module("main")
+        .compile()
+        .expect("Strict MIR compilation should succeed");
+
+    let result = prog
+        .vm_mut()
+        .call("main.compute", vec![Value::Int(20)])
+        .expect("Execution under strict MIR should succeed");
+    assert_eq!(result, Value::Int(45));
+}
+
+#[test]
+fn test_pipe_cranelift_jit_lowered_call_execution() {
+    use lust::ast::ItemKind;
+    use lust::mir::lowering::AstLowering;
+    use lust::mir::cranelift_backend::jit_engine::CraneliftJitCompiler;
+    use lust::mir::ir::MirModule;
+
+    let source = r#"
+        function double(x: int): int
+            return x * 2
+        end
+
+        function add_five(x: int): int
+            return x + 5
+        end
+
+        function pipeline(x: int): int
+            return x |> double |> add_five
+        end
+    "#;
+
+    let items = parse_program(source);
+    let mut module = MirModule::new("test_pipe_jit".into());
+
+    for item in items {
+        if let ItemKind::Function(func_def) = item.kind {
+            let mir_fn = AstLowering::lower_function(&func_def).expect("lower function to MIR");
+            module.add_function(mir_fn);
+        }
+    }
+
+    let mut jit = CraneliftJitCompiler::new().expect("JIT initialization");
+    let func_ptrs = jit.compile_module(&module).expect("Cranelift JIT compilation");
+    let pipe_ptr = *func_ptrs.get("pipeline").expect("pipeline function found");
+    let native_pipeline: extern "C" fn(i64) -> i64 = unsafe { core::mem::transmute(pipe_ptr) };
+
+    // 21 |> double (42) |> add_five (47)
+    let res = native_pipeline(21);
+    assert_eq!(res, 47);
+}
+
+
+
+
