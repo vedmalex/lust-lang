@@ -43,6 +43,32 @@ impl TypeChecker {
                 }
                 Ok(())
             }
+            ItemKind::Test(t) => {
+                let prev_return = self.current_function_return_type.clone();
+                let test_return = Type::new(TypeKind::Unit, TypeChecker::dummy_span());
+                self.current_function_return_type = Some(test_return);
+                for stmt in &t.body {
+                    self.check_stmt(stmt)?;
+                }
+                self.current_function_return_type = prev_return;
+                Ok(())
+            }
+            ItemKind::Suite(s) => {
+                for test in &s.tests {
+                    let prev_return = self.current_function_return_type.clone();
+                    let test_return = Type::new(TypeKind::Unit, TypeChecker::dummy_span());
+                    self.current_function_return_type = Some(test_return);
+                    for stmt in &test.body {
+                        self.check_stmt(stmt)?;
+                    }
+                    self.current_function_return_type = prev_return;
+                }
+                for nested in &s.nested_suites {
+                    let item = Item::new(ItemKind::Suite(nested.clone()), nested.span);
+                    self.check_item(&item)?;
+                }
+                Ok(())
+            }
         }
     }
 

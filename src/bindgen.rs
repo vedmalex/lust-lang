@@ -499,7 +499,9 @@ fn collect_nominal_names_in_items(
             | ItemKind::Trait(_)
             | ItemKind::Impl(_)
             | ItemKind::Use { .. }
-            | ItemKind::Service(_) => {}
+            | ItemKind::Service(_)
+            | ItemKind::Test(_)
+            | ItemKind::Suite(_) => {}
         }
     }
 }
@@ -744,7 +746,11 @@ fn collect_items(
                     method_names,
                 )?;
             }
-            ItemKind::Script(_) | ItemKind::Use { .. } | ItemKind::Service(_) => {}
+            ItemKind::Script(_)
+            | ItemKind::Use { .. }
+            | ItemKind::Service(_)
+            | ItemKind::Test(_)
+            | ItemKind::Suite(_) => {}
         }
     }
 

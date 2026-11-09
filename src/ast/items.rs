@@ -24,6 +24,42 @@ pub enum ItemKind {
     Use { public: bool, tree: UseTree },
     Extern { abi: String, items: Vec<ExternItem> },
     Service(ServiceDef),
+    Test(TestDecl),
+    Suite(SuiteDecl),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum TestModifier {
+    None,
+    Skip(Option<String>),
+    Only,
+    Timeout(u64),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct TestDecl {
+    pub name: String,
+    pub modifier: TestModifier,
+    pub body: Vec<Stmt>,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct SuiteHooks {
+    pub before_each: Option<Vec<Stmt>>,
+    pub after_each: Option<Vec<Stmt>>,
+    pub before_all: Option<Vec<Stmt>>,
+    pub after_all: Option<Vec<Stmt>>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct SuiteDecl {
+    pub name: String,
+    pub modifier: TestModifier,
+    pub tests: Vec<TestDecl>,
+    pub nested_suites: Vec<SuiteDecl>,
+    pub hooks: SuiteHooks,
+    pub span: Span,
 }
 
 #[derive(Debug, Clone, PartialEq)]

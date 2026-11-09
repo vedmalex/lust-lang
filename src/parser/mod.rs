@@ -137,7 +137,11 @@ impl Parser {
             | TokenKind::Use
             | TokenKind::Module
             | TokenKind::Extern => true,
-            TokenKind::Identifier if self.current_token().lexeme == "service" => true,
+            TokenKind::Identifier
+                if self.current_token().lexeme == "service" || self.is_test_or_suite_start() =>
+            {
+                true
+            }
             TokenKind::Local => self.peek_ahead(1).is_some_and(|t| {
                 matches!(
                     t.kind,
@@ -145,6 +149,22 @@ impl Parser {
                 ) || (t.kind == TokenKind::Identifier && t.lexeme == "service")
             }),
             _ => false,
+        }
+    }
+
+    fn is_test_or_suite_start(&self) -> bool {
+        if self.peek_kind() != TokenKind::Identifier {
+            return false;
+        }
+        let lexeme = &self.current_token().lexeme;
+        if lexeme == "test" || lexeme == "suite" || lexeme == "describe" {
+            if let Some(next) = self.peek_ahead(1) {
+                matches!(next.kind, TokenKind::String | TokenKind::Dot)
+            } else {
+                false
+            }
+        } else {
+            false
         }
     }
 

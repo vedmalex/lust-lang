@@ -2,8 +2,8 @@ use super::Parser;
 use crate::{
     ast::{
         EnumDef, EnumVariant, ExternItem, ExternParam, FieldOwnership, FunctionDef, FunctionParam,
-        ImplBlock, Item, ItemKind, Span, StructDef, StructField, TraitBound, TraitDef, TraitMethod, Type,
-        TypeKind, Visibility,
+        ImplBlock, Item, ItemKind, Span, Stmt, StructDef, StructField, SuiteDecl, SuiteHooks, TestDecl,
+        TestModifier, TraitBound, TraitDef, TraitMethod, Type, TypeKind, Visibility,
     },
     error::Result,
     lexer::TokenKind,
@@ -282,6 +282,22 @@ impl Parser {
                     target_type,
                     doc,
                 })
+            }
+
+            TokenKind::Identifier
+                if self.current_token().lexeme == "test" && self.is_test_or_suite_start() =>
+            {
+                let test_decl = self.parse_test_decl()?;
+                ItemKind::Test(test_decl)
+            }
+
+            TokenKind::Identifier
+                if (self.current_token().lexeme == "suite"
+                    || self.current_token().lexeme == "describe")
+                    && self.is_test_or_suite_start() =>
+            {
+                let suite_decl = self.parse_suite_decl()?;
+                ItemKind::Suite(suite_decl)
             }
 
             _ => {
@@ -705,5 +721,204 @@ impl Parser {
 
         self.consume(TokenKind::Greater, "Expected '>' after type parameters")?;
         Ok((type_params, trait_bounds))
+    }
+
+    pub(super) fn parse_test_decl(&mut self) -> Result<TestDecl> {
+        let start_token = self.current_token().clone();
+        self.advance(); // consume "test"
+
+        let mut modifier = TestModifier::None;
+        if self.match_token(&[TokenKind::Dot]) {
+            let mod_ident = self.expect_identifier()?;
+            match mod_ident.as_str() {
+                "skip" => {
+                    let reason = if self.match_token(&[TokenKind::LeftParen]) {
+                        let r = if self.check(TokenKind::String) {
+                            let tok = self.advance().clone();
+                            Some(self.unescape_string_literal(&tok)?)
+                        } else {
+                            None
+                        };
+                        self.consume(TokenKind::RightParen, "Expected ')' after skip reason")?;
+                        r
+                    } else {
+                        None
+                    };
+                    modifier = TestModifier::Skip(reason);
+                }
+                "only" => {
+                    modifier = TestModifier::Only;
+                }
+                "timeout" => {
+                    self.consume(TokenKind::LeftParen, "Expected '(' after timeout")?;
+                    let tok = self.current_token().clone();
+                    self.consume(TokenKind::Integer, "Expected integer timeout in ms")?;
+                    let ms: u64 = tok.lexeme.parse().unwrap_or(5000);
+                    self.consume(TokenKind::RightParen, "Expected ')' after timeout value")?;
+                    modifier = TestModifier::Timeout(ms);
+                }
+                other => {
+                    return Err(self.error(&format!("Unknown test modifier '.{}'", other)));
+                }
+            }
+        }
+
+        let name = if self.check(TokenKind::String) {
+            let tok = self.advance().clone();
+            self.unescape_string_literal(&tok)?
+        } else {
+            return Err(self.error("Expected test name string"));
+        };
+
+        let mut body = Vec::new();
+        if self.match_token(&[TokenKind::Do]) {
+            while !self.check(TokenKind::End) && !self.is_at_end() {
+                body.push(self.parse_stmt()?);
+            }
+            self.consume(TokenKind::End, "Expected 'end' after test block")?;
+        } else if self.match_token(&[TokenKind::LeftBrace]) {
+            while !self.check(TokenKind::RightBrace) && !self.is_at_end() {
+                body.push(self.parse_stmt()?);
+            }
+            self.consume(TokenKind::RightBrace, "Expected '}' after test block")?;
+        } else {
+            return Err(self.error("Expected 'do' or '{' after test declaration"));
+        }
+
+        let end_token = self.tokens[self.current - 1].clone();
+        Ok(TestDecl {
+            name,
+            modifier,
+            body,
+            span: self.make_span(&start_token, &end_token),
+        })
+    }
+
+    pub(super) fn parse_suite_decl(&mut self) -> Result<SuiteDecl> {
+        let start_token = self.current_token().clone();
+        self.advance(); // consume "suite" or "describe"
+
+        let mut modifier = TestModifier::None;
+        if self.match_token(&[TokenKind::Dot]) {
+            let mod_ident = self.expect_identifier()?;
+            if mod_ident == "skip" {
+                let reason = if self.match_token(&[TokenKind::LeftParen]) {
+                    let r = if self.check(TokenKind::String) {
+                        let tok = self.advance().clone();
+                        Some(self.unescape_string_literal(&tok)?)
+                    } else {
+                        None
+                    };
+                    self.consume(TokenKind::RightParen, "Expected ')' after skip reason")?;
+                    r
+                } else {
+                    None
+                };
+                modifier = TestModifier::Skip(reason);
+            } else if mod_ident == "only" {
+                modifier = TestModifier::Only;
+            } else {
+                return Err(self.error(&format!("Unknown suite modifier '.{}'", mod_ident)));
+            }
+        }
+
+        let name = if self.check(TokenKind::String) {
+            let tok = self.advance().clone();
+            self.unescape_string_literal(&tok)?
+        } else {
+            return Err(self.error("Expected suite name string"));
+        };
+
+        let mut tests = Vec::new();
+        let mut nested_suites = Vec::new();
+        let mut hooks = SuiteHooks::default();
+
+        let uses_braces = if self.match_token(&[TokenKind::LeftBrace]) {
+            true
+        } else if self.match_token(&[TokenKind::Do]) {
+            false
+        } else {
+            return Err(self.error("Expected 'do' or '{' after suite declaration"));
+        };
+
+        let terminator = if uses_braces {
+            TokenKind::RightBrace
+        } else {
+            TokenKind::End
+        };
+
+        while !self.check(terminator) && !self.is_at_end() {
+            if self.peek_kind() == TokenKind::Identifier {
+                let lexeme = self.current_token().lexeme.clone();
+                if lexeme == "test" && self.is_test_or_suite_start() {
+                    tests.push(self.parse_test_decl()?);
+                    continue;
+                } else if (lexeme == "suite" || lexeme == "describe")
+                    && self.is_test_or_suite_start()
+                {
+                    nested_suites.push(self.parse_suite_decl()?);
+                    continue;
+                } else if lexeme == "before_each" {
+                    self.advance();
+                    let stmts = self.parse_hook_block()?;
+                    hooks.before_each = Some(stmts);
+                    continue;
+                } else if lexeme == "after_each" {
+                    self.advance();
+                    let stmts = self.parse_hook_block()?;
+                    hooks.after_each = Some(stmts);
+                    continue;
+                } else if lexeme == "before_all" {
+                    self.advance();
+                    let stmts = self.parse_hook_block()?;
+                    hooks.before_all = Some(stmts);
+                    continue;
+                } else if lexeme == "after_all" {
+                    self.advance();
+                    let stmts = self.parse_hook_block()?;
+                    hooks.after_all = Some(stmts);
+                    continue;
+                }
+            }
+            // Fall back to statement
+            self.parse_stmt()?;
+        }
+
+        self.consume(
+            terminator,
+            if uses_braces {
+                "Expected '}' after suite block"
+            } else {
+                "Expected 'end' after suite block"
+            },
+        )?;
+
+        let end_token = self.tokens[self.current - 1].clone();
+        Ok(SuiteDecl {
+            name,
+            modifier,
+            tests,
+            nested_suites,
+            hooks,
+            span: self.make_span(&start_token, &end_token),
+        })
+    }
+
+    fn parse_hook_block(&mut self) -> Result<Vec<Stmt>> {
+        let mut stmts = Vec::new();
+        if self.match_token(&[TokenKind::Do]) {
+            while !self.check(TokenKind::End) && !self.is_at_end() {
+                stmts.push(self.parse_stmt()?);
+            }
+            self.consume(TokenKind::End, "Expected 'end' after hook block")?;
+        } else if self.match_token(&[TokenKind::LeftBrace]) {
+            while !self.check(TokenKind::RightBrace) && !self.is_at_end() {
+                stmts.push(self.parse_stmt()?);
+            }
+            self.consume(TokenKind::RightBrace, "Expected '}' after hook block")?;
+        } else {
+            return Err(self.error("Expected 'do' or '{' after hook name"));
+        }
+        Ok(stmts)
     }
 }

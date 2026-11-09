@@ -1696,48 +1696,44 @@ pub fn lookup_builtin_method(
 
 pub fn is_virtual_std_module(module_path: &str) -> bool {
     let m = module_path.trim();
-    if let Some(stripped) = m.strip_prefix("std.") {
-        matches!(
-            stripped,
-            "math"
-                | "string"
-                | "array"
-                | "map"
-                | "table"
-                | "io"
-                | "os"
-                | "task"
-                | "lua"
-                | "fmt"
-                | "assert"
-                | "iter"
-                | "random"
-                | "effect"
-        )
+    let stripped = if let Some(s) = m.strip_prefix("@std/") {
+        s
+    } else if let Some(s) = m.strip_prefix("std.") {
+        s
     } else {
-        matches!(
-            m,
-            "math"
-                | "string"
-                | "array"
-                | "map"
-                | "table"
-                | "io"
-                | "os"
-                | "task"
-                | "lua"
-                | "fmt"
-                | "assert"
-                | "iter"
-                | "random"
-                | "effect"
-        )
-    }
+        m
+    };
+    matches!(
+        stripped,
+        "math"
+            | "string"
+            | "array"
+            | "map"
+            | "table"
+            | "io"
+            | "os"
+            | "task"
+            | "lua"
+            | "fmt"
+            | "assert"
+            | "iter"
+            | "random"
+            | "effect"
+            | "test"
+            | "test.clock"
+            | "test.mock"
+    )
 }
 
 pub fn canonical_std_module_name(module_path: &str) -> &'static str {
     let m = module_path.trim();
-    let stripped = m.strip_prefix("std.").unwrap_or(m);
+    let stripped = if let Some(s) = m.strip_prefix("@std/") {
+        s
+    } else if let Some(s) = m.strip_prefix("std.") {
+        s
+    } else {
+        m
+    };
     match stripped {
         "math" => "math",
         "string" => "string",
@@ -1753,6 +1749,7 @@ pub fn canonical_std_module_name(module_path: &str) -> &'static str {
         "iter" => "iter",
         "random" => "random",
         "effect" => "effect",
+        "test" | "test.clock" | "test.mock" => "test",
         _ => "unknown",
     }
 }
@@ -1760,6 +1757,25 @@ pub fn canonical_std_module_name(module_path: &str) -> &'static str {
 pub fn resolve_std_function(module_path: &str, item_name: &str) -> Option<&'static str> {
     let canon = canonical_std_module_name(module_path);
     match canon {
+        "test" => match item_name {
+            "test" => Some("std.test.test"),
+            "suite" => Some("std.test.suite"),
+            "describe" => Some("std.test.describe"),
+            "assert" => Some("std.test.assert"),
+            "assert_eq" => Some("std.test.assert_eq"),
+            "assert_ne" => Some("std.test.assert_ne"),
+            "assert_matches" => Some("std.test.assert_matches"),
+            "assert_almost_eq" => Some("std.test.assert_almost_eq"),
+            "assert_success" => Some("std.test.assert_success"),
+            "assert_fails" => Some("std.test.assert_fails"),
+            "assert_interrupted" => Some("std.test.assert_interrupted"),
+            "assert_dies" => Some("std.test.assert_dies"),
+            "before_each" => Some("std.test.before_each"),
+            "after_each" => Some("std.test.after_each"),
+            "before_all" => Some("std.test.before_all"),
+            "after_all" => Some("std.test.after_all"),
+            _ => None,
+        },
         "effect" => match item_name {
             "succeed" => Some("effect.succeed"),
             "fail" => Some("effect.fail"),

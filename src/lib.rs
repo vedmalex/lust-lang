@@ -30,6 +30,7 @@ pub mod number;
 #[cfg(all(feature = "packages", not(target_arch = "wasm32")))]
 pub mod packages;
 pub mod parser;
+pub mod test_framework;
 pub mod typechecker;
 pub mod vm;
 #[cfg(target_arch = "wasm32")]

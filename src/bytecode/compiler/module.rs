@@ -100,6 +100,7 @@ impl Compiler {
                             ItemKind::Use { .. } => {}
                             ItemKind::Module { .. } => {}
                             ItemKind::Service(_) => {}
+                            ItemKind::Test(_) | ItemKind::Suite(_) => {}
                         }
                     }
 
@@ -190,6 +191,7 @@ impl Compiler {
 
                 ItemKind::Use { .. } => {}
                 ItemKind::Service(_) => {}
+                ItemKind::Test(_) | ItemKind::Suite(_) => {}
             }
         }
 

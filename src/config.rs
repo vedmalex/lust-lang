@@ -130,6 +130,7 @@ pub struct CapabilityMask {
     pub allow_os: bool,
     pub allow_net: bool,
     pub allow_task: bool,
+    pub allow_test: bool,
     pub custom_capabilities: HashSet<String>,
 }
 
@@ -141,6 +142,7 @@ impl Default for CapabilityMask {
             allow_os: true,
             allow_net: true,
             allow_task: true,
+            allow_test: true,
             custom_capabilities: HashSet::new(),
         }
     }
@@ -153,6 +155,7 @@ impl std::hash::Hash for CapabilityMask {
         self.allow_os.hash(state);
         self.allow_net.hash(state);
         self.allow_task.hash(state);
+        self.allow_test.hash(state);
         let mut customs: Vec<&String> = self.custom_capabilities.iter().collect();
         customs.sort();
         customs.hash(state);
@@ -167,6 +170,7 @@ impl CapabilityMask {
             allow_os: false,
             allow_net: false,
             allow_task: false,
+            allow_test: false,
             custom_capabilities: HashSet::new(),
         }
     }
@@ -318,7 +322,9 @@ impl LustConfig {
 
     pub fn allow_std_module<S: AsRef<str>>(&mut self, module: S) {
         let m = module.as_ref().trim();
-        let key = if let Some(stripped) = m.strip_prefix("std.") {
+        let key = if let Some(stripped) = m.strip_prefix("@std/") {
+            stripped
+        } else if let Some(stripped) = m.strip_prefix("std.") {
             stripped
         } else {
             m
@@ -340,6 +346,9 @@ impl LustConfig {
             "net" => {
                 self.capability_mask.allow_net = true;
             }
+            "test" => {
+                self.capability_mask.allow_test = true;
+            }
             other => {
                 self.capability_mask.custom_capabilities.insert(other.to_string());
             }
@@ -358,7 +367,9 @@ impl LustConfig {
 
     pub fn is_std_module_allowed(&self, module: &str) -> bool {
         let m = module.trim();
-        let key = if let Some(stripped) = m.strip_prefix("std.") {
+        let key = if let Some(stripped) = m.strip_prefix("@std/") {
+            stripped
+        } else if let Some(stripped) = m.strip_prefix("std.") {
             stripped
         } else {
             m
@@ -370,7 +381,8 @@ impl LustConfig {
                 || self.capability_mask.custom_capabilities.contains(&key)
                 || (key == "io" && self.capability_mask.allow_io)
                 || (key == "os" && self.capability_mask.allow_os)
-                || (key == "task" && self.capability_mask.allow_task);
+                || (key == "task" && self.capability_mask.allow_task)
+                || (key == "test" && self.capability_mask.allow_test);
         }
 
         match &self.prelude_mode {
@@ -378,6 +390,7 @@ impl LustConfig {
                 match key.as_str() {
                     "io" => self.is_module_enabled("io") || self.capability_mask.allow_io,
                     "os" => self.is_module_enabled("os") || self.capability_mask.allow_os,
+                    "test" => self.is_module_enabled("test") || self.capability_mask.allow_test,
                     _ => true,
                 }
             }
@@ -388,6 +401,7 @@ impl LustConfig {
                     }
                     "io" => self.is_module_enabled("io") || self.capability_mask.allow_io,
                     "os" => self.is_module_enabled("os") || self.capability_mask.allow_os,
+                    "test" => self.is_module_enabled("test") || self.capability_mask.allow_test,
                     "random" => {
                         self.is_module_enabled("random")
                             || self.capability_mask.custom_capabilities.contains("random")
