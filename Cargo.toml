@@ -69,6 +69,8 @@ packages = ["std", "libloading", "dirs", "dep:serde_json", "dep:object"]
 lua_transpile = ["std", "dep:full_moon"]
 # ESP32 debugging support - adds logging via esp-println
 esp32c6-logging = ["dep:esp-println", "dep:log"]
+# JSONC optional CST support - off by default (WBS 12C-02)
+jsonc_cst = []
 
 [[bin]]
 name = "lust"

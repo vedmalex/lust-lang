@@ -4,6 +4,8 @@
 
 use lust::data::bson;
 use lust::data::json::{self, JsonError};
+use lust::data::jsonc;
+use lust::data::jsonl;
 use lust::data::toon;
 use lust::data::yaml;
 
@@ -62,3 +64,36 @@ fn review_gate01_toon_rejects_integer_overflow_narrowing() {
         "TOON integer token exceeding integer lane must be rejected instead of narrowing to f64"
     );
 }
+
+#[test]
+fn review_gate01_all_json_family_paths_reject_integer_overflow_narrowing() {
+    let overflow_token = "18446744073709551616";
+
+    // 1. Scalar JSON
+    assert!(
+        json::from_str(overflow_token).is_err(),
+        "scalar JSON must reject integer token exceeding integer lanes"
+    );
+
+    // 2. SIMD JSON
+    assert!(
+        json::from_str_simd(overflow_token).is_err(),
+        "SIMD JSON must reject integer token exceeding integer lanes"
+    );
+
+    // 3. JSONC (after comment strip)
+    let jsonc_input = format!("// prefix comment\n/* block comment */ {overflow_token}\n");
+    assert!(
+        jsonc::from_str(&jsonc_input).is_err(),
+        "JSONC (after comment strip) must reject integer token exceeding integer lanes"
+    );
+
+    // 4. JSONL
+    let jsonl_input = format!("{overflow_token}\n");
+    let mut reader = jsonl::lines(std::io::Cursor::new(jsonl_input));
+    assert!(
+        reader.next_value().is_err(),
+        "JSONL must reject integer token exceeding integer lanes"
+    );
+}
+

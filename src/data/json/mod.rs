@@ -1,10 +1,15 @@
 pub mod encode;
 pub mod events;
 pub mod scalar;
+pub mod simd;
 
 pub use encode::{to_string, to_string_pretty};
-pub use events::{JsonEvent, JsonError};
+pub use events::{JsonError, JsonEvent};
 pub use scalar::JsonParser;
+pub use simd::{
+    from_slice_simd_with_limits, from_slice_simd_with_limits_and_dispatch, from_str_simd,
+    from_str_simd_with_dispatch, CpuDispatch, SimdJsonParser,
+};
 
 use crate::data::DataValue;
 
