@@ -1,5 +1,6 @@
 use super::CallFrame;
 use crate::bytecode::{Register, TaskHandle, Value};
+use crate::effect_abi::{FiberContext, FiberExecutionState, InterruptReason};
 use crate::error::LustError;
 use alloc::{boxed::Box, vec, vec::Vec};
 use hashbrown::HashMap;
@@ -41,6 +42,8 @@ impl TaskState {
 pub struct TaskInstance {
     pub id: TaskId,
     pub state: TaskState,
+    pub fiber_context: FiberContext,
+    pub scope_id: Option<u64>,
     pub(super) call_stack: Vec<Box<CallFrame>>,
     pub pending_return_value: Option<Value>,
     pub pending_return_dest: Option<Register>,
@@ -62,6 +65,8 @@ impl TaskInstance {
     pub(super) fn new(id: TaskId, initial_frame: Box<CallFrame>) -> Self {
         Self {
             id,
+            fiber_context: FiberContext::new(id.0, 0),
+            scope_id: None,
             state: TaskState::Ready,
             call_stack: vec![initial_frame.clone()],
             pending_return_value: None,
@@ -78,6 +83,8 @@ impl TaskInstance {
     pub(super) fn new_native_future(id: TaskId) -> Self {
         Self {
             id,
+            fiber_context: FiberContext::new(id.0, 0),
+            scope_id: None,
             state: TaskState::Yielded,
             call_stack: Vec::new(),
             pending_return_value: None,
@@ -91,7 +98,36 @@ impl TaskInstance {
         }
     }
 
+    /// First interrupt wins; the context owns the pending reason, including while masked.
+    pub fn request_interrupt(&mut self, reason: InterruptReason) {
+        if matches!(
+            self.state,
+            TaskState::Completed | TaskState::Failed | TaskState::Stopped
+        ) {
+            return;
+        }
+        self.fiber_context.pending_interrupt.get_or_insert(reason);
+        // Running tasks must unwind through the dispatch safe point before being joined.
+        if self.state != TaskState::Running {
+            self.poll_interrupt();
+        }
+    }
+
+    pub fn poll_interrupt(&mut self) -> Option<InterruptReason> {
+        if self.fiber_context.is_masked() {
+            return None;
+        }
+        let reason = self.fiber_context.pending_interrupt.take()?;
+        self.state = TaskState::Stopped;
+        self.fiber_context.state = FiberExecutionState::Interrupted;
+        self.error = Some(LustError::RuntimeError {
+            message: alloc::format!("Task interrupted: {:?}", reason),
+        });
+        Some(reason)
+    }
+
     pub fn reset(&mut self) {
+        self.fiber_context = FiberContext::new(self.id.0, self.scope_id.unwrap_or(0));
         match self.kind {
             TaskKind::Script => {
                 self.state = TaskState::Ready;
@@ -162,6 +198,10 @@ impl TaskManager {
 
     pub fn get(&self, id: TaskId) -> Option<&TaskInstance> {
         self.tasks.get(&id)
+    }
+
+    pub fn get_mut(&mut self, id: TaskId) -> Option<&mut TaskInstance> {
+        self.tasks.get_mut(&id)
     }
 
     pub fn next_id(&mut self) -> TaskId {

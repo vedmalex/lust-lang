@@ -150,6 +150,11 @@ impl VM {
 
     fn run_inner<const JIT_ENABLED: bool>(&mut self) -> Result<Value> {
         'dispatch: loop {
+            if let Some(task) = self.current_task.and_then(|id| self.task_manager.get_mut(id)) {
+                if task.poll_interrupt().is_some() {
+                    return Err(task.error.clone().expect("interrupt error"));
+                }
+            }
             if let Some(target_depth) = self.call_until_depth
                 && self.call_stack.len() == target_depth
                 && let Some(return_value) = self.pending_return_value.take()

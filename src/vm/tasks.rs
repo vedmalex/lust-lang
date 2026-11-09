@@ -6,6 +6,57 @@ use crate::vm::task::TaskKind;
 use alloc::{format, string::ToString};
 use core::{cell::RefCell, mem};
 impl VM {
+    /// Associates a task with an open scope before it can execute.
+    pub fn register_scope_task(
+        &mut self,
+        scope: &mut crate::effect_abi::Scope,
+        handle: TaskHandle,
+    ) -> Result<()> {
+        let id = self.task_id_from_handle(handle)?;
+        let task = self.task_manager.get_mut(id).unwrap();
+        if task.scope_id.is_some() || task.state == TaskState::Running {
+            return Err(LustError::RuntimeError {
+                message: "Task already scoped or running".to_string(),
+            });
+        }
+        scope
+            .register_child(id.0)
+            .map_err(|message| LustError::RuntimeError {
+                message: message.to_string(),
+            })?;
+        task.scope_id = Some(scope.id);
+        task.fiber_context.scope_id = scope.id;
+        Ok(())
+    }
+
+    /// Cooperative close. Returns false while children are masked or still executing;
+    /// call again after driving those children to a safe point. Never finalizes early.
+    pub fn close_scope(&mut self, scope: &mut crate::effect_abi::Scope) -> bool {
+        use crate::effect_abi::{InterruptReason, ScopeTeardown};
+        if scope.teardown == ScopeTeardown::Done {
+            return true;
+        }
+        let children = scope.begin_teardown();
+        for id in &children {
+            if let Some(task) = self.task_manager.get_mut(TaskId(*id)) {
+                task.request_interrupt(InterruptReason::Cancelled);
+            }
+        }
+        scope.mark_joining();
+        if children.iter().any(|id| {
+            self.task_manager.get(TaskId(*id)).is_none_or(|task| {
+                !matches!(
+                    task.state,
+                    TaskState::Completed | TaskState::Failed | TaskState::Stopped
+                ) || self.active_scope_tasks.contains(&TaskId(*id))
+            })
+        }) {
+            return false;
+        }
+        scope.finalize_resources();
+        true
+    }
+
     pub(super) fn run_task_internal(
         &mut self,
         task_id: TaskId,
@@ -49,7 +100,6 @@ impl VM {
             _ => {}
         }
 
-        task.state = TaskState::Running;
         task.last_yield = None;
         let mut resume_value_opt = resume_value;
         if let Some(dest) = task.yield_dest.take() {
@@ -66,17 +116,26 @@ impl VM {
             return Err(LustError::RuntimeError { message });
         }
 
+        task.state = TaskState::Running;
+        task.fiber_context.state = crate::effect_abi::FiberExecutionState::Running;
         mem::swap(&mut self.call_stack, &mut task.call_stack);
         mem::swap(
             &mut self.pending_return_value,
             &mut task.pending_return_value,
         );
         mem::swap(&mut self.pending_return_dest, &mut task.pending_return_dest);
-        self.current_task = Some(task_id);
+        let parent_task = self.current_task.replace(task_id);
+        self.active_scope_tasks.push(task_id);
+        self.task_manager.attach(task);
         self.last_task_signal = None;
         let run_result = self.run();
         let signal = self.last_task_signal.take();
-        self.current_task = None;
+        self.current_task = parent_task;
+        self.active_scope_tasks.pop();
+        let mut task = self
+            .task_manager
+            .detach(task_id)
+            .expect("running task retained");
         let mut error_result: Option<LustError> = None;
         match run_result {
             Ok(value) => {
@@ -110,7 +169,9 @@ impl VM {
 
             Err(err) => {
                 let annotated = self.annotate_runtime_error(err);
-                task.state = TaskState::Failed;
+                if task.fiber_context.state != crate::effect_abi::FiberExecutionState::Interrupted {
+                    task.state = TaskState::Failed;
+                }
                 task.error = Some(annotated.clone());
                 task.last_yield = None;
                 error_result = Some(annotated);
@@ -123,6 +184,12 @@ impl VM {
             &mut task.pending_return_value,
         );
         mem::swap(&mut self.pending_return_dest, &mut task.pending_return_dest);
+        task.fiber_context.state = match task.state {
+            TaskState::Completed => crate::effect_abi::FiberExecutionState::Completed,
+            TaskState::Failed => crate::effect_abi::FiberExecutionState::Failed,
+            TaskState::Stopped => crate::effect_abi::FiberExecutionState::Interrupted,
+            _ => crate::effect_abi::FiberExecutionState::Suspended,
+        };
         self.task_manager.attach(task);
         if let Some(err) = error_result {
             Err(err)
@@ -386,6 +453,12 @@ impl VM {
                 });
             }
         };
+        if task.scope_id.is_some() || task.state == TaskState::Running {
+            self.task_manager.attach(task);
+            return Err(LustError::RuntimeError {
+                message: "Cannot restart a scoped or running task".to_string(),
+            });
+        }
         task.reset();
         self.task_manager.insert(task);
         self.run_task_internal(task_id, None)?;
@@ -429,6 +502,10 @@ impl VM {
             }
         };
 
+        if task.state == TaskState::Stopped {
+            self.task_manager.attach(task);
+            return Ok(());
+        }
         match task.kind_mut() {
             TaskKind::NativeFuture { .. } => {
                 match outcome {
@@ -1066,5 +1143,66 @@ fn lua_table_write_sequence(map_rc: &Rc<RefCell<LustMap>>, seq: &[Value]) {
     for (i, val) in seq.iter().enumerate() {
         let key = ValueKey::from_value(&Value::Int((i as LustInt) + 1));
         map.insert(key, val.clone());
+    }
+}
+
+#[cfg(test)]
+mod scope_fiber_tests {
+    use super::*;
+    use crate::effect_abi::{InterruptReason, Scope, ScopeTeardown};
+
+    #[test]
+    fn scope_waits_for_masked_children_then_finalizes_lifo_once() {
+        let mut vm = VM::new();
+        let handle = vm.create_native_future_task();
+        let mut scope = Scope::new(42, None);
+        vm.register_scope_task(&mut scope, handle).unwrap();
+        let events = Rc::new(RefCell::new(Vec::new()));
+        for n in [1, 2] {
+            let events = events.clone();
+            scope
+                .register_finalizer(move || events.borrow_mut().push(n))
+                .unwrap();
+        }
+        vm.task_manager
+            .get_mut(TaskId(handle.id()))
+            .unwrap()
+            .fiber_context
+            .enter_mask();
+        assert!(!vm.close_scope(&mut scope));
+        assert_eq!(scope.teardown, ScopeTeardown::Joining);
+        assert!(events.borrow().is_empty());
+        assert!(scope.register_child(99).is_err());
+        let task = vm.task_manager.get_mut(TaskId(handle.id())).unwrap();
+        assert_eq!(
+            task.fiber_context.pending_interrupt,
+            Some(InterruptReason::Cancelled)
+        );
+        let reason = task.fiber_context.exit_mask().unwrap();
+        task.request_interrupt(reason);
+        assert!(vm.close_scope(&mut scope));
+        assert_eq!(&*events.borrow(), &[2, 1]);
+        assert!(vm.close_scope(&mut scope));
+        assert_eq!(events.borrow().len(), 2);
+        vm.complete_native_future_task(handle, Ok(Value::Nil))
+            .unwrap();
+        assert_eq!(
+            vm.get_task_instance(handle).unwrap().state,
+            TaskState::Stopped
+        );
+    }
+
+    #[test]
+    fn running_interrupt_is_delivered_by_dispatch_before_next_instruction() {
+        let mut vm = VM::new();
+        let id = vm.task_manager.next_id();
+        let mut task = TaskInstance::new_native_future(id);
+        task.state = TaskState::Running;
+        task.request_interrupt(InterruptReason::Timeout);
+        assert_eq!(task.state, TaskState::Running);
+        vm.task_manager.insert(task);
+        vm.current_task = Some(id);
+        assert!(vm.run().is_err());
+        assert_eq!(vm.task_manager.get(id).unwrap().state, TaskState::Stopped);
     }
 }

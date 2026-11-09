@@ -145,6 +145,7 @@ impl VM {
             call_until_depth: None,
             task_manager: TaskManager::new(),
             current_task: None,
+            active_scope_tasks: Vec::new(),
             pending_task_signal: None,
             last_task_signal: None,
             cycle_collector: cycle::CycleCollector::new(),

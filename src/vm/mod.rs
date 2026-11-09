@@ -244,6 +244,7 @@ pub struct VM {
     pub(super) call_until_depth: Option<usize>,
     pub(super) task_manager: TaskManager,
     pub(super) current_task: Option<TaskId>,
+    pub(super) active_scope_tasks: Vec<TaskId>,
     pub(super) pending_task_signal: Option<TaskSignal>,
     pub(super) last_task_signal: Option<TaskSignal>,
     pub(super) cycle_collector: cycle::CycleCollector,
