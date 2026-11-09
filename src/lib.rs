@@ -9,6 +9,7 @@ pub mod bindgen;
 pub mod builtins;
 pub mod bytecode;
 pub mod config;
+pub mod data;
 #[cfg(feature = "std")]
 pub mod codegen_zig;
 pub mod effect_abi;
@@ -38,6 +39,7 @@ pub mod wasm;
 pub use ast::{Expr, Item, Span, Stmt, Type};
 pub use bytecode::{Chunk, Compiler, Function, Instruction, Value};
 pub use config::{ConfigError, DependencyKind, DependencySpec, LustConfig};
+pub use data::{DataValue, DateTimeUtc, Decimal128, Document, DuplicateKeyError, ExactNumber, ObjectId};
 #[cfg(feature = "std")]
 pub use embed::{
     ArrayHandle, AsyncDriver, AsyncTaskQueue, CompiledBytecode, EmbeddedBuilder, EmbeddedProgram,
