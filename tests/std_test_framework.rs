@@ -112,6 +112,14 @@ fn test_ast_parsing_test_and_suite_declarations() {
     }
 }
 
+#[test]
+fn test_ast_parsing_test_syntax_demo_file() {
+    let content = std::fs::read_to_string("examples/effects/07_test_syntax_demo.lust")
+        .expect("should read 07_test_syntax_demo.lust");
+    let items = parse_items(&content);
+    assert_eq!(items.len(), 4);
+}
+
 // ===========================================================================
 // S11.2: Assertions Engine (Pure & Effect System)
 // ===========================================================================

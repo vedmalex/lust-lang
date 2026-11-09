@@ -85,6 +85,11 @@ path = "benchmarks/effects_bench.rs"
 required-features = ["std"]
 
 [[example]]
+name = "test_framework_bench"
+path = "benchmarks/test_framework_bench.rs"
+required-features = ["std"]
+
+[[example]]
 name = "effects_basic"
 path = "examples/effects/01_basic_effects.rs"
 required-features = ["std"]
@@ -97,6 +102,21 @@ required-features = ["std"]
 [[example]]
 name = "effects_acquire_release"
 path = "examples/effects/03_acquire_release_and_scopes.rs"
+required-features = ["std"]
+
+[[example]]
+name = "04_testing_with_virtual_clock"
+path = "examples/effects/04_testing_with_virtual_clock.rs"
+required-features = ["std"]
+
+[[example]]
+name = "05_dependency_injection_mocking"
+path = "examples/effects/05_dependency_injection_mocking.rs"
+required-features = ["std"]
+
+[[example]]
+name = "06_concurrency_and_supervision"
+path = "examples/effects/06_concurrency_and_supervision.rs"
 required-features = ["std"]
 
 [dependencies]
@@ -158,3 +178,13 @@ debug = 1
 overflow-checks = false
 panic = "abort"
 codegen-units = 1
+
+[profile.bench]
+strip = false
+lto = "fat"
+opt-level = 3
+debug = 1
+overflow-checks = false
+panic = "abort"
+codegen-units = 1
+
