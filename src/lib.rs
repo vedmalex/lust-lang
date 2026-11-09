@@ -50,7 +50,8 @@ pub use embed::{
 pub use effect_abi::{
     Cause, Exit, FiberContext, FiberExecutionState, InterruptReason, LayerRollbackLedger,
     LustClosureObject, LustEffectDescriptor, ScheduleKind, ScheduleState, ScheduleStep, Scope,
-    ScopeAdmission, ScopeTeardown, StackContextProjection,
+    ScopeAdmission, ScopeTeardown, StackContextProjection, effect_acquire_release, effect_repeat,
+    effect_retry, effect_timeout,
 };
 pub use error::{LustError, Result};
 pub use jit::{JitCompiler, JitState, JitStats};

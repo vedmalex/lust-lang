@@ -528,3 +528,185 @@ impl ScheduleKind {
         }
     }
 }
+
+/// Executes an effect, retrying on standard failure `Cause::Fail` according to the given schedule.
+/// Invariant: `Cause::Die` and `Cause::Interrupted` (OutOfGas, Timeout, Cancelled) are fail-closed and NEVER retried.
+pub fn effect_retry<A, E, F>(mut effect_fn: F, schedule: &ScheduleKind) -> Exit<A, E>
+where
+    F: FnMut() -> Exit<A, E>,
+{
+    let mut state = ScheduleState::initial();
+    loop {
+        let outcome = effect_fn();
+        match outcome {
+            Exit::Success(val) => return Exit::Success(val),
+            Exit::Failure(Cause::Fail(err)) => {
+                match schedule.step(&state) {
+                    ScheduleStep::Continue { next_state, .. } => {
+                        state = next_state;
+                    }
+                    ScheduleStep::Done => return Exit::Failure(Cause::Fail(err)),
+                }
+            }
+            Exit::Failure(cause) => {
+                // Fail-closed: Die or Interrupt cannot be retried!
+                return Exit::Failure(cause);
+            }
+        }
+    }
+}
+
+/// Repeatedly executes an effect upon `Exit::Success` according to the given schedule.
+/// Halts immediately on any failure.
+pub fn effect_repeat<A, E, F>(mut effect_fn: F, schedule: &ScheduleKind) -> Exit<A, E>
+where
+    F: FnMut() -> Exit<A, E>,
+{
+    let mut state = ScheduleState::initial();
+    loop {
+        let outcome = effect_fn();
+        match outcome {
+            Exit::Success(val) => {
+                match schedule.step(&state) {
+                    ScheduleStep::Continue { next_state, .. } => {
+                        state = next_state;
+                    }
+                    ScheduleStep::Done => return Exit::Success(val),
+                }
+            }
+            Exit::Failure(cause) => return Exit::Failure(cause),
+        }
+    }
+}
+
+/// Executes an effect with a timeout constraint.
+/// If `timed_out` flag is triggered or duration exceeds limit, returns `Exit::Failure(Cause::Interrupted(InterruptReason::Timeout))`.
+pub fn effect_timeout<A, E, F>(effect_fn: F, timed_out: bool) -> Exit<A, E>
+where
+    F: FnOnce() -> Exit<A, E>,
+{
+    if timed_out {
+        Exit::Failure(Cause::Interrupted(InterruptReason::Timeout))
+    } else {
+        effect_fn()
+    }
+}
+
+/// Executes `acquire` with interruption masked, registers `release` finalizer in `Scope`
+/// upon success, and unmasks interrupts. If an interrupt arrived during `acquire`,
+/// it is delivered upon exit from mask.
+pub fn effect_acquire_release<A, E, Acq, Rel>(
+    fiber: &mut FiberContext,
+    scope: &mut Scope,
+    acquire: Acq,
+    release: Rel,
+) -> Exit<A, E>
+where
+    Acq: FnOnce(&mut FiberContext) -> Exit<A, E>,
+    Rel: FnOnce() + 'static,
+{
+    fiber.enter_mask();
+    let outcome = acquire(fiber);
+    if outcome.is_success() {
+        let _ = scope.register_finalizer(release);
+    }
+    let pending = fiber.exit_mask();
+    if let Some(reason) = pending {
+        fiber.state = FiberExecutionState::Interrupted;
+        Exit::Failure(Cause::Interrupted(reason))
+    } else {
+        outcome
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alloc::rc::Rc;
+    use core::cell::RefCell;
+
+    #[test]
+    fn test_retry_recurs_two_retries_three_total_attempts() {
+        let attempts = Rc::new(RefCell::new(0));
+        let attempts_clone = attempts.clone();
+
+        let res: Exit<i32, &'static str> = effect_retry(
+            || {
+                *attempts_clone.borrow_mut() += 1;
+                Exit::Failure(Cause::Fail("transient error"))
+            },
+            &ScheduleKind::recurs(2),
+        );
+
+        assert_eq!(*attempts.borrow(), 3);
+        assert_eq!(res, Exit::Failure(Cause::Fail("transient error")));
+    }
+
+    #[test]
+    fn test_retry_fail_closed_on_interrupt_and_die() {
+        let attempts = Rc::new(RefCell::new(0));
+        let attempts_clone = attempts.clone();
+
+        let res: Exit<i32, &'static str> = effect_retry(
+            || {
+                *attempts_clone.borrow_mut() += 1;
+                Exit::Failure(Cause::Interrupted(InterruptReason::OutOfGas))
+            },
+            &ScheduleKind::recurs(5),
+        );
+
+        // Exactly 1 attempt, interrupt cannot be retried!
+        assert_eq!(*attempts.borrow(), 1);
+        assert_eq!(res, Exit::Failure(Cause::Interrupted(InterruptReason::OutOfGas)));
+    }
+
+    #[test]
+    fn test_repeat_recurs_two() {
+        let count = Rc::new(RefCell::new(0));
+        let count_clone = count.clone();
+
+        let res: Exit<i32, ()> = effect_repeat(
+            || {
+                *count_clone.borrow_mut() += 1;
+                Exit::Success(*count_clone.borrow())
+            },
+            &ScheduleKind::recurs(2),
+        );
+
+        assert_eq!(*count.borrow(), 3);
+        assert_eq!(res, Exit::Success(3));
+    }
+
+    #[test]
+    fn test_acquire_release_masks_interrupt_during_acquire() {
+        let mut fiber = FiberContext::new(101, 1);
+        let mut scope = Scope::new(1, None);
+        let released = Rc::new(RefCell::new(false));
+        let released_clone = released.clone();
+
+        let res: Exit<i32, &'static str> = effect_acquire_release(
+            &mut fiber,
+            &mut scope,
+            |fib| {
+                // While inside acquire, interrupt request arrives
+                let delivered = fib.request_interrupt(InterruptReason::Cancelled);
+                assert!(!delivered, "Interrupt must be masked during acquire");
+                assert_eq!(fib.pending_interrupt, Some(InterruptReason::Cancelled));
+                Exit::Success(42)
+            },
+            move || {
+                *released_clone.borrow_mut() = true;
+            },
+        );
+
+        // Finalizer was successfully registered in scope despite incoming interrupt
+        assert_eq!(scope.finalizers.len(), 1);
+        // Deferred interrupt delivered upon unmasking
+        assert_eq!(res, Exit::Failure(Cause::Interrupted(InterruptReason::Cancelled)));
+        assert_eq!(fiber.state, FiberExecutionState::Interrupted);
+
+        // Teardown executes release
+        scope.finalize_resources();
+        assert!(*released.borrow());
+    }
+}
