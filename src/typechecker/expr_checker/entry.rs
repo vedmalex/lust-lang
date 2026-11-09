@@ -364,12 +364,40 @@ impl TypeChecker {
 
             ExprKind::Paren(inner) => self.check_expr_with_hint(inner, expected_type),
             ExprKind::EffectBlock(stmts) => {
+                self.effect_block_stack.push(crate::typechecker::EffectBlockContext::default());
                 self.env.push_scope();
-                for stmt in stmts {
-                    self.check_stmt(stmt)?;
+                let mut last_expr_type = None;
+                for (i, stmt) in stmts.iter().enumerate() {
+                    if i + 1 == stmts.len() && let StmtKind::Expr(e) = &stmt.kind {
+                        let ty = self.check_expr(e)?;
+                        last_expr_type = Some(ty);
+                    } else {
+                        self.check_stmt(stmt)?;
+                    }
                 }
                 self.env.pop_scope();
-                Ok(Type::new(TypeKind::Unknown, expr.span))
+                let ctx = self.effect_block_stack.pop().unwrap();
+                let success_type = if !ctx.returns.is_empty() {
+                    self.make_union_from_types(ctx.returns)
+                } else if let Some(last_ty) = last_expr_type {
+                    last_ty
+                } else {
+                    Type::new(TypeKind::Unit, expr.span)
+                };
+                let error_type = if ctx.errors.is_empty() {
+                    Type::new(TypeKind::Never, expr.span)
+                } else {
+                    self.make_union_from_types(ctx.errors)
+                };
+                let reqs = crate::typechecker::normalize_requirements(&ctx.requirements);
+                Ok(Type::new(
+                    TypeKind::Effect {
+                        success: Box::new(success_type),
+                        error: Box::new(error_type),
+                        requirements: reqs,
+                    },
+                    expr.span,
+                ))
             }
         }
     }

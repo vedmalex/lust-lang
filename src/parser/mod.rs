@@ -137,11 +137,12 @@ impl Parser {
             | TokenKind::Use
             | TokenKind::Module
             | TokenKind::Extern => true,
+            TokenKind::Identifier if self.current_token().lexeme == "service" => true,
             TokenKind::Local => self.peek_ahead(1).is_some_and(|t| {
                 matches!(
                     t.kind,
                     TokenKind::Function | TokenKind::Struct | TokenKind::Enum | TokenKind::Trait
-                )
+                ) || (t.kind == TokenKind::Identifier && t.lexeme == "service")
             }),
             _ => false,
         }

@@ -1709,6 +1709,17 @@ impl VM {
                             })?
                             .to_string()
                     };
+                    if matches!(&object, Value::Closure(_)) {
+                        if method_name == "provide" && arg_count == 1 {
+                            self.set_register(dest_reg, object)?;
+                            break 'method;
+                        }
+                        if method_name == "run_sync" && arg_count == 0 {
+                            let result = self.call_value(&object, Vec::new())?;
+                            self.set_register(dest_reg, result)?;
+                            break 'method;
+                        }
+                    }
                     if method_name == "try_unwrap" {
                         let unwrap_res = match &object {
                             Value::Enum(obj) if obj.enum_name == "Option" => {

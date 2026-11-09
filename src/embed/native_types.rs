@@ -461,6 +461,7 @@ impl FunctionBuilder {
                 is_method: false,
                 visibility: Visibility::Public,
                 doc: None,
+                effects: None,
             },
         }
     }
@@ -599,6 +600,7 @@ fn function_signature_for(func: &FunctionDef) -> (String, FunctionSignature) {
             is_method: func.is_method,
             type_params: func.type_params.clone(),
             trait_bounds: func.trait_bounds.clone(),
+            effects: func.effects.clone(),
         },
     )
 }

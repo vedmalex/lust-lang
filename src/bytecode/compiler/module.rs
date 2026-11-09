@@ -99,6 +99,7 @@ impl Compiler {
 
                             ItemKind::Use { .. } => {}
                             ItemKind::Module { .. } => {}
+                            ItemKind::Service(_) => {}
                         }
                     }
 
@@ -188,6 +189,7 @@ impl Compiler {
                 }
 
                 ItemKind::Use { .. } => {}
+                ItemKind::Service(_) => {}
             }
         }
 
@@ -252,6 +254,7 @@ impl Compiler {
                 is_method: false,
                 visibility: crate::ast::Visibility::Private,
                 doc: None,
+                effects: None,
             };
             let prev = self.current_module.clone();
             if let Some(entry) = &self.entry_module {

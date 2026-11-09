@@ -40,8 +40,16 @@ impl TypeChecker {
                 iterator,
                 body,
             } => self.check_for_in_stmt(variables, iterator, body),
-            StmtKind::Return(values) => self.check_return_stmt(values),
+            StmtKind::Return(values) => {
+                if self.defer_depth > 0 {
+                    return Err(self.type_error("'return' is not allowed inside defer/errdefer block".to_string()));
+                }
+                self.check_return_stmt(values)
+            }
             StmtKind::Break => {
+                if self.defer_depth > 0 && self.loop_depth_in_defer == 0 {
+                    return Err(self.type_error("'break' is not allowed inside defer/errdefer block".to_string()));
+                }
                 if !self.in_loop {
                     return Err(self.type_error("'break' outside of loop".to_string()));
                 }
@@ -50,6 +58,9 @@ impl TypeChecker {
             }
 
             StmtKind::Continue => {
+                if self.defer_depth > 0 && self.loop_depth_in_defer == 0 {
+                    return Err(self.type_error("'continue' is not allowed inside defer/errdefer block".to_string()));
+                }
                 if !self.in_loop {
                     return Err(self.type_error("'continue' outside of loop".to_string()));
                 }
@@ -67,14 +78,25 @@ impl TypeChecker {
                 Ok(())
             }
 
-            StmtKind::Defer(stmt) | StmtKind::ErrDefer(stmt) => self.check_stmt(stmt),
+            StmtKind::Defer(stmt) | StmtKind::ErrDefer(stmt) => {
+                self.defer_depth += 1;
+                let prev_in_loop = self.in_loop;
+                let prev_loop_depth = self.loop_depth_in_defer;
+                self.in_loop = false;
+                self.loop_depth_in_defer = 0;
+                let res = self.check_stmt(stmt);
+                self.loop_depth_in_defer = prev_loop_depth;
+                self.in_loop = prev_in_loop;
+                self.defer_depth -= 1;
+                res
+            }
             StmtKind::Scoped(stmts) => {
                 self.env.push_scope();
-                for stmt in stmts {
-                    self.check_stmt(stmt)?;
-                }
+                self.scoped_depth += 1;
+                let result = stmts.iter().try_for_each(|stmt| self.check_stmt(stmt));
+                self.scoped_depth -= 1;
                 self.env.pop_scope();
-                Ok(())
+                result
             }
         }
     }
@@ -567,21 +589,34 @@ impl TypeChecker {
         narrowings
     }
 
+    fn enter_loop(&mut self) -> (bool, usize) {
+        let prev = (self.in_loop, self.loop_depth_in_defer);
+        self.in_loop = true;
+        if self.defer_depth > 0 {
+            self.loop_depth_in_defer += 1;
+        }
+        prev
+    }
+
+    fn exit_loop(&mut self, prev: (bool, usize)) {
+        self.in_loop = prev.0;
+        self.loop_depth_in_defer = prev.1;
+    }
+
     fn check_while_stmt(&mut self, condition: &Expr, body: &[Stmt]) -> Result<()> {
         let cond_type = self.check_expr(condition)?;
         self.unify(
             &Type::new(TypeKind::Bool, TypeChecker::dummy_span()),
             &cond_type,
         )?;
-        let prev_in_loop = self.in_loop;
-        self.in_loop = true;
+        let loop_state = self.enter_loop();
         self.env.push_scope();
         for stmt in body {
             self.check_stmt(stmt)?;
         }
 
         self.env.pop_scope();
-        self.in_loop = prev_in_loop;
+        self.exit_loop(loop_state);
         Ok(())
     }
 
@@ -627,8 +662,7 @@ impl TypeChecker {
         }
 
         let loop_var_type = start_type.clone();
-        let prev_in_loop = self.in_loop;
-        self.in_loop = true;
+        let loop_state = self.enter_loop();
         self.env.push_scope();
         self.env
             .declare_variable(variable.to_string(), loop_var_type)?;
@@ -637,7 +671,7 @@ impl TypeChecker {
         }
 
         self.env.pop_scope();
-        self.in_loop = prev_in_loop;
+        self.exit_loop(loop_state);
         Ok(())
     }
 
@@ -672,8 +706,7 @@ impl TypeChecker {
                         )));
                     }
 
-                    let prev_in_loop = self.in_loop;
-                    self.in_loop = true;
+                    let loop_state = self.enter_loop();
                     self.env.push_scope();
                     self.env
                         .declare_variable(variables[0].clone(), key_ty.as_ref().clone())?;
@@ -684,7 +717,7 @@ impl TypeChecker {
                     }
 
                     self.env.pop_scope();
-                    self.in_loop = prev_in_loop;
+                    self.exit_loop(loop_state);
                     return Ok(());
                 }
 
@@ -696,8 +729,7 @@ impl TypeChecker {
                         )));
                     }
 
-                    let prev_in_loop = self.in_loop;
-                    self.in_loop = true;
+                    let loop_state = self.enter_loop();
                     self.env.push_scope();
                     self.env
                         .declare_variable(variables[0].clone(), elem_ty.as_ref().clone())?;
@@ -706,7 +738,7 @@ impl TypeChecker {
                     }
 
                     self.env.pop_scope();
-                    self.in_loop = prev_in_loop;
+                    self.exit_loop(loop_state);
                     return Ok(());
                 }
 
@@ -716,8 +748,7 @@ impl TypeChecker {
 
         match &iterator_type.kind {
             TypeKind::Named(name) if name == "Iterator" => {
-                let prev_in_loop = self.in_loop;
-                self.in_loop = true;
+                let loop_state = self.enter_loop();
                 self.env.push_scope();
                 for var in variables {
                     self.env.declare_variable(
@@ -729,13 +760,12 @@ impl TypeChecker {
                     self.check_stmt(stmt)?;
                 }
                 self.env.pop_scope();
-                self.in_loop = prev_in_loop;
+                self.exit_loop(loop_state);
                 Ok(())
             }
 
             TypeKind::Unknown => {
-                let prev_in_loop = self.in_loop;
-                self.in_loop = true;
+                let loop_state = self.enter_loop();
                 self.env.push_scope();
                 for var in variables {
                     self.env.declare_variable(
@@ -747,7 +777,7 @@ impl TypeChecker {
                     self.check_stmt(stmt)?;
                 }
                 self.env.pop_scope();
-                self.in_loop = prev_in_loop;
+                self.exit_loop(loop_state);
                 Ok(())
             }
 
@@ -759,8 +789,7 @@ impl TypeChecker {
                     )));
                 }
 
-                let prev_in_loop = self.in_loop;
-                self.in_loop = true;
+                let loop_state = self.enter_loop();
                 self.env.push_scope();
                 self.env
                     .declare_variable(variables[0].clone(), elem_type.as_ref().clone())?;
@@ -769,7 +798,7 @@ impl TypeChecker {
                 }
 
                 self.env.pop_scope();
-                self.in_loop = prev_in_loop;
+                self.exit_loop(loop_state);
                 Ok(())
             }
 
@@ -797,6 +826,11 @@ impl TypeChecker {
 
             Type::new(TypeKind::Tuple(element_types), TypeChecker::dummy_span())
         };
+        if let Some(ctx) = self.effect_block_stack.last_mut() {
+            ctx.returns.push(return_type);
+            return Ok(());
+        }
+
         if let Some(expected_return) = &self.current_function_return_type {
             self.unify(expected_return, &return_type)?;
         } else {

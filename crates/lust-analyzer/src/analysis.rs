@@ -521,6 +521,7 @@ impl AnalysisSnapshot {
                                     is_method: false,
                                     visibility: Visibility::Public,
                                     doc: doc.clone(),
+                                    effects: None,
                                 };
                                 let info = FunctionInfo {
                                     module_path: module_path.clone(),

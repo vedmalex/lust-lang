@@ -292,6 +292,7 @@ impl Compiler {
             is_method: false,
             type_params: Vec::new(),
             trait_bounds: Vec::new(),
+            effects: None,
         })
     }
 

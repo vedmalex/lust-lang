@@ -269,6 +269,21 @@ impl Parser {
                 ItemKind::Extern { abi, items }
             }
 
+            TokenKind::Identifier if self.current_token().lexeme == "service" => {
+                self.advance();
+                let name = self.expect_identifier()?;
+                let target_type = if self.match_token(&[TokenKind::Colon]) {
+                    Some(self.parse_type()?)
+                } else {
+                    None
+                };
+                ItemKind::Service(crate::ast::ServiceDef {
+                    name,
+                    target_type,
+                    doc,
+                })
+            }
+
             _ => {
                 return Err(self.error(&format!("Expected item, got {:?}", self.peek_kind())));
             }
@@ -325,22 +340,14 @@ impl Parser {
             None
         };
         let (error_type, requirements) = self.parse_optional_effects_spec()?;
-        let return_type = if error_type.is_some() || !requirements.is_empty() {
-            let span = return_type.as_ref().map(|t| t.span).unwrap_or_else(Span::dummy);
-            let success = Box::new(return_type.unwrap_or_else(|| Type::new(TypeKind::Unit, span)));
-            let error = Box::new(
-                error_type.unwrap_or_else(|| Type::new(TypeKind::Never, Span::dummy())),
-            );
-            Some(Type::new(
-                TypeKind::Effect {
-                    success,
-                    error,
-                    requirements,
-                },
-                span,
-            ))
+        let effects = if error_type.is_some() || !requirements.is_empty() {
+            Some(crate::ast::ReturnSpec {
+                return_type: Some(return_type.clone().unwrap_or_else(|| Type::new(TypeKind::Unit, Span::dummy()))),
+                error_type,
+                requirements,
+            })
         } else {
-            return_type
+            None
         };
 
         #[cfg(feature = "esp32c6-logging")]
@@ -383,6 +390,7 @@ impl Parser {
             is_method,
             visibility,
             doc,
+            effects,
         })
     }
 

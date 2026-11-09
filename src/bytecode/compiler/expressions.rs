@@ -554,6 +554,18 @@ impl Compiler {
                 Ok(result_reg)
             }
 
+            ExprKind::EffectBlock(stmts) => {
+                let suspension = Expr::new(
+                    ExprKind::Lambda {
+                        params: Vec::new(),
+                        return_type: None,
+                        body: Box::new(Expr::new(ExprKind::Block(stmts.clone()), expr.span)),
+                    },
+                    expr.span,
+                );
+                self.compile_expr(&suspension)
+            }
+
             ExprKind::Lambda {
                 params,
                 return_type,

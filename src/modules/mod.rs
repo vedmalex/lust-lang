@@ -491,6 +491,7 @@ impl ModuleLoader {
                 is_method: false,
                 visibility: Visibility::Private,
                 doc: None,
+                effects: None,
             };
             let span = pending_init_span.unwrap_or_else(Span::dummy);
             // Place module init first so the compiler can observe module-level locals

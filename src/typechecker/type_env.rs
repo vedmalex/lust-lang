@@ -24,6 +24,7 @@ pub struct TypeEnv {
     impls: Vec<ImplBlock>,
     builtin_types: HashSet<String>,
     constants: HashMap<String, Type>,
+    services: HashMap<String, Option<Type>>,
 }
 
 #[derive(Debug, Clone)]
@@ -33,6 +34,37 @@ pub struct FunctionSignature {
     pub is_method: bool,
     pub type_params: Vec<String>,
     pub trait_bounds: Vec<TraitBound>,
+    pub effects: Option<crate::ast::ReturnSpec>,
+}
+
+impl FunctionSignature {
+    pub fn return_spec(&self) -> crate::ast::ReturnSpec {
+        if let Some(effects) = &self.effects {
+            effects.clone()
+        } else {
+            crate::ast::ReturnSpec {
+                return_type: Some(self.return_type.clone()),
+                error_type: None,
+                requirements: Vec::new(),
+            }
+        }
+    }
+
+    pub fn success_type(&self) -> Type {
+        if let Some(effects) = &self.effects {
+            effects.return_type.clone().unwrap_or_else(|| Type::new(TypeKind::Unit, Span::dummy()))
+        } else {
+            self.return_type.clone()
+        }
+    }
+
+    pub fn error_type(&self) -> Option<Type> {
+        self.return_spec().error_type
+    }
+
+    pub fn requirements(&self) -> Vec<Type> {
+        self.return_spec().requirements
+    }
 }
 
 impl fmt::Display for FunctionSignature {
@@ -77,6 +109,7 @@ impl TypeEnv {
             impls: Vec::new(),
             builtin_types: HashSet::new(),
             constants: HashMap::new(),
+            services: HashMap::new(),
         };
         env.register_builtins(config);
         env
@@ -828,6 +861,25 @@ impl TypeEnv {
 
     pub fn lookup_struct(&self, name: &str) -> Option<&StructDef> {
         self.structs.get(name)
+    }
+
+    pub fn register_service(&mut self, name: String, target_type: Option<Type>) -> Result<()> {
+        if self.services.contains_key(&name) {
+            return Err(LustError::TypeError {
+                message: format!("Service '{}' is already defined", name),
+            });
+        }
+
+        self.services.insert(name, target_type);
+        Ok(())
+    }
+
+    pub fn lookup_service(&self, name: &str) -> Option<&Option<Type>> {
+        self.services.get(name)
+    }
+
+    pub fn is_service(&self, name: &str) -> bool {
+        self.services.contains_key(name)
     }
 
     pub fn register_enum(&mut self, e: &EnumDef) -> Result<()> {

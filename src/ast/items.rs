@@ -23,6 +23,14 @@ pub enum ItemKind {
     Module { name: String, items: Vec<Item> },
     Use { public: bool, tree: UseTree },
     Extern { abi: String, items: Vec<ExternItem> },
+    Service(ServiceDef),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ServiceDef {
+    pub name: String,
+    pub target_type: Option<Type>,
+    pub doc: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -58,33 +66,19 @@ pub struct FunctionDef {
     pub is_method: bool,
     pub visibility: Visibility,
     pub doc: Option<String>,
+    pub effects: Option<super::ReturnSpec>,
 }
 
 impl FunctionDef {
     pub fn return_spec(&self) -> super::ReturnSpec {
-        match &self.return_type {
-            Some(Type {
-                kind: super::TypeKind::Effect { success, error, requirements },
-                ..
-            }) => super::ReturnSpec {
-                return_type: Some((**success).clone()),
-                error_type: if matches!(error.kind, super::TypeKind::Never) {
-                    None
-                } else {
-                    Some((**error).clone())
-                },
-                requirements: requirements.clone(),
-            },
-            Some(t) => super::ReturnSpec {
-                return_type: Some(t.clone()),
+        if let Some(effects) = &self.effects {
+            effects.clone()
+        } else {
+            super::ReturnSpec {
+                return_type: self.return_type.clone(),
                 error_type: None,
                 requirements: Vec::new(),
-            },
-            None => super::ReturnSpec {
-                return_type: None,
-                error_type: None,
-                requirements: Vec::new(),
-            },
+            }
         }
     }
 

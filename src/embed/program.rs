@@ -2343,6 +2343,7 @@ pub(crate) fn compile_to_bytecode(
                 is_method: false,
                 type_params: Vec::new(),
                 trait_bounds: Vec::new(),
+                effects: None,
             });
     }
 

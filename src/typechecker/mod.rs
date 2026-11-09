@@ -38,6 +38,28 @@ pub struct TypeChecker {
     short_circuit_info: HashMap<String, HashMap<Span, ShortCircuitInfo>>,
     checked_array_indices: HashMap<String, HashSet<Span>>,
     low_memory_mode: bool,
+    scoped_depth: usize,
+    defer_depth: usize,
+    loop_depth_in_defer: usize,
+    current_function_return_spec: Option<crate::ast::ReturnSpec>,
+    effect_block_stack: Vec<EffectBlockContext>,
+}
+
+pub fn normalize_requirements(reqs: &[Type]) -> Vec<Type> {
+    let mut rows: Vec<Type> = reqs.iter().filter(|t|
+        !matches!(&t.kind, TypeKind::Never)
+        && !matches!(&t.kind, TypeKind::Named(n) if n == "never")
+    ).cloned().collect();
+    rows.sort_by_key(|t| t.to_string());
+    rows.dedup_by(|a, b| a.to_string() == b.to_string());
+    rows
+}
+
+#[derive(Default, Debug, Clone)]
+pub struct EffectBlockContext {
+    pub returns: Vec<Type>,
+    pub errors: Vec<Type>,
+    pub requirements: Vec<Type>,
 }
 
 pub struct TypeCollection {
@@ -82,6 +104,11 @@ impl TypeChecker {
             short_circuit_info: HashMap::new(),
             checked_array_indices: HashMap::new(),
             low_memory_mode: config.low_memory_mode(),
+            scoped_depth: 0,
+            defer_depth: 0,
+            loop_depth_in_defer: 0,
+            current_function_return_spec: None,
+            effect_block_stack: Vec::new(),
         }
     }
 
@@ -788,6 +815,7 @@ impl TypeChecker {
                 is_method: has_self,
                 type_params: method.type_params.clone(),
                 trait_bounds: method.trait_bounds.clone(),
+                effects: method.effects.clone(),
             };
             self.env
                 .register_or_update_function(canonical_name, signature)?;
@@ -924,6 +952,14 @@ impl TypeChecker {
                 }
             }
 
+            ItemKind::Service(s) => {
+                let canonical_target = s.target_type.as_ref().map(|t| self.canonicalize_type(t));
+                if let Some(target) = &canonical_target {
+                    self.validate_type(target)?;
+                }
+                self.env.register_service(s.name.clone(), canonical_target)?;
+            }
+
             _ => {}
         }
 
@@ -948,7 +984,108 @@ impl TypeChecker {
     }
 
     fn types_equal(&self, t1: &Type, t2: &Type) -> bool {
-        t1.kind == t2.kind
+        match (&t1.kind, &t2.kind) {
+            (
+                TypeKind::Effect {
+                    success: s1,
+                    error: e1,
+                    requirements: r1,
+                },
+                TypeKind::Effect {
+                    success: s2,
+                    error: e2,
+                    requirements: r2,
+                },
+            ) => {
+                if !self.types_equal(s1, s2) || !self.types_equal(e1, e2) {
+                    return false;
+                }
+                if r1.len() != r2.len() {
+                    return false;
+                }
+                r1.iter().all(|req1| r2.iter().any(|req2| self.types_equal(req1, req2)))
+            }
+            _ => t1.kind == t2.kind,
+        }
+    }
+
+    pub fn record_effect_call(
+        &mut self,
+        requirements: &[Type],
+        error_type: Option<&Type>,
+        span: Span,
+    ) -> Result<()> {
+        if let Some(ctx_idx) = self.effect_block_stack.len().checked_sub(1) {
+            for req in requirements {
+                if self.scoped_depth > 0 && req.to_string() == "Scope" { continue; }
+                let exists = self.effect_block_stack[ctx_idx]
+                    .requirements
+                    .iter()
+                    .any(|r| self.types_equal(r, req));
+                if !exists {
+                    self.effect_block_stack[ctx_idx].requirements.push(req.clone());
+                }
+            }
+            if let Some(err) = error_type {
+                if !matches!(err.kind, TypeKind::Never) {
+                    let exists = self.effect_block_stack[ctx_idx]
+                        .errors
+                        .iter()
+                        .any(|e| self.types_equal(e, err));
+                    if !exists {
+                        self.effect_block_stack[ctx_idx].errors.push(err.clone());
+                    }
+                }
+            }
+            return Ok(());
+        }
+
+        let empty_spec = crate::ast::ReturnSpec {
+            return_type: None,
+            error_type: None,
+            requirements: Vec::new(),
+        };
+        let spec = self.current_function_return_spec.as_ref().unwrap_or(&empty_spec);
+        for req in requirements {
+            if self.scoped_depth > 0 && req.to_string() == "Scope" { continue; }
+            if !spec
+                .requirements
+                .iter()
+                .any(|declared| self.types_equal(declared, req))
+            {
+                return Err(self.type_error_at(
+                    format!(
+                        "Unsatisfied requirement: '{}' is required by call but not declared in function signature",
+                        req
+                    ),
+                    span,
+                ));
+            }
+        }
+        if let Some(err) = error_type {
+            if !matches!(err.kind, TypeKind::Never) {
+                if let Some(declared_err) = &spec.error_type {
+                    if !self.types_compatible(declared_err, err) {
+                        return Err(self.type_error_at(
+                            format!(
+                                "Unhandled error '{}': function signature declares error type '{}'",
+                                err, declared_err
+                            ),
+                            span,
+                        ));
+                    }
+                } else {
+                    return Err(self.type_error_at(
+                        format!(
+                            "Unhandled error '{}': function signature does not declare an error type",
+                            err
+                        ),
+                        span,
+                    ));
+                }
+            }
+        }
+        Ok(())
     }
 
     fn push_type_params(&mut self, params: &[String]) -> Result<()> {
@@ -1217,6 +1354,7 @@ impl TypeChecker {
                 if self.env.lookup_struct(name).is_none()
                     && self.env.lookup_enum(name).is_none()
                     && !self.env.is_builtin_type(name)
+                    && self.env.lookup_service(name).is_none()
                 {
                     return Err(self.type_error_at(format!("Undefined type '{}'", name), ty.span));
                 }
@@ -1766,6 +1904,55 @@ impl TypeChecker {
                 }
             }
 
+            (
+                TypeKind::Effect {
+                    success: exp_succ,
+                    error: exp_err,
+                    requirements: exp_reqs,
+                },
+                TypeKind::Effect {
+                    success: act_succ,
+                    error: act_err,
+                    requirements: act_reqs,
+                },
+            ) => {
+                self.unify(exp_succ, act_succ)?;
+                self.unify(exp_err, act_err)?;
+                if exp_reqs.len() != act_reqs.len() {
+                    return Err(match span {
+                        Some(s) => self.type_error_at(
+                            format!(
+                                "Effect requirements mismatch: expected '{}', got '{}'",
+                                expected, actual
+                            ),
+                            s,
+                        ),
+                        None => self.type_error(format!(
+                            "Effect requirements mismatch: expected '{}', got '{}'",
+                            expected, actual
+                        )),
+                    });
+                }
+                for r in exp_reqs {
+                    if !act_reqs.iter().any(|act_r| self.types_equal(r, act_r)) {
+                        return Err(match span {
+                            Some(s) => self.type_error_at(
+                                format!(
+                                    "Requirement '{}' not found in actual effect requirements",
+                                    r
+                                ),
+                                s,
+                            ),
+                            None => self.type_error(format!(
+                                "Requirement '{}' not found in actual effect requirements",
+                                r
+                            )),
+                        });
+                    }
+                }
+                return Ok(());
+            }
+
             _ => {}
         }
 
@@ -1871,6 +2058,33 @@ impl TypeChecker {
             }
 
             return self.types_compatible(r1, r2);
+        }
+
+        if let (
+            TypeKind::Effect {
+                success: s1,
+                error: e1,
+                requirements: r1,
+            },
+            TypeKind::Effect {
+                success: s2,
+                error: e2,
+                requirements: r2,
+            },
+        ) = (&expected.kind, &actual.kind)
+        {
+            if !self.types_compatible(s1, s2) {
+                return false;
+            }
+            if !self.types_compatible(e1, e2) {
+                return false;
+            }
+            if r1.len() != r2.len() {
+                return false;
+            }
+            return r1
+                .iter()
+                .all(|req1| r2.iter().any(|req2| self.types_equal(req1, req2)));
         }
 
         self.types_equal(expected, actual)

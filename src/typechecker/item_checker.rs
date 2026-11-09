@@ -36,6 +36,13 @@ impl TypeChecker {
 
             ItemKind::Use { .. } => Ok(()),
             ItemKind::Extern { items, .. } => self.check_extern(items),
+            ItemKind::Service(s) => {
+                let canonical_target = s.target_type.as_ref().map(|t| self.canonicalize_type(t));
+                if let Some(target) = &canonical_target {
+                    self.validate_type(target)?;
+                }
+                Ok(())
+            }
         }
     }
 
@@ -62,6 +69,7 @@ impl TypeChecker {
             is_method: func.is_method,
             type_params: func.type_params.clone(),
             trait_bounds: self.canonicalize_trait_bounds(&func.trait_bounds),
+            effects: func.effects.clone(),
         };
         let mut resolved_self_type: Option<String> = None;
         if func.is_method
@@ -110,7 +118,18 @@ impl TypeChecker {
         }
 
         let prev_return_type = self.current_function_return_type.clone();
-        self.current_function_return_type = Some(return_type.clone());
+        let prev_return_spec = self.current_function_return_spec.clone();
+        let expected_body_return = if let Some(effects) = &func.effects {
+            effects
+                .return_type
+                .clone()
+                .unwrap_or_else(|| Type::new(TypeKind::Unit, TypeChecker::dummy_span()))
+        } else {
+            return_type.clone()
+        };
+        self.current_function_return_type = Some(expected_body_return.clone());
+        self.current_function_return_spec = func.effects.clone();
+
         for stmt in &func.body {
             self.check_stmt(stmt)?;
         }
@@ -122,13 +141,14 @@ impl TypeChecker {
                 StmtKind::Return(_) => {}
                 StmtKind::Expr(expr) => {
                     let expr_type = self.check_expr(expr)?;
-                    self.unify(&return_type, &expr_type)?;
+                    self.unify(&expected_body_return, &expr_type)?;
                 }
                 _ => {}
             }
         }
 
         self.current_function_return_type = prev_return_type;
+        self.current_function_return_spec = prev_return_spec;
         self.current_trait_bounds = prev_trait_bounds;
         self.env.pop_scope();
         self.pop_type_params();
@@ -439,6 +459,7 @@ impl TypeChecker {
                         is_method: false,
                         type_params: Vec::new(),
                         trait_bounds: Vec::new(),
+                        effects: None,
                     };
                     self.register_external_function((name.clone(), sig.clone()))?;
                     if let Some((_struct_name_raw, method_name)) = name.split_once(':')
@@ -480,6 +501,7 @@ impl TypeChecker {
                                 is_method: true,
                                 visibility: Visibility::Public,
                                 doc: None,
+                                effects: None,
                             };
                             let impl_block = ImplBlock {
                                 type_params: Vec::new(),

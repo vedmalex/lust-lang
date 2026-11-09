@@ -79,6 +79,7 @@ impl BuiltinFunction {
                 .map(|s| (*s).to_string())
                 .collect(),
             trait_bounds: Vec::new(),
+            effects: None,
         }
     }
 

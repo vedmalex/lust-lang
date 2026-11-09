@@ -467,6 +467,15 @@ impl TypeChecker {
         args: &[Expr],
         expected_type: Option<&Type>,
     ) -> Result<Type> {
+        if let ExprKind::FieldAccess { object, field } = &callee.kind {
+            if matches!(field.as_str(), "provide" | "run_sync") {
+                if let Ok(ty) = self.check_expr(object) {
+                    if matches!(ty.kind, TypeKind::Effect { .. }) {
+                        return self.check_method_call(object, field, explicit_type_args, args);
+                    }
+                }
+            }
+        }
         let explicit_type_args = explicit_type_args
             .unwrap_or(&[])
             .iter()
@@ -595,12 +604,30 @@ impl TypeChecker {
                     })?;
                 }
 
-                if sig.type_params.is_empty() {
-                    return Ok(sig.return_type);
+                let final_return = if sig.type_params.is_empty() {
+                    sig.return_type
                 } else {
                     self.validate_generic_call(&sig, &generic_bindings)?;
-                    return Ok(self.substitute_type(&sig.return_type, &generic_bindings));
+                    self.substitute_type(&sig.return_type, &generic_bindings)
+                };
+                if let Some(effects) = &sig.effects {
+                    let success = effects
+                        .return_type
+                        .clone()
+                        .unwrap_or_else(|| Type::new(TypeKind::Unit, span));
+                    let error = effects.error_type.clone();
+                    self.record_effect_call(
+                        &effects.requirements,
+                        error.as_ref(),
+                        callee.span,
+                    )?;
+                    return Ok(if let Some(err) = error {
+                        Type::new(TypeKind::Result(Box::new(success), Box::new(err)), span)
+                    } else {
+                        success
+                    });
                 }
+                return Ok(final_return);
             }
 
             let enum_lookup = {
@@ -996,12 +1023,30 @@ impl TypeChecker {
                 })?;
             }
 
-            if sig.type_params.is_empty() {
-                Ok(sig.return_type)
+            let final_return = if sig.type_params.is_empty() {
+                sig.return_type
             } else {
                 self.validate_generic_call(&sig, &generic_bindings)?;
-                Ok(self.substitute_type(&sig.return_type, &generic_bindings))
+                self.substitute_type(&sig.return_type, &generic_bindings)
+            };
+            if let Some(effects) = &sig.effects {
+                let success = effects
+                    .return_type
+                    .clone()
+                    .unwrap_or_else(|| Type::new(TypeKind::Unit, span));
+                let error = effects.error_type.clone();
+                self.record_effect_call(
+                    &effects.requirements,
+                    error.as_ref(),
+                    callee.span,
+                )?;
+                return Ok(if let Some(err) = error {
+                    Type::new(TypeKind::Result(Box::new(success), Box::new(err)), span)
+                } else {
+                    success
+                });
             }
+            Ok(final_return)
         } else {
             if !explicit_type_args.is_empty() {
                 return Err(self.type_error_at(
@@ -1092,6 +1137,37 @@ impl TypeChecker {
         args: &[Expr],
     ) -> Result<Type> {
         let receiver_type = self.check_expr(receiver)?;
+        if let TypeKind::Effect { success, error, requirements } = &receiver_type.kind {
+            let mut remaining = crate::typechecker::normalize_requirements(requirements);
+            match method {
+                "run_sync" => {
+                    if !args.is_empty() { return Err(self.type_error("run_sync expects no arguments".into())); }
+                    if !remaining.is_empty() {
+                        return Err(self.type_error(format!("Cannot call run_sync() on Effect with unhandled requirements: {}", remaining.iter().map(|r| r.to_string()).collect::<Vec<_>>().join(", "))));
+                    }
+                    return Ok(if matches!(error.kind, TypeKind::Never) { (**success).clone() }
+                        else { Type::new(TypeKind::Result(success.clone(), error.clone()), receiver.span) });
+                }
+                "provide" => {
+                    if args.len() != 1 { return Err(self.type_error("provide expects one argument".into())); }
+                    let provided = self.check_expr(&args[0])?;
+                    let mut next_error = (**error).clone();
+                    let (out, input) = match &provided.kind {
+                        TypeKind::GenericInstance { name, type_args } if name == "Layer" && type_args.len() == 3 => {
+                            next_error = self.make_union_from_types(vec![next_error, type_args[1].clone()]);
+                            (type_args[0].clone(), vec![type_args[2].clone()])
+                        }
+                        _ => (provided, vec![]),
+                    };
+                    let outputs = match out.kind { TypeKind::Union(rows) | TypeKind::Tuple(rows) => rows, _ => vec![out] };
+                    remaining.retain(|r| !outputs.iter().any(|o| o.to_string() == r.to_string()));
+                    remaining.extend(input);
+                    return Ok(Type::new(TypeKind::Effect { success: success.clone(), error: Box::new(next_error), requirements: crate::typechecker::normalize_requirements(&remaining) }, receiver.span));
+                }
+                _ => {}
+            }
+        }
+
         let span = Self::dummy_span();
         let explicit_type_args = explicit_type_args
             .unwrap_or(&[])
@@ -1196,9 +1272,9 @@ impl TypeChecker {
                     return Ok(Type::new(TypeKind::Bool, span));
                 }
 
-                "unwrap" => {
+                "unwrap" | "try_unwrap" => {
                     if !args.is_empty() {
-                        return Err(self.type_error("unwrap() takes no arguments".to_string()));
+                        return Err(self.type_error(format!("{}() takes no arguments", method)));
                     }
 
                     return Ok((**inner_type).clone());
@@ -1215,7 +1291,7 @@ impl TypeChecker {
 
                 _ => {}
             },
-            TypeKind::Result(ok_type, _err_type) => match method {
+            TypeKind::Result(ok_type, err_type) => match method {
                 "is_ok" | "is_err" => {
                     if !args.is_empty() {
                         return Err(self.type_error(format!("{}() takes no arguments", method)));
@@ -1232,6 +1308,14 @@ impl TypeChecker {
                     return Ok((**ok_type).clone());
                 }
 
+                "try_unwrap" => {
+                    if !args.is_empty() {
+                        return Err(self.type_error("try_unwrap() takes no arguments".to_string()));
+                    }
+                    self.record_effect_call(&[], Some(err_type), receiver.span)?;
+                    return Ok((**ok_type).clone());
+                }
+
                 "unwrap_or" => {
                     if args.len() != 1 {
                         return Err(self.type_error("unwrap_or() requires 1 argument".to_string()));
@@ -1241,6 +1325,28 @@ impl TypeChecker {
                     return Ok(default_type);
                 }
 
+                _ => {}
+            },
+            TypeKind::Effect {
+                success,
+                error,
+                requirements,
+            } => match method {
+                "try_unwrap" => {
+                    if !args.is_empty() {
+                        return Err(self.type_error("try_unwrap() takes no arguments".to_string()));
+                    }
+                    self.record_effect_call(
+                        requirements,
+                        if matches!(error.kind, TypeKind::Never) {
+                            None
+                        } else {
+                            Some(error)
+                        },
+                        receiver.span,
+                    )?;
+                    return Ok((**success).clone());
+                }
                 _ => {}
             },
             TypeKind::Named(type_name) if type_name == "Option" || type_name == "Result" => {
@@ -1253,7 +1359,7 @@ impl TypeChecker {
                         return Ok(Type::new(TypeKind::Bool, span));
                     }
 
-                    "unwrap" => {
+                    "unwrap" | "try_unwrap" => {
                         if !args.is_empty() {
                             return Err(self.type_error("unwrap() takes no arguments".to_string()));
                         }
