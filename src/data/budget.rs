@@ -65,7 +65,7 @@ impl BudgetTracker {
     }
 
     pub fn with_poll_interval(mut self, interval: usize) -> Self {
-        self.poll_interval = interval;
+        self.poll_interval = interval.max(1);
         self
     }
 

@@ -45,6 +45,10 @@ impl<'a> BsonDecoder<'a> {
     }
 
     pub fn decode_document(&mut self) -> Result<Document, BsonError> {
+        self.decode_document_bounded(self.data.len())
+    }
+
+    pub fn decode_document_bounded(&mut self, max_end: usize) -> Result<Document, BsonError> {
         if self.data.len() < 5 {
             return Err(BsonError::UnexpectedEof);
         }
@@ -54,11 +58,14 @@ impl<'a> BsonDecoder<'a> {
 
         let doc_start = self.pos;
         let doc_len = self.read_i32()? as usize;
-        if doc_len < 5 || doc_len > (self.data.len() - doc_start) {
+        let doc_end = doc_start
+            .checked_add(doc_len)
+            .ok_or(BsonError::InvalidDocumentLength(doc_len as i32))?;
+
+        if doc_len < 5 || doc_end > max_end {
             return Err(BsonError::InvalidDocumentLength(doc_len as i32));
         }
 
-        let doc_end = doc_start + doc_len;
         if self.data[doc_end - 1] != 0x00 {
             return Err(BsonError::MissingNullTerminator);
         }
@@ -87,13 +94,13 @@ impl<'a> BsonDecoder<'a> {
                     DataValue::String(s.to_string())
                 }
                 0x03 => {
-                    // Embedded document
-                    let sub_doc = self.decode_document()?;
+                    // Embedded document strictly bounded by enclosing document
+                    let sub_doc = self.decode_document_bounded(doc_end - 1)?;
                     DataValue::Document(sub_doc)
                 }
                 0x04 => {
-                    // Array (sub-document with keys "0", "1", ...)
-                    let sub_doc = self.decode_document()?;
+                    // Array (sub-document with keys "0", "1", ...) strictly bounded
+                    let sub_doc = self.decode_document_bounded(doc_end - 1)?;
                     let mut items = Vec::with_capacity(sub_doc.len());
                     for (_, v) in sub_doc.into_iter() {
                         items.push(v);

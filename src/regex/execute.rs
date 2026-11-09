@@ -33,12 +33,30 @@ pub fn is_match(plan: &RegexPlan, input_text: &str) -> Result<bool, RegexError> 
 
 pub fn find(plan: &RegexPlan, input_text: &str) -> Result<Option<RegexMatch>, RegexError> {
     let mut tracker = RegexWorkTracker::new(input_text.len(), plan.group_count, 0)?;
+
+    // Linear-time forward DFA pre-check: scans input once in O(n) to find match existence and end position
+    let mut fwd_cache = plan.fwd_dfa.create_cache();
+    let fwd_input = Input::new(input_text);
+    tracker.charge_scanned(input_text.len() as u64)?;
+    tracker.charge_transitions(input_text.len() as u64)?;
+
+    let half_match = plan
+        .fwd_dfa
+        .try_search_fwd(&mut fwd_cache, &fwd_input)
+        .map_err(|e| RegexError::SyntaxError(e.to_string()))?;
+
+    let hm = match half_match {
+        Some(m) => m,
+        None => return Ok(None),
+    };
+
     let mut caps = plan.dfa.create_captures();
     let mut cache = plan.dfa.create_cache();
 
-    for pos in 0..=input_text.len() {
+    // Match is guaranteed to end at hm.offset(), scan candidate start positions up to hm.offset()
+    for pos in 0..=hm.offset() {
         let input = Input::new(input_text)
-            .range(pos..)
+            .range(pos..=hm.offset())
             .anchored(regex_automata::Anchored::Yes);
 
         tracker.charge_scanned(1)?;

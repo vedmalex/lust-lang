@@ -72,6 +72,7 @@ impl LustSafeYaml12 {
     }
 
     pub fn parse(&mut self, input: &str) -> Result<DataValue, YamlError> {
+        self.anchors.clear();
         if input.len() > MAX_YAML_BYTES {
             return Err(YamlError::MaxBytesExceeded(input.len()));
         }
@@ -80,6 +81,14 @@ impl LustSafeYaml12 {
         let lines: Vec<&str> = input.lines().collect();
         let mut idx = 0;
         let raw_root = self.parse_lines(&lines, &mut idx, 0)?;
+
+        while idx < lines.len() {
+            let trimmed = lines[idx].trim();
+            if !trimmed.is_empty() && !trimmed.starts_with('#') {
+                return Err(YamlError::SyntaxError(format!("unconsumed input: {}", lines[idx])));
+            }
+            idx += 1;
+        }
 
         // Pre-check DAG expansion weights before materialization
         let (b0, n0) = self.calculate_base_weights(&raw_root);

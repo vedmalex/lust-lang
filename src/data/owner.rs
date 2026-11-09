@@ -119,19 +119,30 @@ impl OwnerRegistry {
         OwnerId::new(self.runtime_id, tenant_id, slot_id, generation)
     }
 
-    /// Pre-dereference check: validates tenant, generation, and active state strictly before memory access
+    /// Pre-dereference check: validates runtime, tenant, generation, and active state strictly before memory access
     pub fn validate_access(&self, owner: OwnerId, current_tenant: u32) -> Result<(), LeaseError> {
-        if owner.tenant_id != current_tenant {
-            return Err(LeaseError::TenantMismatch {
-                expected: current_tenant,
-                actual: owner.tenant_id,
-            });
+        if owner.runtime_id != self.runtime_id {
+            return Err(LeaseError::InvalidState("OwnerId issued by foreign runtime"));
         }
 
         let slot = self
             .slots
             .get(owner.slot_id as usize)
             .ok_or(LeaseError::SlotNotFound)?;
+
+        if slot.tenant_id != current_tenant {
+            return Err(LeaseError::TenantMismatch {
+                expected: current_tenant,
+                actual: slot.tenant_id,
+            });
+        }
+
+        if owner.tenant_id != current_tenant {
+            return Err(LeaseError::TenantMismatch {
+                expected: current_tenant,
+                actual: owner.tenant_id,
+            });
+        }
 
         if slot.generation != owner.generation {
             return Err(LeaseError::StaleGeneration {
@@ -149,6 +160,10 @@ impl OwnerRegistry {
 
     /// Step 1 of invalidation: signal cancellation
     pub fn cancel(&mut self, owner: OwnerId) -> Result<(), LeaseError> {
+        if owner.runtime_id != self.runtime_id {
+            return Err(LeaseError::InvalidState("OwnerId issued by foreign runtime"));
+        }
+
         let slot = self
             .slots
             .get_mut(owner.slot_id as usize)
@@ -171,6 +186,10 @@ impl OwnerRegistry {
 
     /// Step 2 of invalidation: acknowledge child task join
     pub fn acknowledge_join(&mut self, owner: OwnerId) -> Result<(), LeaseError> {
+        if owner.runtime_id != self.runtime_id {
+            return Err(LeaseError::InvalidState("OwnerId issued by foreign runtime"));
+        }
+
         let slot = self
             .slots
             .get_mut(owner.slot_id as usize)
@@ -195,6 +214,10 @@ impl OwnerRegistry {
 
     /// Step 3 of invalidation: release buffer memory (strictly requires Joined state)
     pub fn release(&mut self, owner: OwnerId) -> Result<(), LeaseError> {
+        if owner.runtime_id != self.runtime_id {
+            return Err(LeaseError::InvalidState("OwnerId issued by foreign runtime"));
+        }
+
         let slot = self
             .slots
             .get_mut(owner.slot_id as usize)

@@ -1719,6 +1719,9 @@ pub fn is_virtual_std_module(module_path: &str) -> bool {
             | "iter"
             | "random"
             | "effect"
+            | "schema"
+            | "data"
+            | "model"
             | "test"
             | "test.clock"
             | "test.mock"
@@ -1749,6 +1752,9 @@ pub fn canonical_std_module_name(module_path: &str) -> &'static str {
         "iter" => "iter",
         "random" => "random",
         "effect" => "effect",
+        "schema" => "schema",
+        "data" => "data",
+        "model" => "model",
         "test" | "test.clock" | "test.mock" => "test",
         _ => "unknown",
     }
@@ -1785,6 +1791,18 @@ pub fn resolve_std_function(module_path: &str, item_name: &str) -> Option<&'stat
             "run_sync" => Some("effect.run_sync"),
             "suspend" => Some("effect.suspend"),
             "provide" => Some("effect.provide"),
+            _ => None,
+        },
+        "schema" => match item_name {
+            "s" => Some("schema.s"),
+            _ => None,
+        },
+        "data" => match item_name {
+            "document" => Some("data.document"),
+            _ => None,
+        },
+        "model" => match item_name {
+            "m" => Some("model.m"),
             _ => None,
         },
         "math" => match item_name {

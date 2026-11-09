@@ -35,13 +35,35 @@ pub fn validate_ir(
                     }
                 }
                 if let Some(pattern) = regex {
-                    if let Ok(re) = regex::Regex::new(pattern) {
-                        if !re.is_match(s) {
+                    match crate::regex::BoundedRegex::new(pattern) {
+                        Ok(re) => match re.is_match(s) {
+                            Ok(true) => {}
+                            Ok(false) => {
+                                errors.push(
+                                    ValidationError::new(
+                                        path.clone(),
+                                        format!("String does not match pattern '{}'", pattern),
+                                        "regex_mismatch",
+                                    )
+                                    .with_received(s.clone()),
+                                );
+                                valid = false;
+                            }
+                            Err(e) => {
+                                errors.push(ValidationError::new(
+                                    path.clone(),
+                                    format!("Regex execution error: {}", e),
+                                    "regex_error",
+                                ));
+                                valid = false;
+                            }
+                        },
+                        Err(e) => {
                             errors.push(ValidationError::new(
                                 path.clone(),
-                                format!("String does not match pattern '{}'", pattern),
-                                "regex_mismatch",
-                            ).with_received(s.clone()));
+                                format!("Invalid regex pattern '{}': {}", pattern, e),
+                                "invalid_regex",
+                            ));
                             valid = false;
                         }
                     }
@@ -159,6 +181,88 @@ pub fn validate_ir(
                     "Expected boolean",
                     "invalid_type",
                 ).with_expected("boolean").with_received(value_type_name(value)));
+                None
+            }
+        }
+
+        SchemaIR::Binary { min_len, max_len } => {
+            let bytes_len = match value {
+                DataValue::Binary(b) => Some(b.len()),
+                _ => None,
+            };
+
+            if let Some(len) = bytes_len {
+                let mut valid = true;
+                if let Some(min) = min_len {
+                    if len < *min {
+                        errors.push(ValidationError::new(
+                            path.clone(),
+                            format!("Binary length must be at least {}", min),
+                            "too_small",
+                        ).with_received(len.to_string()));
+                        valid = false;
+                    }
+                }
+                if let Some(max) = max_len {
+                    if len > *max {
+                        errors.push(ValidationError::new(
+                            path.clone(),
+                            format!("Binary length must be at most {}", max),
+                            "too_big",
+                        ).with_received(len.to_string()));
+                        valid = false;
+                    }
+                }
+                if valid {
+                    Some(value.clone())
+                } else {
+                    None
+                }
+            } else {
+                errors.push(ValidationError::new(
+                    path.clone(),
+                    "Expected binary",
+                    "invalid_type",
+                ).with_expected("binary").with_received(value_type_name(value)));
+                None
+            }
+        }
+
+        SchemaIR::ObjectId => {
+            if let DataValue::ObjectId(oid) = value {
+                Some(DataValue::ObjectId(*oid))
+            } else {
+                errors.push(ValidationError::new(
+                    path.clone(),
+                    "Expected ObjectId",
+                    "invalid_type",
+                ).with_expected("ObjectId").with_received(value_type_name(value)));
+                None
+            }
+        }
+
+        SchemaIR::DateTimeUtc => {
+            if let DataValue::DateTimeUtc(dt) = value {
+                Some(DataValue::DateTimeUtc(*dt))
+            } else {
+                errors.push(ValidationError::new(
+                    path.clone(),
+                    "Expected DateTimeUtc",
+                    "invalid_type",
+                ).with_expected("DateTimeUtc").with_received(value_type_name(value)));
+                None
+            }
+        }
+
+        SchemaIR::Decimal128 => {
+            if let DataValue::Number(ExactNumber::Decimal128(d)) = value {
+                Some(DataValue::Number(ExactNumber::Decimal128(*d)))
+            } else {
+                errors.push(ValidationError::new(
+                    path.clone(),
+                    "Expected Decimal128",
+                    "invalid_type",
+                ).with_expected("Decimal128").with_received(value_type_name(value)));
                 None
             }
         }

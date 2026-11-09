@@ -298,6 +298,9 @@ impl<'a> JsonParser<'a> {
 
         if is_float {
             let f: f64 = raw_str.parse().map_err(|_| JsonError::InvalidNumber(start))?;
+            if !f.is_finite() {
+                return Err(JsonError::InvalidNumber(start));
+            }
             Ok(DataValue::Number(ExactNumber::Float(f)))
         } else {
             if let Ok(i) = raw_str.parse::<i64>() {
@@ -305,6 +308,9 @@ impl<'a> JsonParser<'a> {
             } else if let Ok(u) = raw_str.parse::<u64>() {
                 Ok(DataValue::Number(ExactNumber::UInt(u)))
             } else if let Ok(f) = raw_str.parse::<f64>() {
+                if !f.is_finite() {
+                    return Err(JsonError::InvalidNumber(start));
+                }
                 Ok(DataValue::Number(ExactNumber::Float(f)))
             } else {
                 Err(JsonError::InvalidNumber(start))

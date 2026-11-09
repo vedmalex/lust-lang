@@ -80,7 +80,7 @@ impl ToonCodec {
 
             let mut doc = Document::new();
             for (col_idx, val_str) in cells.into_iter().enumerate() {
-                let val = parse_scalar(&val_str);
+                let val = parse_scalar(&val_str, row_idx + 1)?;
                 let col_name = &columns[col_idx];
                 let _ = doc.try_insert(col_name.clone(), val);
             }
@@ -177,19 +177,30 @@ fn strip_quotes(s: &str) -> String {
     trimmed.to_string()
 }
 
-fn parse_scalar(s: &str) -> DataValue {
+fn parse_scalar(s: &str, row: usize) -> Result<DataValue, ToonError> {
     let clean = strip_quotes(s);
+    let is_quoted = (s.starts_with('"') && s.ends_with('"')) || (s.starts_with('\'') && s.ends_with('\''));
+    if is_quoted {
+        return Ok(DataValue::String(clean));
+    }
     match clean.as_str() {
-        "null" | "~" => DataValue::Null,
-        "true" | "TRUE" => DataValue::Bool(true),
-        "false" | "FALSE" => DataValue::Bool(false),
+        "null" | "~" => Ok(DataValue::Null),
+        "true" | "TRUE" => Ok(DataValue::Bool(true)),
+        "false" | "FALSE" => Ok(DataValue::Bool(false)),
         other => {
             if let Ok(i) = other.parse::<i64>() {
-                DataValue::Number(ExactNumber::Int(i))
+                Ok(DataValue::Number(ExactNumber::Int(i)))
             } else if let Ok(f) = other.parse::<f64>() {
-                DataValue::Number(ExactNumber::Float(f))
+                if !f.is_finite() {
+                    return Err(ToonError::InvalidScalar(other.to_string(), row));
+                }
+                Ok(DataValue::Number(ExactNumber::Float(f)))
             } else {
-                DataValue::String(clean)
+                let looks_numeric = other.starts_with(|c: char| c.is_ascii_digit() || c == '+' || c == '-');
+                if looks_numeric {
+                    return Err(ToonError::InvalidScalar(other.to_string(), row));
+                }
+                Ok(DataValue::String(clean))
             }
         }
     }

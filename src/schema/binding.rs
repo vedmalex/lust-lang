@@ -32,7 +32,10 @@ pub fn derive_schema_from_layout(layout: &LogicalLayoutV1) -> Schema {
             CanonicalTypeTag::Int64 | CanonicalTypeTag::UInt64 => SchemaIR::Int { min: None, max: None },
             CanonicalTypeTag::Float64 => SchemaIR::Float { min: None, max: None },
             CanonicalTypeTag::StringSlice => SchemaIR::String { min_len: None, max_len: None, regex: None },
-            CanonicalTypeTag::BinarySlice | CanonicalTypeTag::ObjectId | CanonicalTypeTag::DateTimeUtc | CanonicalTypeTag::Decimal128 => SchemaIR::Any,
+            CanonicalTypeTag::BinarySlice => SchemaIR::Binary { min_len: None, max_len: None },
+            CanonicalTypeTag::ObjectId => SchemaIR::ObjectId,
+            CanonicalTypeTag::DateTimeUtc => SchemaIR::DateTimeUtc,
+            CanonicalTypeTag::Decimal128 => SchemaIR::Decimal128,
             CanonicalTypeTag::NestedStruct(_) => SchemaIR::Any,
         };
 

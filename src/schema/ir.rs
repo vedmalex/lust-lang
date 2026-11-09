@@ -25,6 +25,13 @@ pub enum SchemaIR {
         max: Option<f64>,
     },
     Bool,
+    Binary {
+        min_len: Option<usize>,
+        max_len: Option<usize>,
+    },
+    ObjectId,
+    DateTimeUtc,
+    Decimal128,
     Literal(DataValue),
     Array {
         item: Box<SchemaIR>,

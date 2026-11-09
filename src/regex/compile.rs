@@ -12,11 +12,15 @@ pub fn compile_bounded(pattern: &str) -> Result<RegexPlan, RegexError> {
         RegexError::UnsupportedPattern(format!("{}: {}", pattern, e))
     })?;
 
+    let fwd_dfa = regex_automata::hybrid::dfa::DFA::new(pattern).map_err(|e| {
+        RegexError::UnsupportedPattern(format!("{}: {}", pattern, e))
+    })?;
+
     let caps = dfa.create_captures();
     let group_count = caps.group_len();
     if group_count > MAX_CAPTURE_GROUPS {
         return Err(RegexError::TooManyCaptureGroups(group_count));
     }
 
-    Ok(RegexPlan::new(pattern.to_string(), dfa, group_count))
+    Ok(RegexPlan::new(pattern.to_string(), dfa, fwd_dfa, group_count))
 }

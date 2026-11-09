@@ -77,14 +77,20 @@ pub fn materialize_from_document(
     layout: &LogicalLayoutV1,
     doc: &Document,
 ) -> Result<MaterializedStruct, MaterializeError> {
-    let mut slots = Vec::with_capacity(layout.fields.len());
+    let max_ordinal = layout
+        .fields
+        .iter()
+        .map(|f| f.ordinal as usize)
+        .max()
+        .unwrap_or(0);
+    let mut slots = vec![DataValue::Null; max_ordinal + 1];
 
     for field in &layout.fields {
         match doc.get(&field.name) {
             Some(val) => {
                 if !matches_tag(val, field.tag) {
                     if field.is_nullable && matches!(val, DataValue::Null) {
-                        slots.push(DataValue::Null);
+                        slots[field.ordinal as usize] = DataValue::Null;
                     } else {
                         // Cleanup allocated slots on failure
                         slots.clear();
@@ -95,12 +101,12 @@ pub fn materialize_from_document(
                         });
                     }
                 } else {
-                    slots.push(val.clone());
+                    slots[field.ordinal as usize] = val.clone();
                 }
             }
             None => {
-                if field.is_optional || field.is_nullable {
-                    slots.push(DataValue::Null);
+                if field.is_optional {
+                    slots[field.ordinal as usize] = DataValue::Null;
                 } else {
                     slots.clear();
                     return Err(MaterializeError::MissingField {
