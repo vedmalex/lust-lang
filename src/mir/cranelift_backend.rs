@@ -23,6 +23,8 @@ pub mod jit_engine {
         UnsupportedConstant(MirConstant),
         #[error("Cranelift codegen error: {0}")]
         CodegenError(String),
+        #[error("Failed or unlowerable value cannot be replaced with silent Unit: {0}")]
+        UnlowerableValue(String),
     }
 
     pub struct CraneliftJitCompiler {
@@ -520,7 +522,9 @@ pub mod jit_engine {
                 MirConstant::Int(i) => Ok(builder.ins().iconst(types::I64, *i)),
                 MirConstant::Float(f) => Ok(builder.ins().f64const(*f)),
                 MirConstant::Bool(b) => Ok(builder.ins().iconst(types::I8, if *b { 1 } else { 0 })),
-                MirConstant::Unit => Ok(builder.ins().iconst(types::I8, 0)),
+                MirConstant::Unit => Err(MirCraneliftBackendError::UnlowerableValue(
+                    "failed or unlowerable value cannot be evaluated as Unit in Cranelift backend".to_string(),
+                )),
                 _ => Err(MirCraneliftBackendError::UnsupportedConstant(c.clone())),
             },
         }

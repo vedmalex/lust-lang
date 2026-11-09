@@ -13,6 +13,8 @@ pub enum MirLowerError {
     UnsupportedUnaryOp(UnaryOp),
     #[error("Lvalue expression is not supported by MIR lowering: {0}")]
     UnsupportedLvalue(String),
+    #[error("Failed or unlowerable expression cannot be lowered to MIR: {0}")]
+    UnlowerableExpression(String),
 }
 
 #[derive(Debug, Clone)]
@@ -1734,7 +1736,7 @@ impl<'a> AstLowering<'a> {
                 self.current_block = succ_bb;
                 Ok(Operand::Move(Place::Local(temp)))
             }
-            _ => Ok(Operand::Constant(MirConstant::Unit)),
+            _ => Err(MirLowerError::UnlowerableExpression(format!("{:?}", expr.kind))),
         }
     }
 

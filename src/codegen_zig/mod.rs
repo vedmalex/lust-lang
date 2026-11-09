@@ -308,7 +308,7 @@ impl ZigCodegen {
 
     fn emit_struct(&mut self, s: &StructDef, methods: &[&FunctionDef]) -> Result<()> {
         let modifier = if self.runtime_opts.is_library { "pub const" } else { "pub const" };
-        let struct_kw = if self.runtime_opts.is_library { "extern struct" } else { "struct" };
+        let struct_kw = "extern struct";
         self.emit_line(&format!("{} {} = {} {{", modifier, s.name, struct_kw));
         self.indent();
         for field in &s.fields {
@@ -2685,3 +2685,25 @@ fn zig_ident(name: &str) -> String {
         _ => name.to_string(),
     }
 }
+
+/// Returns the nominal C ABI descriptor for a struct definition, matching its Zig AOT lowering field-for-field.
+pub fn struct_c_abi_descriptor(s: &crate::ast::StructDef) -> crate::data::LogicalLayoutV1 {
+    crate::data::materialize::struct_def_to_layout(s)
+}
+
+/// Verifies that a struct definition's nominal layout matches the C ABI descriptor field-for-field.
+pub fn verify_struct_c_abi_layout(s: &crate::ast::StructDef, layout: &crate::data::LogicalLayoutV1) -> bool {
+    if s.name != layout.type_name {
+        return false;
+    }
+    if s.fields.len() != layout.fields.len() {
+        return false;
+    }
+    for (i, (f, desc)) in s.fields.iter().zip(&layout.fields).enumerate() {
+        if f.name != desc.name || desc.ordinal as usize != i {
+            return false;
+        }
+    }
+    true
+}
+

@@ -159,6 +159,7 @@ pub struct ModuleLoader {
     source_overrides: HashMap<PathBuf, String>,
     module_roots: HashMap<String, Vec<ModuleRoot>>,
     config: LustConfig,
+    data_cache: HashMap<PathBuf, (u64, crate::data::DataValue)>,
 }
 
 #[cfg(feature = "std")]
@@ -178,6 +179,7 @@ impl ModuleLoader {
             source_overrides: HashMap::new(),
             module_roots: HashMap::new(),
             config: LustConfig::default(),
+            data_cache: HashMap::new(),
         }
     }
 
@@ -204,6 +206,14 @@ impl ModuleLoader {
 
     pub fn clear_source_overrides(&mut self) {
         self.source_overrides.clear();
+    }
+
+    pub fn data_cache(&self) -> &HashMap<PathBuf, (u64, crate::data::DataValue)> {
+        &self.data_cache
+    }
+
+    pub fn clear_data_cache(&mut self) {
+        self.data_cache.clear();
     }
 
     pub fn add_module_root(
@@ -269,9 +279,179 @@ impl ModuleLoader {
         Ok(())
     }
 
-    fn load_single_module(&self, module_path: &str, is_entry: bool) -> Result<LoadedModule> {
+    pub fn digest_bytes(bytes: &[u8]) -> u64 {
+        use core::hash::Hasher;
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        hasher.write(bytes);
+        hasher.finish()
+    }
+
+    pub fn load_data_import(&mut self, path: &Path) -> Result<crate::data::DataValue> {
+        let resolved = if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            self.base_dir.join(path)
+        };
+
+        let bytes = if let Some(src) = self.source_overrides.get(&resolved) {
+            src.as_bytes().to_vec()
+        } else {
+            match fs::read(&resolved) {
+                Ok(b) => b,
+                Err(e) => {
+                    return Err(LustError::CompileError(format!(
+                        "Compile error: missing data import file '{}': {}",
+                        resolved.display(),
+                        e
+                    )));
+                }
+            }
+        };
+
+        let digest = Self::digest_bytes(&bytes);
+        if let Some((cached_digest, val)) = self.data_cache.get(&resolved) {
+            if *cached_digest == digest {
+                return Ok(val.clone());
+            }
+        }
+
+        let s = std::str::from_utf8(&bytes).map_err(|e| {
+            LustError::CompileError(format!(
+                "Compile error: invalid UTF-8 in data import '{}': {}",
+                resolved.display(),
+                e
+            ))
+        })?;
+
+        let val = crate::data::json::from_str(s).map_err(|e| {
+            LustError::CompileError(format!(
+                "Compile error: invalid JSON in data import '{}': {}",
+                resolved.display(),
+                e
+            ))
+        })?;
+
+        Self::verify_finite_numbers(&val, &resolved)?;
+
+        self.data_cache.insert(resolved, (digest, val.clone()));
+        Ok(val)
+    }
+
+    fn verify_finite_numbers(val: &crate::data::DataValue, path: &Path) -> Result<()> {
+        use crate::data::{DataValue, ExactNumber};
+        match val {
+            DataValue::Number(ExactNumber::Float(f)) => {
+                if !f.is_finite() {
+                    return Err(LustError::CompileError(format!(
+                        "Compile error: non-finite number in data import '{}'",
+                        path.display()
+                    )));
+                }
+            }
+            DataValue::Array(arr) => {
+                for item in arr {
+                    Self::verify_finite_numbers(item, path)?;
+                }
+            }
+            DataValue::Document(doc) => {
+                for (_k, v) in doc.iter() {
+                    Self::verify_finite_numbers(v, path)?;
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    pub fn data_value_to_lust_code(val: &crate::data::DataValue) -> String {
+        use crate::data::{DataValue, ExactNumber};
+        match val {
+            DataValue::Null => "nil".to_string(),
+            DataValue::Bool(b) => if *b { "true".to_string() } else { "false".to_string() },
+            DataValue::Number(ExactNumber::Int(i)) => format!("{i}"),
+            DataValue::Number(ExactNumber::Float(f)) => format!("{f:?}"),
+            DataValue::Number(ExactNumber::UInt(u)) => format!("{u}"),
+            DataValue::Number(ExactNumber::Decimal128(_)) => "0".to_string(),
+            DataValue::String(s) => format!("{s:?}"),
+            DataValue::Binary(bytes) => format!("{bytes:?}"),
+            DataValue::ObjectId(oid) => format!("{:?}", oid.to_hex()),
+            DataValue::DateTimeUtc(dt) => format!("{}", dt.millis()),
+            DataValue::Array(items) => {
+                let els: Vec<String> = items.iter().map(Self::data_value_to_lust_code).collect();
+                format!("[{}]", els.join(", "))
+            }
+            DataValue::Document(doc) => {
+                let mut parts = Vec::new();
+                for (k, v) in doc.iter() {
+                    parts.push(format!("[{:?}] = {}", k, Self::data_value_to_lust_code(v)));
+                }
+                format!("{{ {} }}", parts.join(", "))
+            }
+        }
+    }
+
+    fn parse_import_statement(line: &str) -> Option<(String, String)> {
+        let trimmed = line.trim();
+        if trimmed.starts_with("//") || trimmed.starts_with("--") || !trimmed.starts_with("import") {
+            return None;
+        }
+        let after_import = trimmed.strip_prefix("import")?;
+        if after_import.is_empty() || !after_import.chars().next()?.is_whitespace() {
+            return None;
+        }
+        let after_import = after_import.trim_start();
+        let from_idx = after_import.find("from")?;
+        let ident = after_import[..from_idx].trim();
+        if ident.is_empty() || !ident.chars().all(|c| c.is_alphanumeric() || c == '_') {
+            return None;
+        }
+        let after_from = after_import[from_idx + 4..].trim_start().trim_end_matches(';').trim();
+        if (after_from.starts_with('"') && after_from.ends_with('"'))
+            || (after_from.starts_with('\'') && after_from.ends_with('\''))
+        {
+            if after_from.len() >= 2 {
+                let path = after_from[1..after_from.len() - 1].to_string();
+                return Some((ident.to_string(), path));
+            }
+        }
+        None
+    }
+
+    fn process_data_imports(&mut self, source: &str, current_file: &Path) -> Result<String> {
+        let mut result = String::with_capacity(source.len());
+        for line in source.lines() {
+            if let Some((ident, import_path)) = Self::parse_import_statement(line) {
+                if import_path.ends_with(".json") {
+                    let resolved = if import_path.starts_with("./") || import_path.starts_with("../") {
+                        current_file.parent().unwrap_or(Path::new(".")).join(&import_path)
+                    } else {
+                        let p = Path::new(&import_path);
+                        if p.is_absolute() {
+                            p.to_path_buf()
+                        } else {
+                            let rel = current_file.parent().unwrap_or(Path::new(".")).join(&import_path);
+                            if rel.exists() || self.source_overrides.contains_key(&rel) {
+                                rel
+                            } else {
+                                self.base_dir.join(&import_path)
+                            }
+                        }
+                    };
+                    let val = self.load_data_import(&resolved)?;
+                    let code = Self::data_value_to_lust_code(&val);
+                    result.push_str(&format!("local {} = {}\n", ident, code));
+                    continue;
+                }
+            }
+            result.push_str(line);
+            result.push('\n');
+        }
+        Ok(result)
+    }
+
+    fn load_single_module(&mut self, module_path: &str, is_entry: bool) -> Result<LoadedModule> {
         let file = self.file_for_module_path(module_path);
-        let source = if let Some(src) = self.source_overrides.get(&file) {
+        let raw_source = if let Some(src) = self.source_overrides.get(&file) {
             src.clone()
         } else {
             match fs::read_to_string(&file) {
@@ -294,6 +474,7 @@ impl ModuleLoader {
                 }
             }
         };
+        let source = self.process_data_imports(&raw_source, &file)?;
         let mut interner = crate::intern::Interner::new();
         let mut lexer = Lexer::new(&source, &mut interner);
         let tokens = lexer
@@ -1469,6 +1650,130 @@ end
         // Best-effort cleanup.
         let _ = fs::remove_file(entry_path);
         let _ = fs::remove_file(module_path);
+        let _ = fs::remove_dir(dir);
+    }
+
+    #[test]
+    fn test_compile_time_data_import_json() {
+        let dir = unique_temp_dir("lust_data_import_test");
+        fs::create_dir_all(&dir).unwrap();
+        let config_path = dir.join("config.json");
+        let entry_path = dir.join("main.lust");
+
+        fs::write(&config_path, r#"{"name": "LustEngine", "port": 8080, "active": true}"#).unwrap();
+        fs::write(
+            &entry_path,
+            r#"
+import config from "./config.json"
+
+function get_name(): string
+    return config["name"]
+end
+"#,
+        )
+        .unwrap();
+
+        let mut loader = ModuleLoader::new(dir.clone());
+        let program = loader
+            .load_program_from_entry(entry_path.to_str().unwrap())
+            .expect("compile-time data import succeeds");
+
+        assert_eq!(program.modules.len(), 1);
+        let data_cache = loader.data_cache();
+        assert_eq!(data_cache.len(), 1);
+
+        let cached_entry = data_cache.get(&config_path).expect("config.json in data_cache");
+        let first_digest = cached_entry.0;
+
+        // Second load: unchanged file uses same digest without reparsing
+        let mut loader2 = ModuleLoader::new(dir.clone());
+        let val = loader2.load_data_import(&config_path).unwrap();
+        assert_eq!(ModuleLoader::digest_bytes(&fs::read(&config_path).unwrap()), first_digest);
+        if let crate::data::DataValue::Document(doc) = &val {
+            assert_eq!(
+                doc.get("name"),
+                Some(&crate::data::DataValue::String("LustEngine".to_string()))
+            );
+        } else {
+            panic!("expected document");
+        }
+
+        // Cleanup
+        let _ = fs::remove_file(config_path);
+        let _ = fs::remove_file(entry_path);
+        let _ = fs::remove_dir(dir);
+    }
+
+    #[test]
+    fn test_compile_time_data_import_missing_file_error() {
+        let dir = unique_temp_dir("lust_data_missing_test");
+        fs::create_dir_all(&dir).unwrap();
+        let entry_path = dir.join("main.lust");
+
+        fs::write(
+            &entry_path,
+            r#"
+import config from "./non_existent.json"
+"#,
+        )
+        .unwrap();
+
+        let mut loader = ModuleLoader::new(dir.clone());
+        let res = loader.load_program_from_entry(entry_path.to_str().unwrap());
+        assert!(res.is_err(), "missing file must be a compile error");
+
+        let _ = fs::remove_file(entry_path);
+        let _ = fs::remove_dir(dir);
+    }
+
+    #[test]
+    fn test_compile_time_data_import_invalid_json_error() {
+        let dir = unique_temp_dir("lust_data_invalid_test");
+        fs::create_dir_all(&dir).unwrap();
+        let config_path = dir.join("bad.json");
+        let entry_path = dir.join("main.lust");
+
+        fs::write(&config_path, r#"{"name": "broken", invalid_syntax}"#).unwrap();
+        fs::write(
+            &entry_path,
+            r#"
+import config from "./bad.json"
+"#,
+        )
+        .unwrap();
+
+        let mut loader = ModuleLoader::new(dir.clone());
+        let res = loader.load_program_from_entry(entry_path.to_str().unwrap());
+        assert!(res.is_err(), "invalid JSON must be a compile error");
+
+        let _ = fs::remove_file(config_path);
+        let _ = fs::remove_file(entry_path);
+        let _ = fs::remove_dir(dir);
+    }
+
+    #[test]
+    fn test_compile_time_data_import_non_finite_number_error() {
+        let dir = unique_temp_dir("lust_data_non_finite_test");
+        fs::create_dir_all(&dir).unwrap();
+        let config_path = dir.join("overflow.json");
+        let entry_path = dir.join("main.lust");
+
+        // 1e999 overflows to infinity; JSON parser and loader reject non-finite numbers
+        fs::write(&config_path, r#"{"rate": 1e999}"#).unwrap();
+        fs::write(
+            &entry_path,
+            r#"
+import config from "./overflow.json"
+"#,
+        )
+        .unwrap();
+
+        let mut loader = ModuleLoader::new(dir.clone());
+        let res = loader.load_program_from_entry(entry_path.to_str().unwrap());
+        assert!(res.is_err(), "non-finite number must be a compile error");
+
+        let _ = fs::remove_file(config_path);
+        let _ = fs::remove_file(entry_path);
         let _ = fs::remove_dir(dir);
     }
 }
