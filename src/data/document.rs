@@ -113,6 +113,15 @@ impl Document {
     }
 }
 
+impl IntoIterator for Document {
+    type Item = (String, DataValue);
+    type IntoIter = std::vec::IntoIter<(String, DataValue)>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.entries.into_iter()
+    }
+}
+
 impl<K: Into<String>, V: Into<DataValue>> FromIterator<(K, V)> for Document {
     fn from_iter<T: IntoIterator<Item = (K, V)>>(iter: T) -> Self {
         let mut doc = Document::new();

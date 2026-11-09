@@ -10,6 +10,9 @@ pub mod builtins;
 pub mod bytecode;
 pub mod config;
 pub mod data;
+pub mod schema;
+#[cfg(feature = "std")]
+pub mod regex;
 #[cfg(feature = "std")]
 pub mod codegen_zig;
 pub mod effect_abi;

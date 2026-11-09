@@ -51,6 +51,7 @@ std = [
   "thiserror/std",
   "dep:lust-macros",
   "dep:regex",
+  "dep:regex-automata",
   "dep:rand",
   "dep:cranelift-codegen",
   "dep:cranelift-frontend",
@@ -137,6 +138,7 @@ foldhash = { version = "0.2.0", default-features = false }
 libm = { version = "0.2.16", default-features = false }
 lust-macros = { path = "crates/lust-macros", version = "0.1.3", optional = true }
 regex = { version = "1.13.1", optional = true }
+regex-automata = { version = "0.4.18", default-features = false, features = ["std", "dfa-onepass", "dfa-search", "syntax", "hybrid"], optional = true }
 rand = { version = "0.10.2", optional = true }
 serde_json = { version = "1.0.151", optional = true, features = ["std"] }
 object = { version = "0.40.0", default-features = false, features = [

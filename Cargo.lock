@@ -1093,6 +1093,7 @@ dependencies = [
  "object",
  "rand",
  "regex",
+ "regex-automata",
  "serde",
  "serde_json",
  "tempfile",
