@@ -39,7 +39,11 @@ pub mod wasm;
 pub use ast::{Expr, Item, Span, Stmt, Type};
 pub use bytecode::{Chunk, Compiler, Function, Instruction, Value};
 pub use config::{ConfigError, DependencyKind, DependencySpec, LustConfig};
-pub use data::{DataValue, DateTimeUtc, Decimal128, Document, DuplicateKeyError, ExactNumber, ObjectId};
+pub use data::{
+    BudgetError, BudgetTracker, CanonicalTypeTag, DataValue, DataView, DateTimeUtc, Decimal128,
+    Document, DuplicateKeyError, ExactNumber, LeaseError, LeaseLifecycleState, LogicalFieldDesc,
+    LogicalLayoutV1, ObjectId, OwnerId, OwnerRegistry,
+};
 #[cfg(feature = "std")]
 pub use embed::{
     ArrayHandle, AsyncDriver, AsyncTaskQueue, CompiledBytecode, EmbeddedBuilder, EmbeddedProgram,

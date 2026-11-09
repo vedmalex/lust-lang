@@ -1,7 +1,15 @@
+pub mod budget;
 pub mod document;
+pub mod layout;
 pub mod number;
+pub mod owner;
 pub mod value;
+pub mod view;
 
+pub use budget::{BudgetError, BudgetTracker};
 pub use document::{Document, DuplicateKeyError};
+pub use layout::{CanonicalTypeTag, LogicalFieldDesc, LogicalLayoutV1};
 pub use number::{DataError, DateTimeUtc, Decimal128, ExactNumber, ObjectId};
+pub use owner::{LeaseError, LeaseLifecycleState, OwnerId, OwnerRegistry, SlotEntry};
 pub use value::DataValue;
+pub use view::DataView;
