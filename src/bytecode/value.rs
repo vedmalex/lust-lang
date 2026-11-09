@@ -2093,7 +2093,7 @@ pub struct JitVecSlot {
 
 #[cfg(feature = "std")]
 impl JitVecSlot {
-    /// Take the slot's contents as Vec<LustInt>, leaving it zeroed.
+    /// Take the slot's contents as `Vec<LustInt>`, leaving it zeroed.
     ///
     /// # Safety
     /// The slot holds either zeros or what `jit_unbox_array_int` stored.
@@ -2115,7 +2115,7 @@ impl JitVecSlot {
         (vec, array)
     }
 
-    /// Take the slot's contents as Vec<u8> (booleans), leaving it zeroed.
+    /// Take the slot's contents as `Vec<u8>` (booleans), leaving it zeroed.
     ///
     /// # Safety
     /// The slot holds either zeros or what `jit_unbox_array_bool` stored.
@@ -2137,7 +2137,7 @@ impl JitVecSlot {
         (vec, array)
     }
 
-    /// Take the slot's contents as Vec<LustFloat>, leaving it zeroed.
+    /// Take the slot's contents as `Vec<LustFloat>`, leaving it zeroed.
     ///
     /// # Safety
     /// The slot holds either zeros or what `jit_unbox_array_float` stored.
@@ -2604,7 +2604,7 @@ pub unsafe extern "C" fn jit_unbox_array_float(
     }
 }
 
-/// Rebox Array<int>: keep slot's elements in cache dirty for zero-copy JIT/interpreter reuse.
+/// Rebox `Array<int>`: keep slot's elements in cache dirty for zero-copy JIT/interpreter reuse.
 #[cfg(feature = "std")]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn jit_rebox_array_int(slot: *mut JitVecSlot) -> u8 {
@@ -2628,7 +2628,7 @@ pub unsafe extern "C" fn jit_rebox_array_int(slot: *mut JitVecSlot) -> u8 {
     }
 }
 
-/// Rebox Array<bool>: keep slot's elements in cache dirty for zero-copy JIT/interpreter reuse.
+/// Rebox `Array<bool>`: keep slot's elements in cache dirty for zero-copy JIT/interpreter reuse.
 #[cfg(feature = "std")]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn jit_rebox_array_bool(slot: *mut JitVecSlot) -> u8 {
@@ -2652,7 +2652,7 @@ pub unsafe extern "C" fn jit_rebox_array_bool(slot: *mut JitVecSlot) -> u8 {
     }
 }
 
-/// Rebox Array<float>: keep slot's elements in cache dirty for zero-copy JIT/interpreter reuse.
+/// Rebox `Array<float>`: keep slot's elements in cache dirty for zero-copy JIT/interpreter reuse.
 #[cfg(feature = "std")]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn jit_rebox_array_float(slot: *mut JitVecSlot) -> u8 {
@@ -2676,7 +2676,7 @@ pub unsafe extern "C" fn jit_rebox_array_float(slot: *mut JitVecSlot) -> u8 {
     }
 }
 
-/// Specialized push operation for Vec<LustInt>
+/// Specialized push operation for `Vec<LustInt>`
 #[cfg(feature = "std")]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn jit_vec_int_push(
@@ -2711,7 +2711,7 @@ pub unsafe extern "C" fn jit_vec_int_push(
     }
 }
 
-/// Specialized push operation for Vec<u8> (booleans)
+/// Specialized push operation for `Vec<u8>` (booleans)
 #[cfg(feature = "std")]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn jit_vec_bool_push(
@@ -2746,7 +2746,7 @@ pub unsafe extern "C" fn jit_vec_bool_push(
     }
 }
 
-/// Specialized push operation for Vec<LustFloat>
+/// Specialized push operation for `Vec<LustFloat>`
 #[cfg(feature = "std")]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn jit_vec_float_push(
@@ -2781,7 +2781,7 @@ pub unsafe extern "C" fn jit_vec_float_push(
     }
 }
 
-/// Drop a specialized Vec<LustInt> slot without publishing
+/// Drop a specialized `Vec<LustInt>` slot without publishing
 #[cfg(feature = "std")]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn jit_drop_vec_int(slot: *mut JitVecSlot) {
@@ -2796,7 +2796,7 @@ pub unsafe extern "C" fn jit_drop_vec_int(slot: *mut JitVecSlot) {
     }
 }
 
-/// Drop a specialized Vec<u8> slot without publishing
+/// Drop a specialized `Vec<u8>` slot without publishing
 #[cfg(feature = "std")]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn jit_drop_vec_bool(slot: *mut JitVecSlot) {
@@ -2811,7 +2811,7 @@ pub unsafe extern "C" fn jit_drop_vec_bool(slot: *mut JitVecSlot) {
     }
 }
 
-/// Drop a specialized Vec<LustFloat> slot without publishing
+/// Drop a specialized `Vec<LustFloat>` slot without publishing
 #[cfg(feature = "std")]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn jit_drop_vec_float(slot: *mut JitVecSlot) {

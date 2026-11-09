@@ -1,3 +1,18 @@
+//! Data model, formats, zero-copy views, and budget tracking for Lust.
+//!
+//! # Examples
+//!
+//! ```rust
+//! use lust::data::{Document, DataValue, ExactNumber};
+//!
+//! let mut doc = Document::new();
+//! doc.try_insert("id", DataValue::Number(ExactNumber::Int(1))).unwrap();
+//! doc.try_insert("name", DataValue::String("Lust".to_string())).unwrap();
+//!
+//! // Gate-SCHEMA-01: Duplicate keys are strictly rejected
+//! assert!(doc.try_insert("id", DataValue::Number(ExactNumber::Int(2))).is_err());
+//! ```
+
 pub mod bson;
 pub mod budget;
 pub mod document;

@@ -131,6 +131,12 @@ impl LogicalLayoutV1 {
     ) -> Self {
         // Enforce declaration-order ordinal (0..N-1)
         fields.sort_by_key(|f| f.ordinal);
+        let has_duplicates = fields.windows(2).any(|w| w[0].ordinal == w[1].ordinal);
+        if has_duplicates {
+            for (i, f) in fields.iter_mut().enumerate() {
+                f.ordinal = i as u16;
+            }
+        }
 
         let mut current_offset = 0usize;
         let mut max_align = 1usize;

@@ -56,7 +56,7 @@ pub fn find(plan: &RegexPlan, input_text: &str) -> Result<Option<RegexMatch>, Re
     // Match is guaranteed to end at hm.offset(), scan candidate start positions up to hm.offset()
     for pos in 0..=hm.offset() {
         let input = Input::new(input_text)
-            .range(pos..=hm.offset())
+            .range(pos..)
             .anchored(regex_automata::Anchored::Yes);
 
         tracker.charge_scanned(1)?;
@@ -87,6 +87,22 @@ pub fn replace_all(
 ) -> Result<String, RegexError> {
     let max_output_estimate = input_text.len().saturating_add(replacement.len().saturating_mul(10));
     let mut tracker = RegexWorkTracker::new(input_text.len(), plan.group_count, max_output_estimate)?;
+
+    // Linear-time forward DFA pre-check: if no matches exist anywhere, return input in O(n)
+    let mut fwd_cache = plan.fwd_dfa.create_cache();
+    let fwd_input = Input::new(input_text);
+    tracker.charge_scanned(input_text.len() as u64)?;
+    tracker.charge_transitions(input_text.len() as u64)?;
+
+    let has_any_match = plan
+        .fwd_dfa
+        .try_search_fwd(&mut fwd_cache, &fwd_input)
+        .map_err(|e| RegexError::SyntaxError(e.to_string()))?;
+
+    if has_any_match.is_none() {
+        return Ok(input_text.to_string());
+    }
+
     let mut caps = plan.dfa.create_captures();
     let mut cache = plan.dfa.create_cache();
     let mut out = String::new();

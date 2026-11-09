@@ -1,3 +1,15 @@
+//! Bounded DFA regex engine with linear work envelope guarantees.
+//!
+//! # Examples
+//!
+//! ```rust
+//! use lust::regex::BoundedRegex;
+//!
+//! let re = BoundedRegex::new("hello [a-z]+").unwrap();
+//! assert!(re.is_match("hello world").unwrap());
+//! assert!(!re.is_match("hello 123").unwrap());
+//! ```
+
 pub mod compile;
 pub mod execute;
 pub mod plan;
