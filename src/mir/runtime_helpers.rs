@@ -25,7 +25,7 @@ pub extern "C" fn lust_mir_charge_gas(amt: i64) -> i64 {
     let cur = GAS_REMAINING.fetch_sub(amt, Ordering::SeqCst);
     let rem = cur - amt;
     if rem < 0 {
-        LAST_STATUS.store(1, Ordering::SeqCst);
+        LAST_STATUS.store(crate::effect_abi::LUST_STATUS_ERR_OUT_OF_GAS as i64, Ordering::SeqCst);
     }
     rem
 }

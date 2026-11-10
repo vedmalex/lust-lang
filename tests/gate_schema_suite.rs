@@ -516,7 +516,7 @@ fn test_gate_schema_04_opt_in_dce_authority() {
 fn test_gate_schema_05_backend_effect_cost_parity() {
     use lust::ast::ItemKind;
     use lust::bytecode::Value;
-    use lust::effect_abi::{Cause, Exit, InterruptReason};
+    use lust::effect_abi::LUST_STATUS_ERR_OUT_OF_GAS;
     use lust::intern::Interner;
     use lust::lexer::Lexer;
     use lust::mir::cranelift_backend::jit_engine::{
@@ -525,26 +525,28 @@ fn test_gate_schema_05_backend_effect_cost_parity() {
     };
     use lust::mir::ir::MirModule;
     use lust::mir::lowering::AstLowering;
-    use lust::mir::vm_backend::MirToBytecodeCompiler;
     use lust::parser::Parser;
     use lust::vm::VM;
 
-    // The same Lust program, including one Effect that can fail:
-    // Declares an effect signature `! string`, allocates an array `[10, 20, 30]`,
-    // runs a loop consuming gas and allocations, and has an explicit failure branch (`fail_flag != 0`).
+    // The Lust program runs a real effect handler:
+    // Declares an effect signature `! string`, constructs a real effect block via `effect do ... end`,
+    // and executes it via `.run_sync()`.
     let program_src = r#"
         function compute_with_effect(n: int, fail_flag: int): int ! string
-            if fail_flag != 0 then
-                return -1
+            local eff = effect do
+                if fail_flag != 0 then
+                    return -1
+                end
+                local arr = [10, 20, 30]
+                local sum: int = 0
+                local i: int = 0
+                while i < n do
+                    sum = sum + arr[0]:unwrap()
+                    i = i + 1
+                end
+                return sum
             end
-            local arr = [10, 20, 30]
-            local sum: int = 0
-            local i: int = 0
-            while i < n do
-                sum = sum + arr[0]
-                i = i + 1
-            end
-            return sum
+            return eff:run_sync()
         end
     "#;
 
@@ -553,71 +555,35 @@ fn test_gate_schema_05_backend_effect_cost_parity() {
     let mut parser = Parser::from_lexer(&mut lexer).expect("lexer must tokenize program");
     let items = parser.parse().expect("parser must parse program items");
 
-    let mut mir_fn = None;
+    let mut func_def_opt = None;
     for item in &items {
         if let ItemKind::Function(func_def) = &item.kind {
-            mir_fn = Some(AstLowering::lower_function(func_def).expect("lowering to MIR must succeed"));
+            func_def_opt = Some(func_def.clone());
             break;
         }
     }
-    let mir_fn = mir_fn.expect("Function compute_with_effect must be parsed and lowered");
-    let mut module = MirModule::new("gate05_parity_mod".into());
-    module.add_function(mir_fn.clone());
+    let func_def = func_def_opt.expect("Function compute_with_effect must be parsed");
 
     // ------------------------------------------------------------------------
     // Backend 1: Bytecode VM
-    // A backend that cannot run must fail the test, not be skipped.
+    // Runs the Lust program with the real effect handler.
     // ------------------------------------------------------------------------
-    let bytecode_fn = MirToBytecodeCompiler::compile(&mir_fn)
-        .expect("Bytecode VM backend must compile MIR function");
+    let mut compiler = lust::Compiler::new();
+    let bytecode_fns = compiler.compile_module(&items)
+        .expect("Bytecode VM backend must compile program with effect handler");
     let mut vm = VM::new();
-    vm.load_functions(vec![bytecode_fn]);
+    vm.load_functions(bytecode_fns);
 
-    // ------------------------------------------------------------------------
-    // Backend 2: Cranelift Backend
-    // A backend that cannot run must fail the test, not be skipped.
-    // ------------------------------------------------------------------------
-    let mut jit = CraneliftJitCompiler::new()
-        .expect("Cranelift JIT backend must initialize");
-    let code_ptr = jit.compile_function(&mir_fn)
-        .expect("Cranelift JIT backend must compile MIR function");
-    let clif_func: extern "C" fn(i64, i64) -> i64 = unsafe { core::mem::transmute(code_ptr) };
-
-    // ------------------------------------------------------------------------
-    // 1. The same Lust program, including one Effect that can fail, produces
-    //    the same result on the bytecode VM and on the Cranelift backend.
-    // ------------------------------------------------------------------------
-    // 1a. Successful execution parity: n = 5, fail_flag = 0 -> returns 50 (5 * arr[0]=10)
-    lust_mir_set_gas(1_000_000);
-    lust_mir_set_status(0);
-    let clif_success = clif_func(5, 0);
-
-    vm.clear_gas_budget();
     let vm_success_val = vm.call("compute_with_effect", vec![Value::Int(5), Value::Int(0)])
         .expect("Bytecode VM execution of compute_with_effect must succeed");
     let vm_success = match vm_success_val {
         Value::Int(v) => v,
         other => panic!("Bytecode VM returned unexpected value: {:?}", other),
     };
-
     assert_eq!(
         vm_success, 50,
         "Bytecode VM must produce expected result 50 on success path"
     );
-    assert_eq!(
-        clif_success, 50,
-        "Cranelift backend must produce expected result 50 on success path"
-    );
-    assert_eq!(
-        vm_success, clif_success,
-        "Bytecode VM and Cranelift backend must produce identical results on success path: VM={}, Cranelift={}",
-        vm_success, clif_success
-    );
-
-    // 1b. Failure execution parity: n = 5, fail_flag = 1 -> returns -1
-    lust_mir_set_gas(1_000_000);
-    lust_mir_set_status(0);
-    let clif_fail = clif_func(5, 1);
 
     let vm_fail_val = vm.call("compute_with_effect", vec![Value::Int(5), Value::Int(1)])
         .expect("Bytecode VM execution of compute_with_effect failure branch must return value");
@@ -625,26 +591,81 @@ fn test_gate_schema_05_backend_effect_cost_parity() {
         Value::Int(v) => v,
         other => panic!("Bytecode VM returned unexpected value: {:?}", other),
     };
-
     assert_eq!(
         vm_fail, -1,
         "Bytecode VM must produce expected failure result -1"
     );
+
+    // ------------------------------------------------------------------------
+    // Backend 2: Cranelift Backend
+    // A backend that cannot run must fail the test, not be skipped.
+    // Lower function into MIR (preserving `! string`).
+    // If Cranelift cannot run the handler, the test must fail.
+    // ------------------------------------------------------------------------
+    let mir_fn = match AstLowering::lower_function(&func_def) {
+        Ok(func) => {
+            assert!(
+                func.signature.effects.is_some(),
+                "MIR lowering must not drop effect signature (! string)"
+            );
+            func
+        }
+        Err(err) => {
+            panic!(
+                "Gate-SCHEMA-05 FAIL: Cranelift backend cannot run effect handler (MIR lowering failed: {err}). \
+                 Per RFC §13 Acceptance Gates, a gate that cannot be exercised must fail the test with an explicit message."
+            );
+        }
+    };
+
+    let mut module = MirModule::new("gate05_parity_mod".into());
+    module.add_function(mir_fn.clone());
+
+    let mut jit = CraneliftJitCompiler::new()
+        .expect("Cranelift JIT backend must initialize");
+    let code_ptr = match jit.compile_function(&mir_fn) {
+        Ok(ptr) => ptr,
+        Err(err) => {
+            panic!(
+                "Gate-SCHEMA-05 FAIL: Cranelift backend cannot run effect handler (Cranelift JIT compilation failed: {err}). \
+                 Per RFC §13 Acceptance Gates, a gate that cannot be exercised must fail the test with an explicit message."
+            );
+        }
+    };
+    let clif_func: extern "C" fn(i64, i64) -> i64 = unsafe { core::mem::transmute(code_ptr) };
+
+    // Cranelift parity checks (if Cranelift could compile and run the handler):
+    lust_mir_set_gas(1_000_000);
+    lust_mir_set_status(0);
+    let clif_success = clif_func(5, 0);
+    assert_eq!(
+        clif_success, 50,
+        "Cranelift backend must produce expected result 50 on success path"
+    );
+    assert_eq!(
+        vm_success, clif_success,
+        "Bytecode VM and Cranelift backend must produce identical results on success path"
+    );
+
+    lust_mir_set_gas(1_000_000);
+    lust_mir_set_status(0);
+    let clif_fail = clif_func(5, 1);
     assert_eq!(
         clif_fail, -1,
         "Cranelift backend must produce expected failure result -1"
     );
     assert_eq!(
         vm_fail, clif_fail,
-        "Bytecode VM and Cranelift backend must produce identical results on failure branch: VM={}, Cranelift={}",
-        vm_fail, clif_fail
+        "Bytecode VM and Cranelift backend must produce identical results on failure branch"
     );
 
     // ------------------------------------------------------------------------
     // 2. Interrupting that effect on each backend yields the same error and
     //    does not return a success value.
+    //    Delete hardcoded Exit literals. Assert on the error each backend actually returns.
+    //    Cranelift must not look successful by returning 0 while a side status flag is interpreted.
     // ------------------------------------------------------------------------
-    let expected_success_val: i64 = 10_000; // n = 1000 -> 1000 * 10 = 10000
+    let expected_success_val: i64 = 10_000;
 
     // Interrupt Bytecode VM via constrained gas budget
     vm.set_gas_budget(2);
@@ -663,7 +684,6 @@ fn test_gate_schema_05_backend_effect_cost_parity() {
         "Bytecode VM error must indicate gas exhaustion or interruption: {}",
         vm_err_str
     );
-    let vm_exit: Exit<i64, InterruptReason> = Exit::Failure(Cause::Interrupted(InterruptReason::OutOfGas));
 
     // Interrupt Cranelift backend via constrained gas budget
     lust_mir_set_gas(2);
@@ -677,33 +697,30 @@ fn test_gate_schema_05_backend_effect_cost_parity() {
         "Cranelift backend must not return a success value when interrupted (returned {})",
         clif_interrupt_val
     );
+    assert_ne!(
+        clif_interrupt_val, 0,
+        "Cranelift backend must not return 0 (looking successful) on gas exhaustion",
+    );
+    assert_eq!(
+        clif_interrupt_val, -(LUST_STATUS_ERR_OUT_OF_GAS as i64),
+        "Cranelift backend must return negative out-of-gas status code on gas exhaustion",
+    );
+    assert_eq!(
+        clif_status, LUST_STATUS_ERR_OUT_OF_GAS as i64,
+        "Cranelift status flag must record LUST_STATUS_ERR_OUT_OF_GAS (status={})",
+        clif_status
+    );
     assert!(
-        clif_gas_rem < 0 || clif_status != 0,
-        "Cranelift backend must record gas exhaustion or error status when interrupted (gas_rem={}, status={})",
-        clif_gas_rem, clif_status
-    );
-    let clif_exit: Exit<i64, InterruptReason> = Exit::Failure(Cause::Interrupted(InterruptReason::OutOfGas));
-
-    // Assert both backends yield the same error and neither returns success
-    assert_eq!(
-        vm_exit, clif_exit,
-        "Interrupting the effect on both backends must yield identical canonical error: VM={:?}, Cranelift={:?}",
-        vm_exit, clif_exit
-    );
-    assert!(!vm_exit.is_success(), "Bytecode VM exit must not be success");
-    assert!(!clif_exit.is_success(), "Cranelift backend exit must not be success");
-    assert_eq!(
-        vm_exit.status_code(),
-        clif_exit.status_code(),
-        "Canonical status codes must match on interruption"
+        clif_gas_rem < 0,
+        "Cranelift backend must record gas exhaustion (gas_rem={})",
+        clif_gas_rem
     );
 
     // ------------------------------------------------------------------------
     // 3. A counted allocation or gas budget is the same order on both backends
     //    for that program: the larger figure is at most 2x the smaller one.
-    //    Print both figures in the assertion message.
+    //    Print both figures in the assertion message. Keep dynamic allocation counts.
     // ------------------------------------------------------------------------
-    // Measure counted allocation on Bytecode VM
     vm.clear_gas_budget();
     vm.set_memory_budget_bytes(1024 * 1024).expect("memory budget config must succeed");
     vm.reset_memory_counter().expect("memory counter reset must succeed");
@@ -711,7 +728,6 @@ fn test_gate_schema_05_backend_effect_cost_parity() {
         .expect("VM execution for allocation measurement must succeed");
     let vm_allocated_bytes = vm.memory_used_bytes();
 
-    // Measure counted allocation on Cranelift backend
     lust_mir_set_gas(1_000_000);
     lust_mir_set_status(0);
     let clif_mem_before = lust_mir_get_memory_used();
@@ -954,6 +970,7 @@ fn test_gate_schema_11_callable_semantics() {
             param_types: vec![],
             return_type: MirType::Int,
             is_public: true,
+            effects: None,
         },
         Span::dummy(),
     );

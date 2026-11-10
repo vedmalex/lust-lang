@@ -96,6 +96,7 @@ fn test_pure_math_array_no_bloat() {
             param_types: vec![MirType::Int],
             return_type: MirType::Int,
             is_public: true,
+            effects: None,
         },
         Span::dummy(),
     );

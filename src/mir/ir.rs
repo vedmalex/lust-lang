@@ -36,6 +36,10 @@ pub enum MirType {
         params: Vec<MirType>,
         return_type: Box<MirType>,
     },
+    Effect {
+        return_type: Box<MirType>,
+        error_type: Box<MirType>,
+    },
     Unknown,
 }
 
@@ -70,6 +74,9 @@ impl fmt::Display for MirType {
                     write!(f, "{p}")?;
                 }
                 write!(f, ") -> {return_type}")
+            }
+            MirType::Effect { return_type, error_type } => {
+                write!(f, "Effect<{return_type}, {error_type}>")
             }
             MirType::Unknown => write!(f, "unknown"),
         }
@@ -358,6 +365,7 @@ pub struct FunctionSignature {
     pub param_types: Vec<MirType>,
     pub return_type: MirType,
     pub is_public: bool,
+    pub effects: Option<crate::ast::ReturnSpec>,
 }
 
 #[derive(Debug, Clone, PartialEq)]

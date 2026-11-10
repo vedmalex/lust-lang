@@ -180,6 +180,7 @@ impl<'a> AstLowering<'a> {
                 .map(mir_type_from_ast)
                 .unwrap_or(MirType::Unit),
             is_public: true,
+            effects: func_def.effects.clone(),
         };
 
         // Create MirFunction with default entry block
@@ -224,6 +225,7 @@ impl<'a> AstLowering<'a> {
             param_types: vec![],
             return_type: MirType::Unit,
             is_public: true,
+            effects: None,
         };
 
         let mut mir_fn = MirFunction::new(sig, crate::ast::Span::dummy());
@@ -1815,6 +1817,10 @@ pub fn mir_type_from_ast(ty: &Type) -> MirType {
         }
         TypeKind::Option(_) => MirType::Enum("Option".to_string()),
         TypeKind::Result(_, _) => MirType::Enum("Result".to_string()),
+        TypeKind::Effect { success, error, .. } => MirType::Effect {
+            return_type: Box::new(mir_type_from_ast(success)),
+            error_type: Box::new(mir_type_from_ast(error)),
+        },
         _ => MirType::Int,
     }
 }

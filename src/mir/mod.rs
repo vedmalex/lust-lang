@@ -38,6 +38,7 @@ mod tests {
             param_types: vec![MirType::Int],
             return_type: MirType::Int,
             is_public: true,
+            effects: None,
         };
 
         let mut func = MirFunction::new(sig, Span::dummy());
@@ -84,6 +85,7 @@ mod tests {
             param_types: vec![],
             return_type: MirType::Unit,
             is_public: true,
+            effects: None,
         };
 
         let mut func = MirFunction::new(sig, Span::dummy());
@@ -105,6 +107,7 @@ mod tests {
             param_types: vec![],
             return_type: MirType::Unit,
             is_public: true,
+            effects: None,
         };
 
         let mut func = MirFunction::new(sig, Span::dummy());
@@ -126,6 +129,7 @@ mod tests {
             param_types: vec![],
             return_type: MirType::Int,
             is_public: true,
+            effects: None,
         };
 
         let mut func = MirFunction::new(sig, Span::dummy());
@@ -746,6 +750,7 @@ mod tests {
                 param_types: vec![MirType::Int, MirType::Int],
                 return_type: MirType::Int,
                 is_public: true,
+            effects: None,
             };
             let mut func = MirFunction::new(sig, Span::dummy());
             let arg0 = func.params[0];
@@ -801,6 +806,7 @@ mod tests {
                 param_types: vec![MirType::Int, MirType::Int],
                 return_type: MirType::Int,
                 is_public: true,
+            effects: None,
             };
             let mut func = MirFunction::new(sig, Span::dummy());
             let arg0 = func.params[0];
@@ -838,6 +844,7 @@ mod tests {
             param_types: vec![MirType::Int],
             return_type: MirType::Int,
             is_public: true,
+            effects: None,
         };
         let mut func = MirFunction::new(sig, Span::dummy());
         let arg0 = func.params[0];
@@ -883,6 +890,7 @@ mod tests {
                 param_types: vec![MirType::Int, MirType::Int],
                 return_type: MirType::Int,
                 is_public: true,
+            effects: None,
             };
             let mut func = MirFunction::new(sig, Span::dummy());
             let arg0 = func.params[0];
@@ -915,6 +923,7 @@ mod tests {
             param_types: vec![MirType::Int],
             return_type: MirType::Int,
             is_public: true,
+            effects: None,
         };
         let mut func = MirFunction::new(sig, Span::dummy());
         let arg0 = func.params[0];
@@ -1054,6 +1063,7 @@ mod tests {
             param_types: vec![MirType::Int, MirType::Int],
             return_type: MirType::Int,
             is_public: true,
+            effects: None,
         };
         let mut func = MirFunction::new(sig, Span::dummy());
         let a = func.params[0];
@@ -1169,6 +1179,7 @@ mod tests {
             param_types: vec![MirType::Int, MirType::Int],
             return_type: MirType::Int,
             is_public: true,
+            effects: None,
         };
         let mut func = MirFunction::new(sig, Span::dummy());
         let a = func.params[0];
@@ -1229,6 +1240,7 @@ mod tests {
             param_types: vec![MirType::Int],
             return_type: MirType::Int,
             is_public: true,
+            effects: None,
         };
         let mut func = MirFunction::new(sig, Span::dummy());
         let temp = func.add_local(Some("temp".into()), MirType::String, true, Span::dummy());
@@ -1434,6 +1446,7 @@ mod tests {
             param_types: vec![MirType::Int],
             return_type: MirType::Int,
             is_public: true,
+            effects: None,
         };
         let mut func = MirFunction::new(sig, Span::dummy());
         let arg0 = func.params[0];

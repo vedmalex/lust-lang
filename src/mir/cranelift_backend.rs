@@ -458,8 +458,13 @@ pub mod jit_engine {
 
                 builder.switch_to_block(emergency_exit_bb);
                 if ret_clif_ty != types::I8 || mir_fn.signature.return_type != MirType::Unit {
-                    let ret_val = builder.ins().iconst(ret_clif_ty, 0);
-                    builder.ins().return_(&[ret_val]);
+                    let stat_call = builder.ins().call(status_fn, &[]);
+                    let stat_val = builder.inst_results(stat_call)[0];
+                    let is_zero = builder.ins().icmp_imm_s(IntCC::Equal, stat_val, 0);
+                    let default_err = builder.ins().iconst(types::I64, -(crate::effect_abi::LUST_STATUS_ERR_OUT_OF_GAS as i64));
+                    let neg_stat = builder.ins().ineg(stat_val);
+                    let err_code = builder.ins().select(is_zero, default_err, neg_stat);
+                    builder.ins().return_(&[err_code]);
                 } else {
                     builder.ins().return_(&[]);
                 }
@@ -482,7 +487,7 @@ pub mod jit_engine {
             MirType::Int => types::I64,
             MirType::Float => types::F64,
             MirType::Bool => types::I8,
-            MirType::Array(_) | MirType::Tuple(_) | MirType::Struct(_) => types::I64,
+            MirType::Array(_) | MirType::Tuple(_) | MirType::Struct(_) | MirType::Effect { .. } => types::I64,
             _ => types::I64,
         }
     }

@@ -121,6 +121,7 @@ mod tests {
             param_types: vec![],
             return_type: MirType::Int,
             is_public: true,
+            effects: None,
         };
 
         let mut func = MirFunction::new(sig, Span::dummy());
