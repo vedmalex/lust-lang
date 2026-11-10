@@ -13,13 +13,17 @@ use super::RxError;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ParticipantId(pub u64);
 
+#[derive(Default)]
+struct ScopeRegistry {
+    participants: HashMap<u64, Vec<ParticipantId>>,
+    closed_scopes: HashSet<u64>,
+}
+
 /// Tracks active participants per scope to guarantee zero lingering callbacks on join.
 #[derive(Default)]
 pub struct ScopeJoinCoordinator {
     next_id: AtomicU64,
-    // scope_id -> set of active participants
-    participants: Mutex<HashMap<u64, Vec<ParticipantId>>>,
-    closed_scopes: Mutex<HashSet<u64>>,
+    registry: Mutex<ScopeRegistry>,
     condvar: Condvar,
 }
 
@@ -27,68 +31,37 @@ impl ScopeJoinCoordinator {
     pub fn new() -> Self {
         Self {
             next_id: AtomicU64::new(1),
-            participants: Mutex::new(HashMap::new()),
-            closed_scopes: Mutex::new(HashSet::new()),
+            registry: Mutex::new(ScopeRegistry::default()),
             condvar: Condvar::new(),
         }
     }
 
     /// Register a new active participant for a given scope.
-    /// Fails closed if admission has already been closed for this scope.
+    /// Fails closed atomically if admission has already been closed for this scope.
     pub fn register_participant(&self, scope_id: u64) -> Result<ParticipantId, RxError> {
-        let closed = self.closed_scopes.lock().unwrap();
-        if closed.contains(&scope_id) {
+        let mut reg = self.registry.lock().unwrap();
+        if reg.closed_scopes.contains(&scope_id) {
             return Err(RxError::Cancelled);
         }
         let id = ParticipantId(self.next_id.fetch_add(1, Ordering::SeqCst));
-        let mut map = self.participants.lock().unwrap();
-        map.entry(scope_id).or_default().push(id);
+        reg.participants.entry(scope_id).or_default().push(id);
         Ok(id)
     }
 
-    /// Close admission for a scope so that no new participants can register.
+    /// Close admission for a scope atomically so that no new participants can register.
     pub fn close_admission(&self, scope_id: u64) {
-        let mut closed = self.closed_scopes.lock().unwrap();
-        closed.insert(scope_id);
+        let mut reg = self.registry.lock().unwrap();
+        reg.closed_scopes.insert(scope_id);
     }
 
     /// Atomically close admission and wait until all registered participants have exited.
     pub fn close_and_wait_quiescent(&self, scope_id: u64, timeout: Option<Duration>) -> bool {
-        self.close_admission(scope_id);
-        self.wait_for_quiescence(scope_id, timeout)
-    }
+        let mut reg = self.registry.lock().unwrap();
+        reg.closed_scopes.insert(scope_id);
 
-    /// Acknowledge that a participant has completely exited.
-    pub fn acknowledge_exit(&self, scope_id: u64, participant_id: ParticipantId) {
-        let mut map = self.participants.lock().unwrap();
-        if let Some(list) = map.get_mut(&scope_id) {
-            list.retain(|&p| p != participant_id);
-            if list.is_empty() {
-                map.remove(&scope_id);
-            }
-        }
-        self.condvar.notify_all();
-    }
-
-    /// Return count of currently active participants for a scope.
-    pub fn active_participants(&self, scope_id: u64) -> usize {
-        let map = self.participants.lock().unwrap();
-        map.get(&scope_id).map_or(0, |list| list.len())
-    }
-
-    /// Check if admission has been closed for a scope.
-    pub fn is_admission_closed(&self, scope_id: u64) -> bool {
-        let closed = self.closed_scopes.lock().unwrap();
-        closed.contains(&scope_id)
-    }
-
-    /// Block or wait until all participants for the given scope have exited.
-    pub fn wait_for_quiescence(&self, scope_id: u64, timeout: Option<Duration>) -> bool {
-        let mut map = self.participants.lock().unwrap();
         let start = std::time::Instant::now();
-
         loop {
-            let active = map.get(&scope_id).map_or(0, |l| l.len());
+            let active = reg.participants.get(&scope_id).map_or(0, |l| l.len());
             if active == 0 {
                 return true;
             }
@@ -99,13 +72,72 @@ impl ScopeJoinCoordinator {
                     return false;
                 }
                 let remaining = limit - elapsed;
-                let (new_map, wait_res) = self.condvar.wait_timeout(map, remaining).unwrap();
-                map = new_map;
+                let (new_reg, wait_res) = self.condvar.wait_timeout(reg, remaining).unwrap();
+                reg = new_reg;
                 if wait_res.timed_out() {
-                    return map.get(&scope_id).map_or(0, |l| l.len()) == 0;
+                    return reg.participants.get(&scope_id).map_or(0, |l| l.len()) == 0;
                 }
             } else {
-                map = self.condvar.wait(map).unwrap();
+                reg = self.condvar.wait(reg).unwrap();
+            }
+        }
+    }
+
+    /// Acknowledge that a participant has completely exited.
+    pub fn acknowledge_exit(&self, scope_id: u64, participant_id: ParticipantId) {
+        let mut reg = self.registry.lock().unwrap();
+        if let Some(list) = reg.participants.get_mut(&scope_id) {
+            list.retain(|&p| p != participant_id);
+            if list.is_empty() {
+                reg.participants.remove(&scope_id);
+            }
+        }
+        self.condvar.notify_all();
+    }
+
+    /// Return count of currently active participants for a scope.
+    pub fn active_participants(&self, scope_id: u64) -> usize {
+        let reg = self.registry.lock().unwrap();
+        reg.participants.get(&scope_id).map_or(0, |list| list.len())
+    }
+
+    /// Check if admission has been closed for a scope.
+    pub fn is_admission_closed(&self, scope_id: u64) -> bool {
+        let reg = self.registry.lock().unwrap();
+        reg.closed_scopes.contains(&scope_id)
+    }
+
+    /// Retire scope from registry to bound historical records.
+    pub fn retire_scope(&self, scope_id: u64) {
+        let mut reg = self.registry.lock().unwrap();
+        reg.closed_scopes.remove(&scope_id);
+        reg.participants.remove(&scope_id);
+    }
+
+    /// Block or wait until all participants for the given scope have exited.
+    pub fn wait_for_quiescence(&self, scope_id: u64, timeout: Option<Duration>) -> bool {
+        let mut reg = self.registry.lock().unwrap();
+        let start = std::time::Instant::now();
+
+        loop {
+            let active = reg.participants.get(&scope_id).map_or(0, |l| l.len());
+            if active == 0 {
+                return true;
+            }
+
+            if let Some(limit) = timeout {
+                let elapsed = start.elapsed();
+                if elapsed >= limit {
+                    return false;
+                }
+                let remaining = limit - elapsed;
+                let (new_reg, wait_res) = self.condvar.wait_timeout(reg, remaining).unwrap();
+                reg = new_reg;
+                if wait_res.timed_out() {
+                    return reg.participants.get(&scope_id).map_or(0, |l| l.len()) == 0;
+                }
+            } else {
+                reg = self.condvar.wait(reg).unwrap();
             }
         }
     }

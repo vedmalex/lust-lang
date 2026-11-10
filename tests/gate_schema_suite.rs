@@ -2001,9 +2001,307 @@ fn test_gate_schema_11_callable_semantics() {
 // ============================================================================
 #[test]
 fn test_gate_schema_12_rx_lifecycle_backpressure() {
-    // Required by contract: A gate that cannot be exercised MUST fail the test
-    // with an explicit message, not pass as a stub.
-    panic!("Gate-SCHEMA-12 cannot be exercised: Rx lifecycle/backpressure scheduler not implemented in engine");
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+
+    use lust::rx::{
+        interval, BoundedQueue, BufferOptions, ExitStatus, Observable, Observer, OverflowStrategy,
+        RxError, RxScheduler,
+    };
+
+    // ------------------------------------------------------------------------
+    // Part 1: Full Operator Pipeline (map, filter, take)
+    // Pipeline: [1..=6] -> map(*2) -> filter(divisible by 4) -> take(2) yields [4, 8]
+    // ------------------------------------------------------------------------
+    {
+        let scheduler = Arc::new(RxScheduler::new_virtual());
+        let scope_id = 1201;
+
+        let received = Arc::new(Mutex::new(Vec::new()));
+        let completed = Arc::new(AtomicBool::new(false));
+        let failed = Arc::new(AtomicBool::new(false));
+
+        let r_clone = received.clone();
+        let c_clone = completed.clone();
+        let f_clone = failed.clone();
+
+        let observer = Observer::new(
+            move |item: i64| {
+                r_clone.lock().unwrap().push(item);
+                Ok(())
+            },
+            move || {
+                c_clone.store(true, Ordering::SeqCst);
+            },
+            move |_: RxError<String>| {
+                f_clone.store(true, Ordering::SeqCst);
+            },
+        );
+
+        let pipeline = Observable::<i64, String>::from_iter(vec![1, 2, 3, 4, 5, 6])
+            .map(|x| x * 2)
+            .filter(|x| x % 4 == 0)
+            .take(2);
+
+        let sub = pipeline
+            .subscribe(
+                observer,
+                scope_id,
+                BufferOptions::default_bounded(),
+                scheduler.clone(),
+            )
+            .expect("Subscribe must succeed");
+
+        scheduler.run_until_quiescent(100);
+
+        let completion = sub
+            .join(Some(Duration::from_millis(100)))
+            .expect("Join must succeed");
+        assert_eq!(completion.exit, ExitStatus::Completed);
+        assert_eq!(completion.items_delivered, 2);
+        assert_eq!(*received.lock().unwrap(), vec![4, 8]);
+        assert!(completed.load(Ordering::SeqCst));
+        assert!(!failed.load(Ordering::SeqCst));
+    }
+
+    // ------------------------------------------------------------------------
+    // Part 2: Dual-Capacity Bounded Queue & Rejection
+    // ------------------------------------------------------------------------
+    {
+        use lust::rx::EnqueueResult;
+
+        #[derive(Debug, Clone, PartialEq, Eq)]
+        struct Payload(usize);
+        impl lust::rx::MeasurableItem for Payload {
+            fn charged_bytes(&self) -> usize {
+                self.0
+            }
+        }
+
+        let opts = BufferOptions::new(2, 8, 1, 4, OverflowStrategy::Fail).unwrap();
+        let mut q: BoundedQueue<Payload> = BoundedQueue::new(opts);
+
+        assert_eq!(q.try_enqueue(Payload(4)), EnqueueResult::Enqueued);
+        assert_eq!(q.try_enqueue(Payload(4)), EnqueueResult::Enqueued);
+        // Byte and item capacity reached (2 items, 8 bytes). Next item fails backpressure.
+        assert_eq!(
+            q.try_enqueue(Payload(1)),
+            EnqueueResult::OverflowError
+        );
+
+        // Single oversized item rejection
+        let opts_large = BufferOptions::new(10, 8, 1, 4, OverflowStrategy::Fail).unwrap();
+        let mut q_large: BoundedQueue<Payload> = BoundedQueue::new(opts_large);
+        assert_eq!(
+            q_large.try_enqueue(Payload(9)),
+            EnqueueResult::ItemTooLarge
+        );
+    }
+
+    // ------------------------------------------------------------------------
+    // Part 3: Scope Cancellation & Zero Lingering Callbacks
+    // ------------------------------------------------------------------------
+    {
+        let scheduler = Arc::new(RxScheduler::new_virtual());
+        let scope_id = 1203;
+
+        let received = Arc::new(Mutex::new(Vec::new()));
+        let completed = Arc::new(AtomicBool::new(false));
+        let failed = Arc::new(AtomicBool::new(false));
+
+        let r_clone = received.clone();
+        let c_clone = completed.clone();
+        let f_clone = failed.clone();
+
+        let observer = Observer::new(
+            move |item: i64| {
+                r_clone.lock().unwrap().push(item);
+                Ok(())
+            },
+            move || {
+                c_clone.store(true, Ordering::SeqCst);
+            },
+            move |_: RxError<String>| {
+                f_clone.store(true, Ordering::SeqCst);
+            },
+        );
+
+        let stream: Observable<i64, String> = Observable::from_producer(move |control| {
+            for i in 0..100 {
+                if !control.is_active() {
+                    break;
+                }
+                if let Err(_) = control.deliver_next(i) {
+                    break;
+                }
+            }
+            control.complete();
+            Ok(())
+        });
+
+        let sub = stream
+            .subscribe(
+                observer,
+                scope_id,
+                BufferOptions::default_bounded(),
+                scheduler.clone(),
+            )
+            .unwrap();
+
+        // Cancel subscription before running scheduler
+        sub.cancel();
+
+        scheduler.run_until_quiescent(100);
+
+        let completion = sub.join(Some(Duration::from_millis(100))).unwrap();
+        assert_eq!(completion.exit, ExitStatus::Cancelled);
+        assert!(!completed.load(Ordering::SeqCst));
+        assert!(!failed.load(Ordering::SeqCst));
+        assert_eq!(received.lock().unwrap().len(), 0);
+    }
+
+    // ------------------------------------------------------------------------
+    // Part 4: Self-Unsubscribe & Deadlock Prevention (SelfJoin)
+    // ------------------------------------------------------------------------
+    {
+        let scheduler = Arc::new(RxScheduler::new_virtual());
+        let scope_id = 1204;
+
+        let received = Arc::new(Mutex::new(Vec::new()));
+        let self_join_detected = Arc::new(AtomicBool::new(false));
+        let sub_holder: Arc<Mutex<Option<lust::rx::Subscription<i64, String>>>> =
+            Arc::new(Mutex::new(None));
+
+        let r_clone = received.clone();
+        let sub_clone = sub_holder.clone();
+        let sj_clone = self_join_detected.clone();
+
+        let observer = Observer::new(
+            move |item: i64| {
+                r_clone.lock().unwrap().push(item);
+                if item == 2 {
+                    if let Some(ref s) = *sub_clone.lock().unwrap() {
+                        if let Err(RxError::SelfJoin) = s.join(Some(Duration::from_millis(10))) {
+                            sj_clone.store(true, Ordering::SeqCst);
+                        }
+                        s.cancel();
+                    }
+                }
+                Ok(())
+            },
+            || {},
+            |_: RxError<String>| {},
+        );
+
+        let stream: Observable<i64, String> =
+            Observable::from_iter(vec![1, 2, 3, 4, 5]);
+        let sub = stream
+            .subscribe(
+                observer,
+                scope_id,
+                BufferOptions::default_bounded(),
+                scheduler.clone(),
+            )
+            .unwrap();
+
+        *sub_holder.lock().unwrap() = Some(sub.clone());
+
+        scheduler.run_until_quiescent(100);
+
+        assert!(self_join_detected.load(Ordering::SeqCst));
+        assert_eq!(*received.lock().unwrap(), vec![1, 2]);
+
+        let completion = sub.join(Some(Duration::from_millis(100))).unwrap();
+        assert_eq!(completion.exit, ExitStatus::Cancelled);
+    }
+
+    // ------------------------------------------------------------------------
+    // Part 5: Virtual Clock Interval & Cancellation
+    // ------------------------------------------------------------------------
+    {
+        let scheduler = Arc::new(RxScheduler::new_virtual());
+        let scope_id = 1205;
+
+        let ticks = Arc::new(Mutex::new(Vec::new()));
+        let t_clone = ticks.clone();
+
+        let observer: Observer<i64, String> = Observer::from_next(move |val: i64| {
+            t_clone.lock().unwrap().push(val);
+            Ok(())
+        });
+
+        let stream = interval::<String>(Duration::from_millis(100), scheduler.clone());
+        let sub = stream
+            .subscribe(
+                observer,
+                scope_id,
+                BufferOptions::default_bounded(),
+                scheduler.clone(),
+            )
+            .unwrap();
+
+        scheduler.drain_ready();
+        scheduler.advance_and_drain(Duration::from_millis(100)); // tick 0
+        scheduler.advance_and_drain(Duration::from_millis(100)); // tick 1
+        scheduler.advance_and_drain(Duration::from_millis(100)); // tick 2
+        scheduler.advance_and_drain(Duration::from_millis(50));  // 350ms total
+
+        assert_eq!(*ticks.lock().unwrap(), vec![0, 1, 2]);
+
+        sub.cancel();
+        scheduler.advance_and_drain(Duration::from_millis(500));
+        assert_eq!(*ticks.lock().unwrap(), vec![0, 1, 2]);
+
+        let completion = sub.join(Some(Duration::from_millis(100))).unwrap();
+        assert_eq!(completion.exit, ExitStatus::Cancelled);
+    }
+
+    // ------------------------------------------------------------------------
+    // Part 6: Terminal Error Protocol Idempotence
+    // ------------------------------------------------------------------------
+    {
+        let scheduler = Arc::new(RxScheduler::new_virtual());
+        let scope_id = 1206;
+
+        let fail_count = Arc::new(AtomicUsize::new(0));
+        let fc = fail_count.clone();
+
+        let observer = Observer::new(
+            |_: i64| Ok(()),
+            || panic!("Must not complete on error"),
+            move |err: RxError<String>| {
+                fc.fetch_add(1, Ordering::SeqCst);
+                assert_eq!(err, RxError::Source("simulated error".to_string()));
+            },
+        );
+
+        let stream = Observable::from_producer(|control| {
+            control.deliver_next(1)?;
+            control.fail(RxError::Source("simulated error".to_string()));
+            control.fail(RxError::Source("duplicate error".to_string()));
+            control.complete();
+            Ok(())
+        });
+
+        let sub = stream
+            .subscribe(
+                observer,
+                scope_id,
+                BufferOptions::default_bounded(),
+                scheduler.clone(),
+            )
+            .unwrap();
+
+        scheduler.run_until_quiescent(100);
+
+        let completion = sub.join(Some(Duration::from_millis(100))).unwrap();
+        assert_eq!(
+            completion.exit,
+            ExitStatus::Failed(RxError::Source("simulated error".to_string()))
+        );
+        assert_eq!(fail_count.load(Ordering::SeqCst), 1);
+    }
 }
 
 // ============================================================================

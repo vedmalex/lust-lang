@@ -265,3 +265,143 @@ fn test_rx_terminal_error_propagation_once() {
     );
     assert_eq!(fail_count.load(Ordering::SeqCst), 1);
 }
+
+#[test]
+fn test_rx_operators_pipeline_map_filter_take() {
+    let scheduler = Arc::new(RxScheduler::new_virtual());
+    let scope_id = 106;
+
+    let received = Arc::new(Mutex::new(Vec::new()));
+    let completed = Arc::new(AtomicBool::new(false));
+    let failed = Arc::new(AtomicBool::new(false));
+
+    let r_clone = received.clone();
+    let c_clone = completed.clone();
+    let f_clone = failed.clone();
+
+    let observer = Observer::new(
+        move |item: i64| {
+            r_clone.lock().unwrap().push(item);
+            Ok(())
+        },
+        move || {
+            c_clone.store(true, Ordering::SeqCst);
+        },
+        move |_: RxError<String>| {
+            f_clone.store(true, Ordering::SeqCst);
+        },
+    );
+
+    // [1..6] -> map(*2) -> filter(divisible by 4) -> take(2) yields [4, 8]
+    let pipeline = Observable::<i64, String>::from_iter(vec![1, 2, 3, 4, 5, 6])
+        .map(|x| x * 2)
+        .filter(|x| x % 4 == 0)
+        .take(2);
+
+    let sub = pipeline
+        .subscribe(
+            observer,
+            scope_id,
+            BufferOptions::default_bounded(),
+            scheduler.clone(),
+        )
+        .unwrap();
+
+    scheduler.run_until_quiescent(100);
+
+    let completion = sub.join(Some(Duration::from_millis(100))).unwrap();
+    assert_eq!(completion.exit, ExitStatus::Completed);
+    assert_eq!(completion.items_delivered, 2);
+    assert_eq!(*received.lock().unwrap(), vec![4, 8]);
+    assert!(completed.load(Ordering::SeqCst));
+    assert!(!failed.load(Ordering::SeqCst));
+}
+
+#[test]
+fn test_rx_take_zero_pulls_zero() {
+    let scheduler = Arc::new(RxScheduler::new_virtual());
+    let scope_id = 107;
+
+    let received = Arc::new(Mutex::new(Vec::new()));
+    let completed = Arc::new(AtomicBool::new(false));
+
+    let r_clone = received.clone();
+    let c_clone = completed.clone();
+
+    let observer = Observer::new(
+        move |item: i64| {
+            r_clone.lock().unwrap().push(item);
+            Ok(())
+        },
+        move || {
+            c_clone.store(true, Ordering::SeqCst);
+        },
+        |_: RxError<String>| {},
+    );
+
+    let stream = Observable::<i64, String>::from_iter(vec![1, 2, 3, 4, 5]).take(0);
+
+    let sub = stream
+        .subscribe(
+            observer,
+            scope_id,
+            BufferOptions::default_bounded(),
+            scheduler.clone(),
+        )
+        .unwrap();
+
+    scheduler.run_until_quiescent(100);
+
+    let completion = sub.join(Some(Duration::from_millis(100))).unwrap();
+    assert_eq!(completion.exit, ExitStatus::Completed);
+    assert_eq!(completion.items_delivered, 0);
+    assert_eq!(received.lock().unwrap().len(), 0);
+    assert!(completed.load(Ordering::SeqCst));
+}
+
+#[test]
+fn test_rx_two_cold_subscriptions_independent() {
+    let scheduler = Arc::new(RxScheduler::new_virtual());
+
+    let stream = Observable::<i64, String>::from_iter(vec![10, 20, 30]);
+
+    let rec1 = Arc::new(Mutex::new(Vec::new()));
+    let rec2 = Arc::new(Mutex::new(Vec::new()));
+
+    let r1 = rec1.clone();
+    let sub1 = stream
+        .clone()
+        .subscribe(
+            Observer::from_next(move |val: i64| {
+                r1.lock().unwrap().push(val);
+                Ok(())
+            }),
+            108,
+            BufferOptions::default_bounded(),
+            scheduler.clone(),
+        )
+        .unwrap();
+
+    let r2 = rec2.clone();
+    let sub2 = stream
+        .subscribe(
+            Observer::from_next(move |val: i64| {
+                r2.lock().unwrap().push(val);
+                Ok(())
+            }),
+            109,
+            BufferOptions::default_bounded(),
+            scheduler.clone(),
+        )
+        .unwrap();
+
+    scheduler.run_until_quiescent(100);
+
+    let comp1 = sub1.join(Some(Duration::from_millis(100))).unwrap();
+    let comp2 = sub2.join(Some(Duration::from_millis(100))).unwrap();
+
+    assert_eq!(comp1.exit, ExitStatus::Completed);
+    assert_eq!(comp2.exit, ExitStatus::Completed);
+    assert_eq!(*rec1.lock().unwrap(), vec![10, 20, 30]);
+    assert_eq!(*rec2.lock().unwrap(), vec![10, 20, 30]);
+}

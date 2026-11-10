@@ -1,6 +1,6 @@
 //! Reactive Lifecycle State Machine, Subscription, and Observer implementations.
 
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -67,6 +67,11 @@ impl<T, E: 'static> Observer<T, E> {
     }
 }
 
+struct TerminalHandlers<E> {
+    on_complete: Box<dyn FnOnce() + Send + 'static>,
+    on_failure: Box<dyn FnOnce(RxError<E>) + Send + 'static>,
+}
+
 /// Internal shared control block for a subscription.
 pub struct SubscriptionControl<T: MeasurableItem + Send + 'static, E: Clone + Send + 'static> {
     pub scope_id: u64,
@@ -74,10 +79,11 @@ pub struct SubscriptionControl<T: MeasurableItem + Send + 'static, E: Clone + Se
     pub state: Mutex<SubscriptionState>,
     pub exit_status: Mutex<Option<ExitStatus<E>>>,
     pub queue: Mutex<BoundedQueue<T>>,
-    pub observer: Mutex<Option<Observer<T, E>>>,
+    next_fn: Mutex<Option<Box<dyn FnMut(T) -> Result<(), RxError<E>> + Send + 'static>>>,
+    terminal_fn: Mutex<Option<TerminalHandlers<E>>>,
+    pub admission_gate: Mutex<()>,
     pub coordinator: Arc<ScopeJoinCoordinator>,
     pub items_delivered: AtomicUsize,
-    pub terminal_dispatched: AtomicBool,
     pub current_executing_thread: AtomicU64,
 }
 
@@ -88,28 +94,35 @@ impl<T: MeasurableItem + Send + 'static, E: Clone + Send + 'static> Subscription
         observer: Observer<T, E>,
         coordinator: Arc<ScopeJoinCoordinator>,
     ) -> Self {
+        let terminal = TerminalHandlers {
+            on_complete: observer.on_complete,
+            on_failure: observer.on_failure,
+        };
         Self {
             scope_id,
             generation: AtomicU32::new(1),
             state: Mutex::new(SubscriptionState::Active),
             exit_status: Mutex::new(None),
             queue: Mutex::new(BoundedQueue::new(options)),
-            observer: Mutex::new(Some(observer)),
+            next_fn: Mutex::new(Some(observer.on_next)),
+            terminal_fn: Mutex::new(Some(terminal)),
+            admission_gate: Mutex::new(()),
             coordinator,
             items_delivered: AtomicUsize::new(0),
-            terminal_dispatched: AtomicBool::new(false),
             current_executing_thread: AtomicU64::new(0),
         }
     }
 
     /// Linearize cancellation:
+    /// - Acquire admission_gate to serialize with any pending callback admission
     /// - Transition Active -> Stopping
     /// - Increment generation so late timer envelopes / arrivals are discarded
     /// - Close admission gate: no new callbacks will start
     /// - Record ExitStatus::Cancelled if no terminal outcome committed yet
     pub fn cancel(&self) {
+        let _gate = self.admission_gate.lock().unwrap();
         let mut state = self.state.lock().unwrap();
-        if *state == SubscriptionState::Closed || *state == SubscriptionState::Releasing {
+        if *state != SubscriptionState::Active {
             return;
         }
         *state = SubscriptionState::Stopping;
@@ -120,6 +133,9 @@ impl<T: MeasurableItem + Send + 'static, E: Clone + Send + 'static> Subscription
             *exit = Some(ExitStatus::Cancelled);
         }
         self.coordinator.close_admission(self.scope_id);
+
+        // Discard terminal handlers on cancellation per RFC §16.3
+        drop(self.terminal_fn.lock().unwrap().take());
     }
 
     /// Check if subscription is actively accepting new callbacks.
@@ -131,21 +147,21 @@ impl<T: MeasurableItem + Send + 'static, E: Clone + Send + 'static> Subscription
     /// Deliver next item to observer.
     /// Inviolable invariant: No callback starts after cancel() has committed!
     pub fn deliver_next(&self, item: T) -> Result<(), RxError<E>> {
-        // Check state and admission
+        // Linearized admission check: serialized with cancel()
         {
+            let _gate = self.admission_gate.lock().unwrap();
             let state = self.state.lock().unwrap();
             if *state != SubscriptionState::Active {
                 return Err(RxError::Cancelled);
             }
-        }
+            // Mark current executing thread for SelfJoin detection
+            let current_tid = thread_id_to_u64();
+            self.current_executing_thread.store(current_tid, Ordering::SeqCst);
+        } // _gate and state locks dropped HERE before calling observer code!
 
-        // Set executing thread ID for SelfJoin detection
-        let current_tid = thread_id_to_u64();
-        self.current_executing_thread.store(current_tid, Ordering::SeqCst);
-
-        let mut obs_guard = self.observer.lock().unwrap();
-        let res = if let Some(ref mut obs) = *obs_guard {
-            let next_res = (obs.on_next)(item);
+        let mut next_guard = self.next_fn.lock().unwrap();
+        let res = if let Some(ref mut next_cb) = *next_guard {
+            let next_res = next_cb(item);
             if next_res.is_ok() {
                 self.items_delivered.fetch_add(1, Ordering::SeqCst);
             }
@@ -153,6 +169,7 @@ impl<T: MeasurableItem + Send + 'static, E: Clone + Send + 'static> Subscription
         } else {
             Err(RxError::Cancelled)
         };
+        drop(next_guard);
 
         self.current_executing_thread.store(0, Ordering::SeqCst);
 
@@ -165,42 +182,50 @@ impl<T: MeasurableItem + Send + 'static, E: Clone + Send + 'static> Subscription
     }
 
     /// Commit normal stream completion.
+    /// Terminal callback is executed OUTSIDE of all mutexes to eliminate reentrancy deadlocks.
     pub fn complete(&self) {
-        let mut exit = self.exit_status.lock().unwrap();
-        if exit.is_none() {
-            *exit = Some(ExitStatus::Completed);
-        }
-
-        // Dispatch terminal complete callback exactly once if not cancelled
-        if !self.terminal_dispatched.swap(true, Ordering::SeqCst) {
+        let action = {
             let mut state = self.state.lock().unwrap();
             if *state == SubscriptionState::Active {
                 *state = SubscriptionState::Stopping;
-                let mut obs_guard = self.observer.lock().unwrap();
-                if let Some(obs) = obs_guard.take() {
-                    (obs.on_complete)();
+                let mut exit = self.exit_status.lock().unwrap();
+                if exit.is_none() {
+                    *exit = Some(ExitStatus::Completed);
                 }
+                self.coordinator.close_admission(self.scope_id);
+                self.terminal_fn.lock().unwrap().take()
+            } else {
+                None
             }
+        };
+
+        // Invoke outside of all mutexes!
+        if let Some(terminal) = action {
+            (terminal.on_complete)();
         }
     }
 
     /// Commit stream failure.
+    /// Terminal callback is executed OUTSIDE of all mutexes to eliminate reentrancy deadlocks.
     pub fn fail(&self, err: RxError<E>) {
-        let mut exit = self.exit_status.lock().unwrap();
-        if exit.is_none() {
-            *exit = Some(ExitStatus::Failed(err.clone()));
-        }
-
-        // Dispatch terminal failure callback exactly once if not cancelled
-        if !self.terminal_dispatched.swap(true, Ordering::SeqCst) {
+        let action = {
             let mut state = self.state.lock().unwrap();
             if *state == SubscriptionState::Active {
                 *state = SubscriptionState::Stopping;
-                let mut obs_guard = self.observer.lock().unwrap();
-                if let Some(obs) = obs_guard.take() {
-                    (obs.on_failure)(err);
+                let mut exit = self.exit_status.lock().unwrap();
+                if exit.is_none() {
+                    *exit = Some(ExitStatus::Failed(err.clone()));
                 }
+                self.coordinator.close_admission(self.scope_id);
+                self.terminal_fn.lock().unwrap().take()
+            } else {
+                None
             }
+        };
+
+        // Invoke outside of all mutexes!
+        if let Some(terminal) = action {
+            (terminal.on_failure)(err);
         }
     }
 
@@ -233,10 +258,13 @@ impl<T: MeasurableItem + Send + 'static, E: Clone + Send + 'static> Subscription
             // Clean up queue and observer captures
             let mut q = self.queue.lock().unwrap();
             q.clear();
-            let mut obs = self.observer.lock().unwrap();
-            *obs = None;
+            *self.next_fn.lock().unwrap() = None;
+            *self.terminal_fn.lock().unwrap() = None;
             *state = SubscriptionState::Closed;
         }
+
+        // Retire scope from coordinator
+        self.coordinator.retire_scope(self.scope_id);
 
         let exit = self
             .exit_status
@@ -252,8 +280,6 @@ impl<T: MeasurableItem + Send + 'static, E: Clone + Send + 'static> Subscription
         })
     }
 }
-
-use std::sync::atomic::AtomicUsize;
 
 /// Opaque subscription handle held by caller.
 #[derive(Clone)]
@@ -290,7 +316,6 @@ impl<T: MeasurableItem + Send + 'static, E: Clone + Send + 'static> Subscription
 
 fn thread_id_to_u64() -> u64 {
     let tid = std::thread::current().id();
-    // Hash ThreadId to stable u64
     use std::hash::{Hash, Hasher};
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     tid.hash(&mut hasher);

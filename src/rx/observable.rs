@@ -11,21 +11,22 @@ use super::RxError;
 
 /// Type alias for stream producer closure.
 pub type ProducerFn<T, E> =
-    Box<dyn FnOnce(Arc<SubscriptionControl<T, E>>) -> Result<(), RxError<E>> + Send + 'static>;
+    Arc<dyn Fn(Arc<SubscriptionControl<T, E>>) -> Result<(), RxError<E>> + Send + Sync + 'static>;
 
 /// A cold, lazy blueprint for a reactive stream.
 /// Executed only upon call to `subscribe`.
-pub struct Observable<T: MeasurableItem + Send + 'static, E: Clone + Send + 'static = String> {
+#[derive(Clone)]
+pub struct Observable<T: MeasurableItem + Send + Sync + 'static, E: Clone + Send + 'static = String> {
     producer: ProducerFn<T, E>,
 }
 
-impl<T: MeasurableItem + Send + 'static, E: Clone + Send + 'static> Observable<T, E> {
+impl<T: MeasurableItem + Send + Sync + 'static, E: Clone + Send + 'static> Observable<T, E> {
     pub fn new<F>(producer: F) -> Self
     where
-        F: FnOnce(Arc<SubscriptionControl<T, E>>) -> Result<(), RxError<E>> + Send + 'static,
+        F: Fn(Arc<SubscriptionControl<T, E>>) -> Result<(), RxError<E>> + Send + Sync + 'static,
     {
         Self {
-            producer: Box::new(producer),
+            producer: Arc::new(producer),
         }
     }
 
@@ -33,21 +34,20 @@ impl<T: MeasurableItem + Send + 'static, E: Clone + Send + 'static> Observable<T
     /// Pulls items lazily on demand until collection ends or subscription cancels.
     pub fn from_iter<I>(iter: I) -> Self
     where
-        I: IntoIterator<Item = T> + Send + 'static,
-        I::IntoIter: Send + 'static,
+        T: Clone,
+        I: IntoIterator<Item = T>,
     {
+        let items: Vec<T> = iter.into_iter().collect();
         Self::new(move |control| {
-            let mut iterator = iter.into_iter();
-            while control.is_active() {
-                if let Some(item) = iterator.next() {
-                    if let Err(e) = control.deliver_next(item) {
-                        return Err(e);
-                    }
-                } else {
-                    control.complete();
-                    break;
+            for item in items.iter() {
+                if !control.is_active() {
+                    return Err(RxError::Cancelled);
+                }
+                if let Err(e) = control.deliver_next(item.clone()) {
+                    return Err(e);
                 }
             }
+            control.complete();
             Ok(())
         })
     }
@@ -55,9 +55,136 @@ impl<T: MeasurableItem + Send + 'static, E: Clone + Send + 'static> Observable<T
     /// Create an Observable driven by an arbitrary cooperative producer closure.
     pub fn from_producer<F>(producer_fn: F) -> Self
     where
-        F: FnOnce(Arc<SubscriptionControl<T, E>>) -> Result<(), RxError<E>> + Send + 'static,
+        F: Fn(Arc<SubscriptionControl<T, E>>) -> Result<(), RxError<E>> + Send + Sync + 'static,
     {
         Self::new(producer_fn)
+    }
+
+    /// Transform stream values with a projection function.
+    pub fn map<R, F>(self, f: F) -> Observable<R, E>
+    where
+        R: MeasurableItem + Send + Sync + 'static,
+        F: Fn(T) -> R + Send + Sync + 'static,
+    {
+        let upstream_producer = self.producer.clone();
+        let f = Arc::new(f);
+        Observable::new(move |downstream_ctrl| {
+            let f_clone = f.clone();
+            let ds_ctrl = downstream_ctrl.clone();
+            let upstream_ctrl = Arc::new(SubscriptionControl::new(
+                downstream_ctrl.scope_id,
+                BufferOptions::default_bounded(),
+                Observer::new(
+                    move |item: T| {
+                        let mapped = f_clone(item);
+                        ds_ctrl.deliver_next(mapped)
+                    },
+                    {
+                        let ds_ctrl = downstream_ctrl.clone();
+                        move || ds_ctrl.complete()
+                    },
+                    {
+                        let ds_ctrl = downstream_ctrl.clone();
+                        move |err| ds_ctrl.fail(err)
+                    },
+                ),
+                downstream_ctrl.coordinator.clone(),
+            ));
+            let res = upstream_producer(upstream_ctrl);
+            if let Err(RxError::Cancelled) = res {
+                Ok(())
+            } else {
+                res
+            }
+        })
+    }
+
+    /// Filter stream values by a predicate.
+    pub fn filter<P>(self, predicate: P) -> Observable<T, E>
+    where
+        P: Fn(&T) -> bool + Send + Sync + 'static,
+    {
+        let upstream_producer = self.producer.clone();
+        let predicate = Arc::new(predicate);
+        Observable::new(move |downstream_ctrl| {
+            let pred_clone = predicate.clone();
+            let ds_ctrl = downstream_ctrl.clone();
+            let upstream_ctrl = Arc::new(SubscriptionControl::new(
+                downstream_ctrl.scope_id,
+                BufferOptions::default_bounded(),
+                Observer::new(
+                    move |item: T| {
+                        if pred_clone(&item) {
+                            ds_ctrl.deliver_next(item)
+                        } else {
+                            Ok(())
+                        }
+                    },
+                    {
+                        let ds_ctrl = downstream_ctrl.clone();
+                        move || ds_ctrl.complete()
+                    },
+                    {
+                        let ds_ctrl = downstream_ctrl.clone();
+                        move |err| ds_ctrl.fail(err)
+                    },
+                ),
+                downstream_ctrl.coordinator.clone(),
+            ));
+            let res = upstream_producer(upstream_ctrl);
+            if let Err(RxError::Cancelled) = res {
+                Ok(())
+            } else {
+                res
+            }
+        })
+    }
+
+    /// Take only the first `count` values, then complete.
+    pub fn take(self, count: usize) -> Observable<T, E> {
+        let upstream_producer = self.producer.clone();
+        Observable::new(move |downstream_ctrl| {
+            if count == 0 {
+                downstream_ctrl.complete();
+                return Ok(());
+            }
+            let taken = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let taken_clone = taken.clone();
+            let ds_ctrl = downstream_ctrl.clone();
+            let upstream_ctrl = Arc::new(SubscriptionControl::new(
+                downstream_ctrl.scope_id,
+                BufferOptions::default_bounded(),
+                Observer::new(
+                    move |item: T| {
+                        let current = taken_clone.fetch_add(1, Ordering::SeqCst);
+                        if current < count {
+                            let res = ds_ctrl.deliver_next(item);
+                            if current + 1 == count {
+                                ds_ctrl.complete();
+                            }
+                            res
+                        } else {
+                            Err(RxError::Cancelled)
+                        }
+                    },
+                    {
+                        let ds_ctrl = downstream_ctrl.clone();
+                        move || ds_ctrl.complete()
+                    },
+                    {
+                        let ds_ctrl = downstream_ctrl.clone();
+                        move |err| ds_ctrl.fail(err)
+                    },
+                ),
+                downstream_ctrl.coordinator.clone(),
+            ));
+            let res = upstream_producer(upstream_ctrl);
+            if let Err(RxError::Cancelled) = res {
+                Ok(())
+            } else {
+                res
+            }
+        })
     }
 
     /// Subscribe an observer to this Observable within a given scope.
@@ -85,19 +212,24 @@ impl<T: MeasurableItem + Send + 'static, E: Clone + Send + 'static> Observable<T
 
         // Spawn or run producer task
         let ctrl_clone = control.clone();
-        let producer = self.producer;
+        let producer = self.producer.clone();
 
-        scheduler
-            .schedule_task(10, move || {
-                let res = producer(ctrl_clone.clone());
-                if let Err(e) = res {
-                    ctrl_clone.fail(e);
-                }
-                ctrl_clone
-                    .coordinator
-                    .acknowledge_exit(scope_id, participant_id);
-            })
-            .map_err(|_| RxError::BackpressureOverflow)?;
+        let schedule_res = scheduler.schedule_task(10, move || {
+            let res = producer(ctrl_clone.clone());
+            if let Err(e) = res {
+                ctrl_clone.fail(e);
+            }
+            ctrl_clone
+                .coordinator
+                .acknowledge_exit(scope_id, participant_id);
+        });
+
+        if let Err(_) = schedule_res {
+            scheduler
+                .coordinator
+                .acknowledge_exit(scope_id, participant_id);
+            return Err(RxError::BackpressureOverflow);
+        }
 
         Ok(subscription)
     }
