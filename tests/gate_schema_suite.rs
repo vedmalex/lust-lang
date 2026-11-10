@@ -745,6 +745,9 @@ fn test_gate_schema_05_backend_effect_cost_parity() {
 
     let max_alloc = vm_allocated_bytes.max(clif_allocated_bytes);
     let min_alloc = vm_allocated_bytes.min(clif_allocated_bytes);
+    eprintln!(
+        "Gate-05 allocation: vm={vm_allocated_bytes} cranelift={clif_allocated_bytes}"
+    );
 
     assert!(
         max_alloc <= 2 * min_alloc,
