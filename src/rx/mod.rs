@@ -3,11 +3,17 @@
 
 pub mod buffer;
 pub mod clock;
+pub mod lifecycle;
+pub mod observable;
 pub mod scheduler;
 pub mod timer;
 
 pub use buffer::{BoundedQueue, BufferOptions, EnqueueResult, MeasurableItem, OverflowStrategy};
 pub use clock::{PhysicalClock, RxClock, SharedClock, VirtualClock};
+pub use lifecycle::{
+    Completion, ExitStatus, Observer, Subscription, SubscriptionControl, SubscriptionState,
+};
+pub use observable::{interval, Observable, ProducerFn};
 pub use scheduler::{ParticipantId, ReadyTask, RxScheduler, ScopeJoinCoordinator};
 pub use timer::{RxTimerService, TimerId};
 

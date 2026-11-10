@@ -210,6 +210,21 @@ impl RxScheduler {
         }
     }
 
+    /// Drain all currently ready tasks and expired timers at the current clock time.
+    pub fn drain_ready(&self) -> usize {
+        let mut steps = 0;
+        while self.step() {
+            steps += 1;
+        }
+        steps
+    }
+
+    /// Advance virtual clock by the given duration and drain all expired timers and tasks.
+    pub fn advance_and_drain(&self, duration: Duration) -> usize {
+        self.clock.advance(duration);
+        self.drain_ready()
+    }
+
     /// Run the scheduler until there are no remaining ready tasks and no timers can be triggered.
     /// In a virtual clock environment, if there are pending timers, advances time to the next deadline.
     pub fn run_until_quiescent(&self, max_steps: usize) -> usize {
