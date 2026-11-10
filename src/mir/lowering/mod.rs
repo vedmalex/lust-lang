@@ -3,7 +3,7 @@ use crate::ast::{
 };
 use crate::mir::ir::*;
 use alloc::{boxed::Box, format, string::String, vec, vec::Vec};
-use hashbrown::HashMap;
+use hashbrown::{HashMap, HashSet};
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum MirLowerError {
@@ -29,15 +29,31 @@ pub(super) struct MirCleanup {
     pub(super) stmt: Box<Stmt>,
 }
 
+#[derive(Debug, Clone)]
+pub(super) struct LocalThunk {
+    pub(super) body: Vec<Stmt>,
+    pub(super) captured_bindings: Vec<(String, LocalId, MirType)>,
+    pub(super) result_type: MirType,
+    #[allow(dead_code)]
+    pub(super) span: crate::ast::Span,
+}
+
+#[derive(Debug, Clone)]
+pub(super) enum ScopeBinding {
+    Local(LocalId),
+    Thunk(LocalThunk),
+}
+
 pub struct AstLowering<'a> {
     current_fn: &'a mut MirFunction,
     current_block: BlockId,
-    scopes: Vec<HashMap<String, LocalId>>,
+    scopes: Vec<HashMap<String, ScopeBinding>>,
     cleanups: Vec<Vec<MirCleanup>>,
     loop_stack: Vec<(BlockId, BlockId)>, // (header/continue_block, exit_block)
     struct_fields: HashMap<String, Vec<String>>,
     struct_field_substructs: HashMap<String, Vec<Option<String>>>,
     local_field_names: HashMap<LocalId, Vec<String>>,
+    thunk_return_target: Option<(LocalId, BlockId)>,
 }
 
 impl<'a> AstLowering<'a> {
@@ -50,7 +66,7 @@ impl<'a> AstLowering<'a> {
                 .name
                 .clone()
                 .unwrap_or_else(|| format!("arg{idx}"));
-            scope.insert(p_name, *p_id);
+            scope.insert(p_name, ScopeBinding::Local(*p_id));
         }
 
         Self {
@@ -62,6 +78,7 @@ impl<'a> AstLowering<'a> {
             struct_fields: HashMap::new(),
             struct_field_substructs: HashMap::new(),
             local_field_names: HashMap::new(),
+            thunk_return_target: None,
         }
     }
 
@@ -84,14 +101,35 @@ impl<'a> AstLowering<'a> {
 
     fn insert_var(&mut self, name: String, local_id: LocalId) {
         if let Some(scope) = self.scopes.last_mut() {
-            scope.insert(name, local_id);
+            scope.insert(name, ScopeBinding::Local(local_id));
+        }
+    }
+
+    fn insert_thunk(&mut self, name: String, thunk: LocalThunk) {
+        if let Some(scope) = self.scopes.last_mut() {
+            scope.insert(name, ScopeBinding::Thunk(thunk));
         }
     }
 
     fn lookup_var(&self, name: &str) -> Option<LocalId> {
         for scope in self.scopes.iter().rev() {
-            if let Some(id) = scope.get(name) {
-                return Some(*id);
+            if let Some(binding) = scope.get(name) {
+                match binding {
+                    ScopeBinding::Local(id) => return Some(*id),
+                    ScopeBinding::Thunk(_) => return None,
+                }
+            }
+        }
+        None
+    }
+
+    fn lookup_thunk(&self, name: &str) -> Option<&LocalThunk> {
+        for scope in self.scopes.iter().rev() {
+            if let Some(binding) = scope.get(name) {
+                match binding {
+                    ScopeBinding::Thunk(thunk) => return Some(thunk),
+                    ScopeBinding::Local(_) => return None,
+                }
             }
         }
         None
@@ -264,6 +302,20 @@ impl<'a> AstLowering<'a> {
 
         match &stmt.kind {
             StmtKind::Local { bindings, initializer } => {
+                if let Some(inits) = initializer {
+                    let has_effect = inits.iter().any(|e| matches!(&e.kind, ExprKind::EffectBlock(_)));
+                    if has_effect {
+                        if inits.len() != 1 || bindings.len() != 1 {
+                            return Err(MirLowerError::UnlowerableExpression(
+                                "EffectBlock initializer must be a single binding to a local variable".into(),
+                            ));
+                        }
+                        if let ExprKind::EffectBlock(stmts) = &inits[0].kind {
+                            return self.lower_effect_block(&bindings[0].name, stmts, inits[0].span, bindings[0].span);
+                        }
+                    }
+                }
+
                 let init_operands = if let Some(inits) = initializer {
                     let mut ops = Vec::with_capacity(inits.len());
                     for expr in inits {
@@ -314,6 +366,20 @@ impl<'a> AstLowering<'a> {
             }
             StmtKind::Assign { targets, values } => {
                 for (target, val) in targets.iter().zip(values.iter()) {
+                    if let ExprKind::Identifier(name) = &target.kind {
+                        if self.lookup_thunk(name).is_some() {
+                            return Err(MirLowerError::UnlowerableExpression(format!(
+                                "Effect thunk '{name}' cannot be reassigned or mutated"
+                            )));
+                        }
+                    }
+                    if let ExprKind::Identifier(name) = &val.kind {
+                        if self.lookup_thunk(name).is_some() {
+                            return Err(MirLowerError::UnlowerableExpression(format!(
+                                "Effect thunk '{name}' cannot be aliased or copied"
+                            )));
+                        }
+                    }
                     let rval_op = self.lower_expr(val)?;
                     let place = self.lower_place(target)?
                         .ok_or_else(|| MirLowerError::UnsupportedLvalue(format!("{:?}", target.kind)))?;
@@ -321,6 +387,13 @@ impl<'a> AstLowering<'a> {
                 }
             }
             StmtKind::CompoundAssign { target, op, value } => {
+                if let ExprKind::Identifier(name) = &target.kind {
+                    if self.lookup_thunk(name).is_some() {
+                        return Err(MirLowerError::UnlowerableExpression(format!(
+                            "Effect thunk '{name}' cannot be reassigned or mutated"
+                        )));
+                    }
+                }
                 let mir_op = mir_binop_from_ast(*op)?;
                 let place = self.lower_place(target)?
                     .ok_or_else(|| MirLowerError::UnsupportedLvalue(format!("{:?}", target.kind)))?;
@@ -390,25 +463,40 @@ impl<'a> AstLowering<'a> {
                 self.current_block = exit_block;
             }
             StmtKind::Return(exprs) => {
-                let ret_op = if let Some(first) = exprs.first() {
-                    let op = self.lower_expr(first)?;
-                    let temp = self.current_fn.add_local(None, MirType::Int, true, stmt.span);
-                    self.emit_stmt(Statement::StorageLive(temp, stmt.span));
-                    self.emit_stmt(Statement::Assign(Place::Local(temp), Rvalue::Use(op), stmt.span));
-                    Some(Operand::Copy(Place::Local(temp)))
+                if let Some((res_local, cont_bb)) = self.thunk_return_target {
+                    if exprs.len() != 1 {
+                        return Err(MirLowerError::UnlowerableExpression(
+                            "Effect thunk return must return exactly one value".into(),
+                        ));
+                    }
+                    let op = self.lower_expr(&exprs[0])?;
+                    self.emit_stmt(Statement::Assign(
+                        Place::Local(res_local),
+                        Rvalue::Use(op),
+                        stmt.span,
+                    ));
+                    self.terminate_block(Terminator::Goto(cont_bb, stmt.span));
                 } else {
-                    None
-                };
+                    let ret_op = if let Some(first) = exprs.first() {
+                        let op = self.lower_expr(first)?;
+                        let temp = self.current_fn.add_local(None, MirType::Int, true, stmt.span);
+                        self.emit_stmt(Statement::StorageLive(temp, stmt.span));
+                        self.emit_stmt(Statement::Assign(Place::Local(temp), Rvalue::Use(op), stmt.span));
+                        Some(Operand::Copy(Place::Local(temp)))
+                    } else {
+                        None
+                    };
 
-                for scope_cleanups in self.cleanups.clone().iter().rev() {
-                    for c in scope_cleanups.iter().rev() {
-                        if matches!(c.kind, MirCleanupKind::Defer) {
-                            self.lower_statement(&c.stmt)?;
+                    for scope_cleanups in self.cleanups.clone().iter().rev() {
+                        for c in scope_cleanups.iter().rev() {
+                            if matches!(c.kind, MirCleanupKind::Defer) {
+                                self.lower_statement(&c.stmt)?;
+                            }
                         }
                     }
-                }
 
-                self.terminate_block(Terminator::Return(ret_op, stmt.span));
+                    self.terminate_block(Terminator::Return(ret_op, stmt.span));
+                }
             }
             StmtKind::ForNumeric {
                 variable,
@@ -1237,9 +1325,18 @@ impl<'a> AstLowering<'a> {
             ExprKind::Identifier(name) => {
                 if let Some(loc_id) = self.lookup_var(name) {
                     Ok(Operand::Copy(Place::Local(loc_id)))
+                } else if self.lookup_thunk(name).is_some() {
+                    Err(MirLowerError::UnlowerableExpression(format!(
+                        "Effect thunk '{name}' cannot escape or be used as a value"
+                    )))
                 } else {
                     Ok(Operand::Constant(MirConstant::Int(0)))
                 }
+            }
+            ExprKind::EffectBlock(_) => {
+                Err(MirLowerError::UnlowerableExpression(
+                    "Bare EffectBlock in unsupported value context; only local bindings are supported".into(),
+                ))
             }
             ExprKind::Paren(inner) => self.lower_expr(inner),
             ExprKind::Binary { left, op, right } => {
@@ -1480,6 +1577,27 @@ impl<'a> AstLowering<'a> {
             }
             ExprKind::MethodCall { receiver, method, args, .. } if method == "unwrap" && args.is_empty() => {
                 self.lower_expr(receiver)
+            }
+            ExprKind::MethodCall { receiver, method, args, .. } if method == "run_sync" => {
+                if !args.is_empty() {
+                    return Err(MirLowerError::UnlowerableExpression(
+                        "run_sync() takes no arguments".into(),
+                    ));
+                }
+                let thunk_name = match &receiver.kind {
+                    ExprKind::Identifier(name) => name,
+                    _ => {
+                        return Err(MirLowerError::UnlowerableExpression(
+                            "run_sync receiver must be a local effect thunk identifier".into(),
+                        ));
+                    }
+                };
+                let thunk = self.lookup_thunk(thunk_name).cloned().ok_or_else(|| {
+                    MirLowerError::UnlowerableExpression(format!(
+                        "'{thunk_name}' is not an active local effect thunk in the current scope"
+                    ))
+                })?;
+                self.lower_effect_run_sync(&thunk, expr.span)
             }
             ExprKind::Call { callee, args, .. }
                 if args.is_empty()
@@ -1744,7 +1862,14 @@ impl<'a> AstLowering<'a> {
 
     fn lower_place(&mut self, expr: &Expr) -> Result<Option<Place>, MirLowerError> {
         match &expr.kind {
-            ExprKind::Identifier(name) => Ok(self.lookup_var(name).map(Place::Local)),
+            ExprKind::Identifier(name) => {
+                if self.lookup_thunk(name).is_some() {
+                    return Err(MirLowerError::UnlowerableExpression(format!(
+                        "Effect thunk '{name}' cannot be reassigned or used as an lvalue"
+                    )));
+                }
+                Ok(self.lookup_var(name).map(Place::Local))
+            }
             ExprKind::Paren(inner) => self.lower_place(inner),
             ExprKind::Index { object, index } => {
                 let base_place = match self.lower_place(object)? {
@@ -1788,6 +1913,352 @@ impl<'a> AstLowering<'a> {
     fn terminate_block(&mut self, term: Terminator) {
         self.current_fn.blocks[self.current_block.0].terminator = Some(term);
     }
+
+    fn lower_effect_block(
+        &mut self,
+        name: &str,
+        stmts: &[Stmt],
+        _expr_span: crate::ast::Span,
+        binding_span: crate::ast::Span,
+    ) -> Result<(), MirLowerError> {
+        let mut locally_bound = HashSet::new();
+        let mut free_vars = HashSet::new();
+        validate_and_find_captures_in_stmts(stmts, &mut locally_bound, &mut free_vars)?;
+
+        let mut sorted_vars: Vec<String> = free_vars.into_iter().collect();
+        sorted_vars.sort();
+
+        let mut captured_bindings = Vec::new();
+        for var_name in sorted_vars {
+            if self.lookup_thunk(&var_name).is_some() {
+                return Err(MirLowerError::UnlowerableExpression(format!(
+                    "Effect thunk '{var_name}' cannot be captured in nested effect"
+                )));
+            }
+            if let Some(loc_id) = self.lookup_var(&var_name) {
+                let loc_ty = &self.current_fn.locals[loc_id.0].ty;
+                if *loc_ty != MirType::Int {
+                    return Err(MirLowerError::UnlowerableExpression(format!(
+                        "Unsupported capture type for '{var_name}': only read-only integers are supported, found {loc_ty:?}"
+                    )));
+                }
+                let snapshot_local = self.current_fn.add_local(
+                    Some(format!("__thunk_cap_{}_{}", name, var_name)),
+                    MirType::Int,
+                    false,
+                    binding_span,
+                );
+                self.emit_stmt(Statement::StorageLive(snapshot_local, binding_span));
+                self.emit_stmt(Statement::Assign(
+                    Place::Local(snapshot_local),
+                    Rvalue::Use(Operand::Copy(Place::Local(loc_id))),
+                    binding_span,
+                ));
+                captured_bindings.push((var_name, snapshot_local, MirType::Int));
+            }
+        }
+
+        let thunk = LocalThunk {
+            body: stmts.to_vec(),
+            captured_bindings,
+            result_type: MirType::Int,
+            span: binding_span,
+        };
+        self.insert_thunk(name.to_string(), thunk);
+        Ok(())
+    }
+
+    fn lower_effect_run_sync(
+        &mut self,
+        thunk: &LocalThunk,
+        span: crate::ast::Span,
+    ) -> Result<Operand, MirLowerError> {
+        let result_local = self.current_fn.add_local(
+            Some("__thunk_res".into()),
+            thunk.result_type.clone(),
+            true,
+            span,
+        );
+        self.emit_stmt(Statement::StorageLive(result_local, span));
+
+        let continuation_bb = self.current_fn.new_block();
+
+        let saved_loop_stack = core::mem::take(&mut self.loop_stack);
+        let saved_thunk_return_target = self.thunk_return_target;
+        let saved_scopes = core::mem::take(&mut self.scopes);
+        let saved_cleanups = core::mem::take(&mut self.cleanups);
+
+        self.thunk_return_target = Some((result_local, continuation_bb));
+        self.cleanups = vec![Vec::new()];
+
+        let mut thunk_root_scope = HashMap::new();
+        for (var_name, snapshot_local, _ty) in &thunk.captured_bindings {
+            thunk_root_scope.insert(var_name.clone(), ScopeBinding::Local(*snapshot_local));
+        }
+        self.scopes = vec![thunk_root_scope];
+
+        let inline_res = (|| {
+            for stmt in &thunk.body {
+                self.lower_statement(stmt)?;
+            }
+            if self.current_fn.blocks[self.current_block.0].terminator.is_none() {
+                return Err(MirLowerError::UnlowerableExpression(
+                    "Effect thunk must explicitly return on all paths; fallthrough is not supported".into(),
+                ));
+            }
+            Ok(())
+        })();
+
+        self.loop_stack = saved_loop_stack;
+        self.thunk_return_target = saved_thunk_return_target;
+        self.scopes = saved_scopes;
+        self.cleanups = saved_cleanups;
+
+        inline_res?;
+
+        self.current_block = continuation_bb;
+        Ok(Operand::Move(Place::Local(result_local)))
+    }
+}
+
+fn validate_and_find_captures_in_expr(
+    expr: &Expr,
+    locally_bound: &HashSet<String>,
+    free_vars: &mut HashSet<String>,
+) -> Result<(), MirLowerError> {
+    match &expr.kind {
+        ExprKind::Literal(_) => Ok(()),
+        ExprKind::Identifier(name) => {
+            if !locally_bound.contains(name) {
+                free_vars.insert(name.clone());
+            }
+            Ok(())
+        }
+        ExprKind::Binary { left, right, .. } => {
+            validate_and_find_captures_in_expr(left, locally_bound, free_vars)?;
+            validate_and_find_captures_in_expr(right, locally_bound, free_vars)?;
+            Ok(())
+        }
+        ExprKind::Unary { operand, .. } => {
+            validate_and_find_captures_in_expr(operand, locally_bound, free_vars)
+        }
+        ExprKind::Call { callee, args, .. } => {
+            validate_and_find_captures_in_expr(callee, locally_bound, free_vars)?;
+            for a in args {
+                validate_and_find_captures_in_expr(a, locally_bound, free_vars)?;
+            }
+            Ok(())
+        }
+        ExprKind::MethodCall { receiver, args, .. } => {
+            validate_and_find_captures_in_expr(receiver, locally_bound, free_vars)?;
+            for a in args {
+                validate_and_find_captures_in_expr(a, locally_bound, free_vars)?;
+            }
+            Ok(())
+        }
+        ExprKind::FieldAccess { object, .. } => {
+            validate_and_find_captures_in_expr(object, locally_bound, free_vars)
+        }
+        ExprKind::Index { object, index } => {
+            validate_and_find_captures_in_expr(object, locally_bound, free_vars)?;
+            validate_and_find_captures_in_expr(index, locally_bound, free_vars)?;
+            Ok(())
+        }
+        ExprKind::Array(elems) | ExprKind::Tuple(elems) => {
+            for e in elems {
+                validate_and_find_captures_in_expr(e, locally_bound, free_vars)?;
+            }
+            Ok(())
+        }
+        ExprKind::Map(pairs) => {
+            for (k, v) in pairs {
+                validate_and_find_captures_in_expr(k, locally_bound, free_vars)?;
+                validate_and_find_captures_in_expr(v, locally_bound, free_vars)?;
+            }
+            Ok(())
+        }
+        ExprKind::StructLiteral { fields, .. } => {
+            for f in fields {
+                validate_and_find_captures_in_expr(&f.value, locally_bound, free_vars)?;
+            }
+            Ok(())
+        }
+        ExprKind::EnumConstructor { args, .. } => {
+            for a in args {
+                validate_and_find_captures_in_expr(a, locally_bound, free_vars)?;
+            }
+            Ok(())
+        }
+        ExprKind::Lambda { .. } => Err(MirLowerError::UnlowerableExpression(
+            "Lambdas are not supported inside effect thunk".into(),
+        )),
+        ExprKind::Paren(inner)
+        | ExprKind::Cast { expr: inner, .. }
+        | ExprKind::TypeCheck { expr: inner, .. } => {
+            validate_and_find_captures_in_expr(inner, locally_bound, free_vars)
+        }
+        ExprKind::IsPattern { expr: inner, .. } => {
+            validate_and_find_captures_in_expr(inner, locally_bound, free_vars)
+        }
+        ExprKind::If {
+            condition,
+            then_branch,
+            else_branch,
+        } => {
+            validate_and_find_captures_in_expr(condition, locally_bound, free_vars)?;
+            validate_and_find_captures_in_expr(then_branch, locally_bound, free_vars)?;
+            if let Some(eb) = else_branch {
+                validate_and_find_captures_in_expr(eb, locally_bound, free_vars)?;
+            }
+            Ok(())
+        }
+        ExprKind::Block(stmts) => {
+            let mut inner_bound = locally_bound.clone();
+            validate_and_find_captures_in_stmts(stmts, &mut inner_bound, free_vars)
+        }
+        ExprKind::EffectBlock(_) => Err(MirLowerError::UnlowerableExpression(
+            "Nested effect blocks are not supported".into(),
+        )),
+        ExprKind::Return(exprs) => {
+            for e in exprs {
+                validate_and_find_captures_in_expr(e, locally_bound, free_vars)?;
+            }
+            Ok(())
+        }
+        ExprKind::Range { start, end, .. } => {
+            validate_and_find_captures_in_expr(start, locally_bound, free_vars)?;
+            validate_and_find_captures_in_expr(end, locally_bound, free_vars)?;
+            Ok(())
+        }
+    }
+}
+
+fn validate_and_find_captures_in_stmts(
+    stmts: &[Stmt],
+    locally_bound: &mut HashSet<String>,
+    free_vars: &mut HashSet<String>,
+) -> Result<(), MirLowerError> {
+    for stmt in stmts {
+        match &stmt.kind {
+            StmtKind::Local {
+                bindings,
+                initializer,
+            } => {
+                if let Some(inits) = initializer {
+                    for i in inits {
+                        validate_and_find_captures_in_expr(i, locally_bound, free_vars)?;
+                    }
+                }
+                for b in bindings {
+                    locally_bound.insert(b.name.clone());
+                }
+            }
+            StmtKind::Assign { targets, values } => {
+                for v in values {
+                    validate_and_find_captures_in_expr(v, locally_bound, free_vars)?;
+                }
+                for t in targets {
+                    if let ExprKind::Identifier(name) = &t.kind {
+                        if !locally_bound.contains(name) {
+                            return Err(MirLowerError::UnlowerableExpression(format!(
+                                "Write to captured variable '{name}' is not supported in effect thunk"
+                            )));
+                        }
+                    } else {
+                        validate_and_find_captures_in_expr(t, locally_bound, free_vars)?;
+                    }
+                }
+            }
+            StmtKind::CompoundAssign { target, op: _, value } => {
+                validate_and_find_captures_in_expr(value, locally_bound, free_vars)?;
+                if let ExprKind::Identifier(name) = &target.kind {
+                    if !locally_bound.contains(name) {
+                        return Err(MirLowerError::UnlowerableExpression(format!(
+                            "Write to captured variable '{name}' is not supported in effect thunk"
+                        )));
+                    }
+                } else {
+                    validate_and_find_captures_in_expr(target, locally_bound, free_vars)?;
+                }
+            }
+            StmtKind::Expr(e) => {
+                validate_and_find_captures_in_expr(e, locally_bound, free_vars)?;
+            }
+            StmtKind::If {
+                condition,
+                then_block,
+                elseif_branches,
+                else_block,
+            } => {
+                validate_and_find_captures_in_expr(condition, locally_bound, free_vars)?;
+                let mut then_bound = locally_bound.clone();
+                validate_and_find_captures_in_stmts(then_block, &mut then_bound, free_vars)?;
+                for (c, body) in elseif_branches {
+                    validate_and_find_captures_in_expr(c, locally_bound, free_vars)?;
+                    let mut elif_bound = locally_bound.clone();
+                    validate_and_find_captures_in_stmts(body, &mut elif_bound, free_vars)?;
+                }
+                if let Some(eb) = else_block {
+                    let mut else_bound = locally_bound.clone();
+                    validate_and_find_captures_in_stmts(eb, &mut else_bound, free_vars)?;
+                }
+            }
+            StmtKind::While { condition, body } => {
+                validate_and_find_captures_in_expr(condition, locally_bound, free_vars)?;
+                let mut body_bound = locally_bound.clone();
+                validate_and_find_captures_in_stmts(body, &mut body_bound, free_vars)?;
+            }
+            StmtKind::ForNumeric {
+                variable,
+                start,
+                end,
+                step,
+                body,
+            } => {
+                validate_and_find_captures_in_expr(start, locally_bound, free_vars)?;
+                validate_and_find_captures_in_expr(end, locally_bound, free_vars)?;
+                if let Some(s) = step {
+                    validate_and_find_captures_in_expr(s, locally_bound, free_vars)?;
+                }
+                let mut body_bound = locally_bound.clone();
+                body_bound.insert(variable.clone());
+                validate_and_find_captures_in_stmts(body, &mut body_bound, free_vars)?;
+            }
+            StmtKind::ForIn {
+                variables,
+                iterator,
+                body,
+            } => {
+                validate_and_find_captures_in_expr(iterator, locally_bound, free_vars)?;
+                let mut body_bound = locally_bound.clone();
+                for v in variables {
+                    body_bound.insert(v.clone());
+                }
+                validate_and_find_captures_in_stmts(body, &mut body_bound, free_vars)?;
+            }
+            StmtKind::Return(exprs) => {
+                if exprs.is_empty() {
+                    return Err(MirLowerError::UnlowerableExpression(
+                        "Effect thunk return must return an integer value".into(),
+                    ));
+                }
+                for e in exprs {
+                    validate_and_find_captures_in_expr(e, locally_bound, free_vars)?;
+                }
+            }
+            StmtKind::Break | StmtKind::Continue => {}
+            StmtKind::Block(inner) | StmtKind::Scoped(inner) => {
+                let mut inner_bound = locally_bound.clone();
+                validate_and_find_captures_in_stmts(inner, &mut inner_bound, free_vars)?;
+            }
+            StmtKind::Defer(_) | StmtKind::ErrDefer(_) => {
+                return Err(MirLowerError::UnlowerableExpression(
+                    "Cleanups (defer/errdefer) are not supported inside effect thunk".into(),
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 fn const_int_from_expr(expr: &Expr) -> Option<i64> {
