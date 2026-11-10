@@ -152,4 +152,34 @@ impl Compiler {
         self.current_chunk_mut().patch_jump(jump_to_end, end_pos);
         Ok(acc_reg)
     }
+
+    pub(super) fn compile_effect_run_sync(&mut self, stmts: &[Stmt]) -> Result<Register> {
+        let result_reg = self.next_local_slot();
+        if let Some(scope) = self.scopes.last_mut() {
+            scope
+                .locals
+                .insert(format!("(thunk_res_{})", result_reg), (result_reg, false));
+        }
+        self.emit(Instruction::LoadNil(result_reg), 0);
+        let saved_thunk_return = self.thunk_return_target.take();
+        self.thunk_return_target = Some((result_reg, Vec::new()));
+
+        self.begin_scope();
+        for stmt in stmts {
+            self.compile_stmt(stmt)?;
+            self.reset_temp_registers();
+        }
+        self.end_scope()?;
+
+        let (_, return_jumps) = self.thunk_return_target.take().unwrap();
+        self.thunk_return_target = saved_thunk_return;
+
+        let end_pos = self.current_chunk().instructions.len();
+        for jump in return_jumps {
+            self.current_chunk_mut().patch_jump(jump, end_pos);
+        }
+
+        self.reset_temp_registers();
+        Ok(result_reg)
+    }
 }

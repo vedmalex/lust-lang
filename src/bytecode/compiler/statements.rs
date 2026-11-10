@@ -7,6 +7,23 @@ impl Compiler {
                 bindings,
                 initializer,
             } => {
+                if let Some(values) = initializer {
+                    if bindings.len() == 1 && values.len() == 1 {
+                        let mut init_expr = &values[0];
+                        while let ExprKind::Paren(inner) = &init_expr.kind {
+                            init_expr = inner;
+                        }
+                        if let ExprKind::EffectBlock(stmts) = &init_expr.kind {
+                            if let Some(scope) = self.scopes.last_mut() {
+                                scope
+                                    .effect_thunks
+                                    .insert(bindings[0].name.clone(), stmts.clone());
+                            }
+                            return Ok(());
+                        }
+                    }
+                }
+
                 let mut binding_regs = Vec::new();
                 for binding in bindings {
                     let reg = self.next_local_slot();
@@ -223,6 +240,23 @@ impl Compiler {
             }
 
             StmtKind::Return(values) => {
+                if self.thunk_return_target.is_some() {
+                    if values.len() != 1 {
+                        return Err(LustError::CompileError(
+                            "Effect thunk return must return exactly one value".into(),
+                        ));
+                    }
+                    let target_reg = self.thunk_return_target.as_ref().unwrap().0;
+                    let expr_reg = self.compile_expr(&values[0])?;
+                    self.emit(Instruction::Move(target_reg, expr_reg), 0);
+                    self.free_register(expr_reg);
+                    let jump_pos = self.emit(Instruction::Jump(0), 0);
+                    if let Some((_, jumps)) = &mut self.thunk_return_target {
+                        jumps.push(jump_pos);
+                    }
+                    return Ok(());
+                }
+
                 let ret_reg = if values.is_empty() {
                     255
                 } else if values.len() == 1 {

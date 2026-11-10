@@ -57,9 +57,19 @@ impl Compiler {
         let depth = self.scopes.last().map(|s| s.depth + 1).unwrap_or(0);
         self.scopes.push(Scope {
             locals: HashMap::new(),
+            effect_thunks: HashMap::new(),
             depth,
             cleanups: Vec::new(),
         });
+    }
+
+    pub(super) fn lookup_effect_thunk(&self, name: &str) -> Option<Vec<Stmt>> {
+        for scope in self.scopes.iter().rev() {
+            if let Some(thunk) = scope.effect_thunks.get(name) {
+                return Some(thunk.clone());
+            }
+        }
+        None
     }
 
     pub(super) fn end_scope(&mut self) -> Result<()> {

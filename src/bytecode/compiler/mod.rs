@@ -48,6 +48,7 @@ pub struct Compiler {
     minimal_runtime_types: bool,
     pub(super) use_mir: bool,
     pub(super) strict_mir: bool,
+    pub(super) thunk_return_target: Option<(Register, Vec<usize>)>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -65,6 +66,7 @@ pub(super) struct ScopeCleanup {
 #[derive(Debug, Clone)]
 pub(super) struct Scope {
     pub(super) locals: HashMap<String, (Register, bool)>,
+    pub(super) effect_thunks: HashMap<String, Vec<Stmt>>,
     pub(super) depth: usize,
     pub(super) cleanups: Vec<ScopeCleanup>,
 }
@@ -106,6 +108,7 @@ impl Compiler {
             minimal_runtime_types: false,
             use_mir: false,
             strict_mir: false,
+            thunk_return_target: None,
         };
         compiler.configure_stdlib(&LustConfig::default());
         compiler

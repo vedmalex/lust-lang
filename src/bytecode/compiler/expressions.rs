@@ -351,9 +351,7 @@ impl Compiler {
                     while let ExprKind::Paren(inner) = &index_expr.kind {
                         index_expr = inner;
                     }
-                    if self.is_checked_array_index(index_expr.span)
-                        && let ExprKind::Index { object, index } = &index_expr.kind
-                    {
+                    if let ExprKind::Index { object, index } = &index_expr.kind {
                         let obj_reg = self.compile_expr(object)?;
                         let idx_reg = self.compile_expr(index)?;
                         let result_reg = self.allocate_register();
@@ -361,6 +359,20 @@ impl Compiler {
                         self.free_register(obj_reg);
                         self.free_register(idx_reg);
                         return Ok(result_reg);
+                    }
+                }
+
+                if method == "run_sync" && args.is_empty() && type_args.is_none() {
+                    let mut rec = receiver.as_ref();
+                    while let ExprKind::Paren(inner) = &rec.kind {
+                        rec = inner;
+                    }
+                    if let ExprKind::Identifier(name) = &rec.kind {
+                        if let Some(thunk_stmts) = self.lookup_effect_thunk(name) {
+                            return self.compile_effect_run_sync(&thunk_stmts);
+                        }
+                    } else if let ExprKind::EffectBlock(stmts) = &rec.kind {
+                        return self.compile_effect_run_sync(stmts);
                     }
                 }
 
@@ -596,6 +608,7 @@ impl Compiler {
                 self.scopes.clear();
                 let mut lambda_scope = Scope {
                     locals: HashMap::new(),
+                    effect_thunks: HashMap::new(),
                     depth: 0,
                     cleanups: Vec::new(),
                 };
