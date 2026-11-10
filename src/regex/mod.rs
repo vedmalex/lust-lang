@@ -16,7 +16,7 @@ pub mod plan;
 pub mod policy;
 
 pub use compile::compile_bounded;
-pub use execute::{find, is_match, replace_all, RegexMatch};
+pub use execute::{find, find_with_stats, is_match, replace_all, RegexFindStats, RegexMatch};
 pub use plan::RegexPlan;
 pub use policy::{RegexError, RegexWorkTracker};
 
@@ -38,6 +38,14 @@ impl BoundedRegex {
 
     pub fn find(&self, text: &str) -> Result<Option<RegexMatch>, RegexError> {
         find(&self.plan, text)
+    }
+
+    /// Same match as [`Self::find`] plus the number of DFA searches performed.
+    pub fn find_with_stats(
+        &self,
+        text: &str,
+    ) -> Result<(Option<RegexMatch>, RegexFindStats), RegexError> {
+        find_with_stats(&self.plan, text)
     }
 
     pub fn replace(&self, text: &str, replacement: &str) -> Result<String, RegexError> {

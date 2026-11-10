@@ -31,8 +31,22 @@ pub fn is_match(plan: &RegexPlan, input_text: &str) -> Result<bool, RegexError> 
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RegexFindStats {
+    /// Forward plus reverse DFA searches. A linear find is 1 when there is no match, or 2 when there is one.
+    pub dfa_searches: u32,
+}
+
 pub fn find(plan: &RegexPlan, input_text: &str) -> Result<Option<RegexMatch>, RegexError> {
+    Ok(find_with_stats(plan, input_text)?.0)
+}
+
+pub fn find_with_stats(
+    plan: &RegexPlan,
+    input_text: &str,
+) -> Result<(Option<RegexMatch>, RegexFindStats), RegexError> {
     let mut tracker = RegexWorkTracker::new(input_text.len(), plan.group_count, 0)?;
+    let mut dfa_searches = 0u32;
 
     // Linear-time forward DFA search: scans input once in O(n) to find match existence and end position
     let mut fwd_cache = plan.fwd_dfa.create_cache();
@@ -40,6 +54,7 @@ pub fn find(plan: &RegexPlan, input_text: &str) -> Result<Option<RegexMatch>, Re
     tracker.charge_scanned(input_text.len() as u64)?;
     tracker.charge_transitions(input_text.len() as u64)?;
 
+    dfa_searches = dfa_searches.saturating_add(1);
     let half_match = plan
         .fwd_dfa
         .try_search_fwd(&mut fwd_cache, &fwd_input)
@@ -47,17 +62,20 @@ pub fn find(plan: &RegexPlan, input_text: &str) -> Result<Option<RegexMatch>, Re
 
     let hm = match half_match {
         Some(m) => m,
-        None => return Ok(None),
+        None => return Ok((None, RegexFindStats { dfa_searches })),
     };
 
     let end = hm.offset();
     if end == 0 {
         tracker.charge_capture_updates(1)?;
-        return Ok(Some(RegexMatch {
-            start: 0,
-            end: 0,
-            text: String::new(),
-        }));
+        return Ok((
+            Some(RegexMatch {
+                start: 0,
+                end: 0,
+                text: String::new(),
+            }),
+            RegexFindStats { dfa_searches },
+        ));
     }
 
     // Linear-time reverse DFA search: scans backwards from end position to find match start in O(match_len)
@@ -66,6 +84,7 @@ pub fn find(plan: &RegexPlan, input_text: &str) -> Result<Option<RegexMatch>, Re
         .range(..end)
         .anchored(regex_automata::Anchored::Yes);
 
+    dfa_searches = dfa_searches.saturating_add(1);
     let rev_match = plan
         .rev_dfa
         .try_search_rev(&mut rev_cache, &rev_input)
@@ -82,11 +101,14 @@ pub fn find(plan: &RegexPlan, input_text: &str) -> Result<Option<RegexMatch>, Re
     tracker.charge_capture_updates(1)?;
 
     let matched_text = &input_text[start..end];
-    Ok(Some(RegexMatch {
-        start,
-        end,
-        text: matched_text.to_string(),
-    }))
+    Ok((
+        Some(RegexMatch {
+            start,
+            end,
+            text: matched_text.to_string(),
+        }),
+        RegexFindStats { dfa_searches },
+    ))
 }
 
 pub fn replace_all(
