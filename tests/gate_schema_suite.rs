@@ -1790,11 +1790,83 @@ end
         .expect("compile-time data import succeeds");
     assert_eq!(prog.modules.len(), 1);
 
-    // Byte digest caching: unchanged file is not reparsed
-    let cache = loader.data_cache();
-    assert_eq!(cache.len(), 1);
-    let (digest, _) = cache.get(&config_path).unwrap();
-    assert_eq!(*digest, ModuleLoader::digest_bytes(&fs::read(&config_path).unwrap()));
+    // Record initial cache digest and verify initial port 5432
+    let (initial_digest, initial_val) = {
+        let cache = loader.data_cache();
+        assert_eq!(cache.len(), 1);
+        let (d, v) = cache
+            .get(&config_path)
+            .expect("config_path present in data cache");
+        let initial_bytes = fs::read(&config_path).unwrap();
+        assert_eq!(*d, ModuleLoader::digest_bytes(&initial_bytes));
+        let doc = v.as_document().expect("data import parsed as document");
+        assert_eq!(
+            doc.get("port"),
+            Some(&DataValue::Number(ExactNumber::Int(5432)))
+        );
+        (*d, v.clone())
+    };
+
+    // Overwrite config.json with identical length, port 6432
+    let new_json = r#"{"database": "lust_db", "port": 6432, "ssl": true}"#;
+    fs::write(&config_path, new_json).unwrap();
+    let read_back = fs::read(&config_path).unwrap();
+    assert_eq!(read_back, new_json.as_bytes());
+    let new_file_digest = ModuleLoader::digest_bytes(&read_back);
+    assert_ne!(
+        new_file_digest, initial_digest,
+        "new file content must produce different digest"
+    );
+
+    // Reload via the same loader without clearing cache or creating a new loader
+    let reloaded = loader
+        .load_data_import(&config_path)
+        .expect("data import reload succeeds");
+    assert_ne!(
+        reloaded, initial_val,
+        "returned data value must differ from initial value"
+    );
+    let reloaded_doc = reloaded
+        .as_document()
+        .expect("reloaded data import returns document");
+    assert_eq!(
+        reloaded_doc.get("port"),
+        Some(&DataValue::Number(ExactNumber::Int(6432))),
+        "reloaded document port must be 6432"
+    );
+
+    // Cache must have one entry with the new digest and new value (port 6432)
+    {
+        let cache = loader.data_cache();
+        assert_eq!(cache.len(), 1, "cache must still have exactly one entry");
+        let (cached_digest, cached_val) = cache
+            .get(&config_path)
+            .expect("config_path present in data cache after reload");
+        assert_eq!(
+            *cached_digest, new_file_digest,
+            "cached digest must match new file digest"
+        );
+        assert_ne!(
+            *cached_digest, initial_digest,
+            "cached digest must not equal old digest"
+        );
+        assert_eq!(
+            cached_val, &reloaded,
+            "cached value must equal returned new value"
+        );
+        assert_ne!(
+            cached_val, &initial_val,
+            "cached value must not equal old value"
+        );
+        let cached_doc = cached_val
+            .as_document()
+            .expect("cached value must be document");
+        assert_eq!(
+            cached_doc.get("port"),
+            Some(&DataValue::Number(ExactNumber::Int(6432))),
+            "cached document port must be 6432"
+        );
+    }
 
     // Missing file emits compile error
     let missing_path = dir.join("missing.lust");
