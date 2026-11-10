@@ -1908,18 +1908,22 @@ end
 #[test]
 fn test_gate_schema_11_callable_semantics() {
     use lust::ast::{Expr, ExprKind, Span};
+    use lust::mir::cranelift_backend::jit_engine::CraneliftJitCompiler;
     use lust::mir::cranelift_backend::MirCraneliftBackendError;
-    use lust::mir::ir::{FunctionSignature, MirFunction, MirType};
+    use lust::mir::ir::{
+        FunctionSignature, MirConstant, MirFunction, MirType, Operand, Terminator,
+    };
     use lust::mir::lowering::{AstLowering, MirLowerError};
 
-    // 1. AstLowering lower_expr must emit error on unlowerable expression rather than silent Unit
+    // 1. AstLowering lower_expr must emit error on unlowerable bare EffectBlock in unsupported
+    //    bare value context rather than silent Unit (only local bindings are supported for effect blocks).
     let dummy_expr = Expr::new(
-        ExprKind::EffectBlock(vec![]), // Not lowerable to primitive value
+        ExprKind::EffectBlock(vec![]), // Unsupported bare value context; only local bindings are supported
         Span::dummy(),
     );
     let mut mir_fn = MirFunction::new(
         FunctionSignature {
-            name: "dummy_fn".into(),
+            name: "gate_11_bare_effect_fn".into(),
             param_types: vec![],
             return_type: MirType::Int,
             is_public: true,
@@ -1931,16 +1935,64 @@ fn test_gate_schema_11_callable_semantics() {
     let lower_res = lowering.lower_expr(&dummy_expr);
     assert!(
         matches!(lower_res, Err(MirLowerError::UnlowerableExpression(..))),
-        "unlowerable expression must emit UnlowerableExpression error, not silent Unit"
+        "bare EffectBlock in unsupported value context must emit UnlowerableExpression error, not silent Unit"
     );
+    if let Err(MirLowerError::UnlowerableExpression(msg)) = &lower_res {
+        assert!(
+            msg.contains("Bare EffectBlock in unsupported value context"),
+            "expected diagnostic text for unsupported bare value context, got: {msg}"
+        );
+    }
 
-    // 2. Cranelift MIR must not replace failed/unlowerable value with silent Unit
-    let unlowerable_err = MirCraneliftBackendError::UnlowerableValue(
-        "failed or unlowerable value cannot be evaluated as Unit in Cranelift backend".to_string(),
-    );
+    // 2. Cranelift MIR compiler must reject an explicit Unit operand on an Int return path with UnlowerableValue
+    let sig_unit = FunctionSignature {
+        name: "gate_11_reject_unit_fn".into(),
+        param_types: vec![],
+        return_type: MirType::Int,
+        is_public: true,
+        effects: None,
+    };
+    let mut mir_fn_unit = MirFunction::new(sig_unit, Span::dummy());
+    let unit_entry = mir_fn_unit.entry;
+    mir_fn_unit.blocks[unit_entry.0].terminator = Some(Terminator::Return(
+        Some(Operand::Constant(MirConstant::Unit)),
+        Span::dummy(),
+    ));
+
+    let mut jit_compiler = CraneliftJitCompiler::new().expect("fresh CraneliftJitCompiler must initialize");
+    let compile_unit_res = jit_compiler.compile_function(&mir_fn_unit);
+    match &compile_unit_res {
+        Err(err @ MirCraneliftBackendError::UnlowerableValue(..)) => {
+            assert!(
+                err.to_string().contains("silent Unit"),
+                "error message must explicitly declare rejection of silent Unit fallback: {err}"
+            );
+        }
+        other => {
+            panic!("expected Err(MirCraneliftBackendError::UnlowerableValue(..)), got: {other:?}");
+        }
+    }
+
+    // 3. Positive control: same shape with Constant(Int(7)), fresh compiler, compilation succeeds
+    let sig_pos = FunctionSignature {
+        name: "gate_11_positive_int_fn".into(),
+        param_types: vec![],
+        return_type: MirType::Int,
+        is_public: true,
+        effects: None,
+    };
+    let mut mir_fn_int = MirFunction::new(sig_pos, Span::dummy());
+    let pos_entry = mir_fn_int.entry;
+    mir_fn_int.blocks[pos_entry.0].terminator = Some(Terminator::Return(
+        Some(Operand::Constant(MirConstant::Int(7))),
+        Span::dummy(),
+    ));
+
+    let mut jit_compiler_pos = CraneliftJitCompiler::new().expect("fresh CraneliftJitCompiler must initialize");
+    let compile_pos_res = jit_compiler_pos.compile_function(&mir_fn_int);
     assert!(
-        unlowerable_err.to_string().contains("silent Unit"),
-        "error message must explicitly declare rejection of silent Unit fallback"
+        compile_pos_res.is_ok(),
+        "positive control with Constant(Int(7)) must compile successfully, got: {compile_pos_res:?}"
     );
 }
 
