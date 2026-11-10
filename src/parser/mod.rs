@@ -138,7 +138,10 @@ impl Parser {
             | TokenKind::Module
             | TokenKind::Extern => true,
             TokenKind::Identifier
-                if self.current_token().lexeme == "service" || self.is_test_or_suite_start() =>
+                if self.current_token().lexeme == "service"
+                    || (self.current_token().lexeme == "export"
+                        && self.peek_ahead(1).is_some_and(|t| matches!(t.kind, TokenKind::Use | TokenKind::Function | TokenKind::Struct | TokenKind::Enum)))
+                    || self.is_test_or_suite_start() =>
             {
                 true
             }

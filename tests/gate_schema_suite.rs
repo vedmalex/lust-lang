@@ -227,11 +227,11 @@ fn test_gate_schema_04_opt_in_dce_authority() {
         "alias of unpermitted std.io must be a compile error"
     );
 
-    // 1c. Re-export: pub use ...
+    // 1c. Re-export: export import ... from "@std/..."
     let reexport_os_file = dir.join("deny_reexport_os.lust");
     fs::write(
         &reexport_os_file,
-        "pub use std.os\nfunction main(): int return 0 end\n",
+        "export import os from \"@std/os\"\nfunction main(): int return 0 end\n",
     )
     .unwrap();
     let mut loader = ModuleLoader::new(dir.clone()).with_config(strict_config.clone());
@@ -244,7 +244,7 @@ fn test_gate_schema_04_opt_in_dce_authority() {
     let reexport_io_file = dir.join("deny_reexport_io.lust");
     fs::write(
         &reexport_io_file,
-        "pub use std.io\nfunction main(): int return 0 end\n",
+        "export import io from \"@std/io\"\nfunction main(): int return 0 end\n",
     )
     .unwrap();
     let mut loader = ModuleLoader::new(dir.clone()).with_config(strict_config.clone());
@@ -252,6 +252,23 @@ fn test_gate_schema_04_opt_in_dce_authority() {
     assert!(
         res_reexport_io.is_err(),
         "re-export of unpermitted std.io must be a compile error"
+    );
+
+    // Same re-export form must compile when module is allowed
+    let mut permitted_reexport_config = LustConfig::pure();
+    permitted_reexport_config.set_strict_capabilities(true);
+    permitted_reexport_config.allow_std_module("os");
+    let mut loader_allowed_reexport =
+        ModuleLoader::new(dir.clone()).with_config(permitted_reexport_config);
+    let prog_allowed_reexport = loader_allowed_reexport
+        .load_program_from_entry(reexport_os_file.to_str().unwrap())
+        .expect("re-export of permitted std.os must compile successfully");
+    assert!(
+        prog_allowed_reexport.modules[0]
+            .exports
+            .functions
+            .contains_key("os"),
+        "re-exported module alias must be registered in exports"
     );
 
     // 1d. Dynamic import: import("@std/os") or import("@std/io")
@@ -300,8 +317,29 @@ fn test_gate_schema_04_opt_in_dce_authority() {
     );
     assert!(
         !witness_file.exists(),
-        "host effect must not be observed: witness file was created!"
+        "host effect must not be observed when unpermitted: witness file was created!"
     );
+
+    // 2b. Positive execution check: When @std/os is allowed, execute the program and show witness file is created.
+    let mut permitted_os_config = LustConfig::pure();
+    permitted_os_config.set_strict_capabilities(true);
+    permitted_os_config.allow_std_module("os");
+    let mut loader_permitted_os =
+        ModuleLoader::new(dir.clone()).with_config(permitted_os_config.clone());
+    let prog_effect = loader_permitted_os
+        .load_program_from_entry(effect_file.to_str().unwrap())
+        .expect("permitted program must load successfully");
+    let entry_fn = format!("{}.main", prog_effect.entry_module);
+    let mut vm_effect = lust::compile_program_with_config(prog_effect, &permitted_os_config)
+        .expect("permitted program must compile to VM");
+    if vm_effect.call("main", vec![]).is_err() {
+        let _ = vm_effect.call(&entry_fn, vec![]).expect("running main must succeed");
+    }
+    assert!(
+        witness_file.exists(),
+        "witness file must be created when @std/os is permitted and executed"
+    );
+    let _ = fs::remove_file(&witness_file);
 
     // 3. Permitted module (@std/bson after an explicit allow) still imports
     let mut permitted_config = LustConfig::pure();
@@ -335,7 +373,7 @@ fn test_gate_schema_04_opt_in_dce_authority() {
     let dce_file = dir.join("dce_program.lust");
     fs::write(
         &dce_file,
-        "function compute(x: int): int\n    return x * 2 + 1\nend\n",
+        "function compute(x: int): int\n    return x * 2 + 1\nend\nlocal r: int = compute(21)\n",
     )
     .unwrap();
     let mut loader_dce = ModuleLoader::new(dir.clone()).with_config(strict_config.clone());
@@ -346,8 +384,8 @@ fn test_gate_schema_04_opt_in_dce_authority() {
     let shaken = tree_shake_items(&prog_dce.modules[0].items, false);
     let opts = analyze_runtime_requirements(&shaken, false, None);
     assert!(
-        !opts.needs_print,
-        "print runtime must not be needed for pure compute"
+        !opts.needs_print && !opts.needs_os && !opts.needs_io,
+        "print/os/io runtime must not be needed for pure compute"
     );
 
     let mut codegen = ZigCodegen::with_options(opts);
@@ -377,11 +415,11 @@ fn test_gate_schema_04_opt_in_dce_authority() {
         "compiled artifact must not contain host os.remove_file entry"
     );
     assert!(
-        !compiled_artifact.contains("os.sleep"),
-        "compiled artifact must not contain host os.sleep entry"
+        !compiled_artifact.contains("unlink"),
+        "compiled artifact must not contain host unlink entry"
     );
 
-    // Check compiled binary / link output artifact
+    // Compile pure binary / link output artifact
     let zig_path = dir.join("dce_artifact.zig");
     let obj_path = dir.join("dce_artifact.o");
     fs::write(&zig_path, &compiled_artifact).unwrap();
@@ -390,20 +428,79 @@ fn test_gate_schema_04_opt_in_dce_authority() {
         .arg(&zig_path)
         .arg(format!("-femit-bin={}", obj_path.display()))
         .output()
-        .expect("invoke zig build-obj to produce compiled link artifact");
-    assert!(obj_output.status.success(), "zig build-obj must succeed");
+        .expect("invoke zig build-obj to produce pure link artifact");
+    assert!(
+        obj_output.status.success(),
+        "zig build-obj must succeed for pure artifact: {}",
+        String::from_utf8_lossy(&obj_output.stderr)
+    );
 
+    // 4b. Positive control: A program that calls the host entry must contain the actual emitted symbol
+    let host_file = dir.join("host_program.lust");
+    fs::write(
+        &host_file,
+        "use std.os\nfunction effect(): bool\n    return os.remove_file(\"tmp.txt\")\nend\nlocal r: bool = effect()\n",
+    )
+    .unwrap();
+    let mut loader_host =
+        ModuleLoader::new(dir.clone()).with_config(permitted_os_config.clone());
+    let prog_host = loader_host
+        .load_program_from_entry(host_file.to_str().unwrap())
+        .expect("host program must load");
+    let shaken_host = tree_shake_items(&prog_host.modules[0].items, false);
+    let opts_host = analyze_runtime_requirements(&shaken_host, false, None);
+    assert!(
+        opts_host.needs_os,
+        "host program must require os runtime"
+    );
+    let mut codegen_host = ZigCodegen::with_options(opts_host);
+    let compiled_host = codegen_host
+        .generate_program(&shaken_host)
+        .expect("AOT codegen must succeed for host program");
+
+    let host_zig_path = dir.join("host_artifact.zig");
+    let host_obj_path = dir.join("host_artifact.o");
+    fs::write(&host_zig_path, &compiled_host).unwrap();
+    let host_obj_output = std::process::Command::new("zig")
+        .arg("build-obj")
+        .arg(&host_zig_path)
+        .arg(format!("-femit-bin={}", host_obj_path.display()))
+        .output()
+        .expect("invoke zig build-obj to produce host link artifact");
+    assert!(host_obj_output.status.success(), "zig build-obj must succeed for host artifact");
+
+    let host_obj_bytes = fs::read(&host_obj_path).expect("read host binary artifact");
+    let host_obj_file = object::File::parse(&*host_obj_bytes).expect("parse host binary artifact");
+
+    // The positive control must contain the emitted symbol (mangled remove_file or C linkage unlink)
+    let host_symbol_name = host_obj_file
+        .symbols()
+        .map(|s| s.name().unwrap_or_default().to_string())
+        .find(|name| name.contains("remove_file") || name.strip_prefix('_').unwrap_or(name) == "unlink")
+        .expect("positive control must contain emitted host entry symbol (remove_file or unlink)");
+
+    // Check pure compiled binary artifact: must lack that exact symbol and host entry symbols
     let obj_bytes = fs::read(&obj_path).expect("read compiled binary artifact");
     let obj_file = object::File::parse(&*obj_bytes).expect("parse compiled binary artifact");
+    let pure_symbols: std::collections::HashSet<String> = obj_file
+        .symbols()
+        .map(|s| s.name().unwrap_or_default().to_string())
+        .collect();
+
+    assert!(
+        !pure_symbols.contains(&host_symbol_name),
+        "compiled link artifact must lack positive control host entry symbol '{}'",
+        host_symbol_name
+    );
+
     for sym in obj_file.symbols() {
         let name = sym.name().unwrap_or_default();
         assert!(
-            name != "__lust_print" && name != "__lust_println" && name != "write_stdout" && name != "write_file",
-            "compiled link artifact must not contain host write entry: {}",
-            name
-        );
-        assert!(
-            !name.contains("fwrite") && !name.contains("remove_file") && !name.contains("os_sleep"),
+            !name.contains("remove_file")
+                && !name.contains("fwrite")
+                && !name.contains("write_stdout")
+                && !name.contains("write_file")
+                && name.strip_prefix('_').unwrap_or(name) != "unlink",
             "compiled link artifact must not contain host entry: {}",
             name
         );

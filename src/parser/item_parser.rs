@@ -21,8 +21,13 @@ impl Parser {
         self.collect_pending_docs();
         let doc = self.take_pending_docs();
         let start_token = self.current_token().clone();
+        let mut is_export = false;
         let visibility = if self.match_token(&[TokenKind::Local]) {
             Visibility::Private
+        } else if self.check(TokenKind::Identifier) && self.current_token().lexeme == "export" {
+            self.advance();
+            is_export = true;
+            Visibility::Public
         } else {
             Visibility::Public
         };
@@ -74,7 +79,7 @@ impl Parser {
                                 self.consume(TokenKind::RightBrace, "Expected '}' after glob")?;
                                 return Ok(Item::new(
                                     ItemKind::Use {
-                                        public: false,
+                                        public: is_export,
                                         tree: crate::ast::UseTree::Glob { prefix: path },
                                     },
                                     self.make_span(&start_token, &self.tokens[self.current - 1]),
@@ -104,7 +109,7 @@ impl Parser {
                         let end_token = self.tokens[self.current - 1].clone();
                         return Ok(Item::new(
                             ItemKind::Use {
-                                public: false,
+                                public: is_export,
                                 tree: crate::ast::UseTree::Group {
                                     prefix: path,
                                     items,
@@ -118,7 +123,7 @@ impl Parser {
                         let end_token = self.tokens[self.current - 1].clone();
                         return Ok(Item::new(
                             ItemKind::Use {
-                                public: false,
+                                public: is_export,
                                 tree: crate::ast::UseTree::Glob { prefix: path },
                             },
                             self.make_span(&start_token, &end_token),
@@ -134,7 +139,7 @@ impl Parser {
                     None
                 };
                 ItemKind::Use {
-                    public: false,
+                    public: is_export,
                     tree: crate::ast::UseTree::Path {
                         path,
                         alias,

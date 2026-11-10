@@ -602,12 +602,23 @@ fn extract_dynamic_import_target(line: &str) -> Option<String> {
     None
 }
 
-fn parse_import_statement(line: &str) -> Option<(String, String)> {
+fn parse_import_statement(line: &str) -> Option<(bool, String, String)> {
     let trimmed = line.trim();
-    if trimmed.starts_with("//") || trimmed.starts_with("--") || !trimmed.starts_with("import") {
+    if trimmed.starts_with("//") || trimmed.starts_with("--") {
         return None;
     }
-    let after_import = trimmed.strip_prefix("import")?;
+    let (is_export, rest) = if let Some(stripped) = trimmed.strip_prefix("export") {
+        if !stripped.chars().next().map_or(false, |c| c.is_whitespace()) {
+            return None;
+        }
+        (true, stripped.trim_start())
+    } else {
+        (false, trimmed)
+    };
+    if !rest.starts_with("import") {
+        return None;
+    }
+    let after_import = rest.strip_prefix("import")?;
     if after_import.is_empty() || !after_import.chars().next()?.is_whitespace() {
         return None;
     }
@@ -623,7 +634,7 @@ fn parse_import_statement(line: &str) -> Option<(String, String)> {
     {
         if after_from.len() >= 2 {
             let path = after_from[1..after_from.len() - 1].to_string();
-            return Some((ident.to_string(), path));
+            return Some((is_export, ident.to_string(), path));
         }
     }
     None
@@ -632,7 +643,10 @@ fn parse_import_statement(line: &str) -> Option<(String, String)> {
 fn preprocess_embedded_source(source: &str, config: &crate::config::LustConfig) -> Result<String> {
     let mut result = String::with_capacity(source.len());
     for line in source.lines() {
-        let processed_line = if line.trim_start().starts_with("use @std/") || line.trim_start().starts_with("pub use @std/") {
+        let processed_line = if line.trim_start().starts_with("use @std/")
+            || line.trim_start().starts_with("pub use @std/")
+            || line.trim_start().starts_with("export use @std/")
+        {
             line.replace("@std/", "std.")
         } else {
             line.to_string()
@@ -649,7 +663,7 @@ fn preprocess_embedded_source(source: &str, config: &crate::config::LustConfig) 
             }
         }
 
-        if let Some((ident, import_path)) = parse_import_statement(&processed_line) {
+        if let Some((is_export, ident, import_path)) = parse_import_statement(&processed_line) {
             if crate::builtins::is_virtual_std_module(&import_path) {
                 if !config.is_std_module_allowed(&import_path) {
                     return Err(LustError::CompileError(format!(
@@ -658,7 +672,11 @@ fn preprocess_embedded_source(source: &str, config: &crate::config::LustConfig) 
                     )));
                 }
                 let canon = crate::builtins::canonical_std_module_name(&import_path);
-                result.push_str(&format!("use std.{} as {}\n", canon, ident));
+                if is_export {
+                    result.push_str(&format!("export use std.{} as {}\n", canon, ident));
+                } else {
+                    result.push_str(&format!("use std.{} as {}\n", canon, ident));
+                }
                 continue;
             }
         }
@@ -1093,13 +1111,20 @@ fn apply_reexport(
             let item = path.last().unwrap().clone();
             let alias_name = alias.clone().unwrap_or_else(|| item.clone());
             let fq = format!("{}.{}", module, item);
-            let classification = classify_import_target(registry, &module, &item);
-            if classification.import_type {
-                exports.types.insert(alias_name.clone(), fq.clone());
-            }
+            if crate::builtins::is_virtual_std_module(&fq) {
+                for (fn_name, fn_fq) in crate::builtins::virtual_std_module_functions(&fq) {
+                    exports.functions.insert(format!("{}.{}", alias_name, fn_name), fn_fq.to_string());
+                }
+                exports.functions.insert(alias_name.clone(), fq.clone());
+            } else {
+                let classification = classify_import_target(registry, &module, &item);
+                if classification.import_type {
+                    exports.types.insert(alias_name.clone(), fq.clone());
+                }
 
-            if classification.import_value {
-                exports.functions.insert(alias_name, fq);
+                if classification.import_value {
+                    exports.functions.insert(alias_name, fq);
+                }
             }
 
             Ok(())
