@@ -405,3 +405,50 @@ fn test_rx_two_cold_subscriptions_independent() {
     assert_eq!(*rec1.lock().unwrap(), vec![10, 20, 30]);
     assert_eq!(*rec2.lock().unwrap(), vec![10, 20, 30]);
 }
+
+#[test]
+fn test_rx_take_cancels_upstream_immediately() {
+    let scheduler = Arc::new(RxScheduler::new_virtual());
+    let scope_id = 110;
+
+    let upstream_produced = Arc::new(AtomicUsize::new(0));
+    let up_clone = upstream_produced.clone();
+
+    let stream = Observable::<i64, String>::from_producer(move |control| {
+        for i in 0..100 {
+            if !control.is_active() {
+                break;
+            }
+            up_clone.fetch_add(1, Ordering::SeqCst);
+            if let Err(_) = control.deliver_next(i) {
+                break;
+            }
+        }
+        control.complete();
+        Ok(())
+    });
+
+    let received = Arc::new(Mutex::new(Vec::new()));
+    let r_clone = received.clone();
+
+    let sub = stream
+        .take(3)
+        .subscribe(
+            Observer::from_next(move |val: i64| {
+                r_clone.lock().unwrap().push(val);
+                Ok(())
+            }),
+            scope_id,
+            BufferOptions::default_bounded(),
+            scheduler.clone(),
+        )
+        .unwrap();
+
+    scheduler.run_until_quiescent(100);
+
+    let completion = sub.join(Some(Duration::from_millis(100))).unwrap();
+    assert_eq!(completion.exit, ExitStatus::Completed);
+    assert_eq!(*received.lock().unwrap(), vec![0, 1, 2]);
+    // Upstream should have stopped after producing item 3 (or 3 attempts), NOT 100!
+    assert!(upstream_produced.load(Ordering::SeqCst) <= 4);
+}

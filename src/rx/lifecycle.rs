@@ -1,12 +1,74 @@
 //! Reactive Lifecycle State Machine, Subscription, and Observer implementations.
 
 use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
 use super::buffer::{BoundedQueue, BufferOptions, MeasurableItem};
 use super::scheduler::ScopeJoinCoordinator;
 use super::RxError;
+
+/// Re-entrant admission gate that serializes callback start and terminal transitions
+/// while permitting re-entrant calls (such as self-unsubscribe or self-completion)
+/// from within an active callback on the same thread.
+#[derive(Default)]
+pub struct AdmissionGate {
+    state: Mutex<(Option<u64>, usize)>,
+    cond: Condvar,
+}
+
+pub struct AdmissionGuard<'a> {
+    gate: &'a AdmissionGate,
+}
+
+impl AdmissionGate {
+    pub fn new() -> Self {
+        Self {
+            state: Mutex::new((None, 0)),
+            cond: Condvar::new(),
+        }
+    }
+
+    pub fn lock(&self) -> AdmissionGuard<'_> {
+        let tid = thread_id_to_u64();
+        let mut st = self.state.lock().unwrap();
+        loop {
+            match *st {
+                (Some(holder), ref mut depth) if holder == tid => {
+                    *depth += 1;
+                    return AdmissionGuard { gate: self };
+                }
+                (None, _) => {
+                    *st = (Some(tid), 1);
+                    return AdmissionGuard { gate: self };
+                }
+                _ => {
+                    st = self.cond.wait(st).unwrap();
+                }
+            }
+        }
+    }
+
+    fn unlock(&self) {
+        let tid = thread_id_to_u64();
+        let mut st = self.state.lock().unwrap();
+        if let (Some(holder), ref mut depth) = *st {
+            if holder == tid {
+                *depth -= 1;
+                if *depth == 0 {
+                    *st = (None, 0);
+                    self.cond.notify_one();
+                }
+            }
+        }
+    }
+}
+
+impl<'a> Drop for AdmissionGuard<'a> {
+    fn drop(&mut self) {
+        self.gate.unlock();
+    }
+}
 
 /// Lifecycle states of a subscription as defined in RFC §16.3 and Astra's brief.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -81,7 +143,7 @@ pub struct SubscriptionControl<T: MeasurableItem + Send + 'static, E: Clone + Se
     pub queue: Mutex<BoundedQueue<T>>,
     next_fn: Mutex<Option<Box<dyn FnMut(T) -> Result<(), RxError<E>> + Send + 'static>>>,
     terminal_fn: Mutex<Option<TerminalHandlers<E>>>,
-    pub admission_gate: Mutex<()>,
+    pub admission_gate: AdmissionGate,
     pub coordinator: Arc<ScopeJoinCoordinator>,
     pub items_delivered: AtomicUsize,
     pub current_executing_thread: AtomicU64,
@@ -106,7 +168,7 @@ impl<T: MeasurableItem + Send + 'static, E: Clone + Send + 'static> Subscription
             queue: Mutex::new(BoundedQueue::new(options)),
             next_fn: Mutex::new(Some(observer.on_next)),
             terminal_fn: Mutex::new(Some(terminal)),
-            admission_gate: Mutex::new(()),
+            admission_gate: AdmissionGate::new(),
             coordinator,
             items_delivered: AtomicUsize::new(0),
             current_executing_thread: AtomicU64::new(0),
@@ -120,7 +182,7 @@ impl<T: MeasurableItem + Send + 'static, E: Clone + Send + 'static> Subscription
     /// - Close admission gate: no new callbacks will start
     /// - Record ExitStatus::Cancelled if no terminal outcome committed yet
     pub fn cancel(&self) {
-        let _gate = self.admission_gate.lock().unwrap();
+        let _gate = self.admission_gate.lock();
         let mut state = self.state.lock().unwrap();
         if *state != SubscriptionState::Active {
             return;
@@ -147,17 +209,20 @@ impl<T: MeasurableItem + Send + 'static, E: Clone + Send + 'static> Subscription
     /// Deliver next item to observer.
     /// Inviolable invariant: No callback starts after cancel() has committed!
     pub fn deliver_next(&self, item: T) -> Result<(), RxError<E>> {
-        // Linearized admission check: serialized with cancel()
+        // Hold admission gate across the entire callback.
+        // Serialized with cancel(), complete(), and fail().
+        // Re-entrant calls from same thread (e.g. self-cancel) succeed without deadlock.
+        let _gate = self.admission_gate.lock();
+
         {
-            let _gate = self.admission_gate.lock().unwrap();
             let state = self.state.lock().unwrap();
             if *state != SubscriptionState::Active {
                 return Err(RxError::Cancelled);
             }
-            // Mark current executing thread for SelfJoin detection
-            let current_tid = thread_id_to_u64();
-            self.current_executing_thread.store(current_tid, Ordering::SeqCst);
-        } // _gate and state locks dropped HERE before calling observer code!
+        }
+
+        let current_tid = thread_id_to_u64();
+        self.current_executing_thread.store(current_tid, Ordering::SeqCst);
 
         let mut next_guard = self.next_fn.lock().unwrap();
         let res = if let Some(ref mut next_cb) = *next_guard {
@@ -185,6 +250,7 @@ impl<T: MeasurableItem + Send + 'static, E: Clone + Send + 'static> Subscription
     /// Terminal callback is executed OUTSIDE of all mutexes to eliminate reentrancy deadlocks.
     pub fn complete(&self) {
         let action = {
+            let _gate = self.admission_gate.lock();
             let mut state = self.state.lock().unwrap();
             if *state == SubscriptionState::Active {
                 *state = SubscriptionState::Stopping;
@@ -209,6 +275,7 @@ impl<T: MeasurableItem + Send + 'static, E: Clone + Send + 'static> Subscription
     /// Terminal callback is executed OUTSIDE of all mutexes to eliminate reentrancy deadlocks.
     pub fn fail(&self, err: RxError<E>) {
         let action = {
+            let _gate = self.admission_gate.lock();
             let mut state = self.state.lock().unwrap();
             if *state == SubscriptionState::Active {
                 *state = SubscriptionState::Stopping;

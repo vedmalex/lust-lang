@@ -151,6 +151,10 @@ impl<T: MeasurableItem + Send + Sync + 'static, E: Clone + Send + 'static> Obser
             let taken = Arc::new(std::sync::atomic::AtomicUsize::new(0));
             let taken_clone = taken.clone();
             let ds_ctrl = downstream_ctrl.clone();
+            let upstream_ctrl_holder: Arc<std::sync::Mutex<Option<Arc<SubscriptionControl<T, E>>>>> =
+                Arc::new(std::sync::Mutex::new(None));
+            let holder_clone = upstream_ctrl_holder.clone();
+
             let upstream_ctrl = Arc::new(SubscriptionControl::new(
                 downstream_ctrl.scope_id,
                 BufferOptions::default_bounded(),
@@ -161,6 +165,9 @@ impl<T: MeasurableItem + Send + Sync + 'static, E: Clone + Send + 'static> Obser
                             let res = ds_ctrl.deliver_next(item);
                             if current + 1 == count {
                                 ds_ctrl.complete();
+                                if let Some(ref up) = *holder_clone.lock().unwrap() {
+                                    up.cancel();
+                                }
                             }
                             res
                         } else {
@@ -178,6 +185,9 @@ impl<T: MeasurableItem + Send + Sync + 'static, E: Clone + Send + 'static> Obser
                 ),
                 downstream_ctrl.coordinator.clone(),
             ));
+
+            *upstream_ctrl_holder.lock().unwrap() = Some(upstream_ctrl.clone());
+
             let res = upstream_producer(upstream_ctrl);
             if let Err(RxError::Cancelled) = res {
                 Ok(())
