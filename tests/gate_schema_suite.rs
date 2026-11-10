@@ -2011,6 +2011,8 @@ fn test_gate_schema_12_rx_lifecycle_backpressure() {
 // ============================================================================
 #[test]
 fn test_gate_schema_13_ffi_semantic_boundary() {
+    // Descriptor and generated-declaration regression checks only. No C/Zig compilation
+    // or foreign invocation is performed; semantic FFI safety remains CONCERNS.
     use lust::ast::{FieldOwnership, Span, StructDef, StructField, Type, TypeKind, Visibility};
     use lust::codegen_zig::{generate_c_header, struct_c_abi_descriptor, verify_struct_c_abi_layout, ZigCodegen};
 
@@ -2046,7 +2048,7 @@ fn test_gate_schema_13_ffi_semantic_boundary() {
         doc: None,
     };
 
-    // 1. C ABI descriptor matches struct definition field-for-field
+    // 1. Descriptor identity/order and modeled offset checks
     let desc = struct_c_abi_descriptor(&s);
     assert_eq!(desc.type_name, "TelemetryPacket");
     assert_eq!(desc.fields.len(), 3);
@@ -2058,7 +2060,7 @@ fn test_gate_schema_13_ffi_semantic_boundary() {
     assert_eq!(desc.fields[2].name, "temperature");
     assert_eq!(desc.fields[2].byte_offset, 16);
 
-    // 2. Zig AOT struct lowering uses nominal layout (extern struct) without database I/O
+    // 2. Generated Zig declaration text
     let item = lust::ast::Item::new(lust::ast::ItemKind::Struct(s.clone()), Span::dummy());
     let mut codegen = ZigCodegen::new();
     let zig_out = codegen.generate_program(&[item.clone()]).expect("Zig AOT codegen succeeds");
@@ -2070,7 +2072,7 @@ fn test_gate_schema_13_ffi_semantic_boundary() {
     assert!(zig_out.contains("enabled: bool,"));
     assert!(zig_out.contains("temperature: f64,"));
 
-    // 3. C header matches layout field-for-field
+    // 3. Generated C declaration text
     let c_hdr = generate_c_header(&[item]);
     assert!(c_hdr.contains("struct TelemetryPacket {"));
     assert!(c_hdr.contains("int64_t device_id;"));
