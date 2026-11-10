@@ -1721,17 +1721,20 @@ fn test_gate_schema_08_redos_regex_resource_bounding() {
 }
 
 // ============================================================================
-// Gate-SCHEMA-09: Typed Struct Parity & Zero-Cost Field Access
+// Gate-SCHEMA-09: Ordinal materialization and fail-closed validation (partial Gate-SCHEMA-09 coverage)
 // ============================================================================
 #[test]
 fn test_gate_schema_09_typed_struct_parity_zero_cost_access() {
+    // Scope: ordinal slot values, MissingField, and TypeMismatch through the Rust materialization API;
+    // backend parity and zero-cost access are not established; Gate-09 remains CONCERNS;
+    // the test name is not an acceptance claim.
     let fields = vec![
         LogicalFieldDesc::new(0, "user_id", CanonicalTypeTag::Int64),
         LogicalFieldDesc::new(1, "verified", CanonicalTypeTag::Bool),
     ];
     let layout = LogicalLayoutV1::new_with_abi(4001, "Account", fields, TargetAbi::x86_64());
 
-    // 1. Valid document materializes directly by ordinal slot
+    // 1. Valid document materializes to the expected ordinal slot values. Construction itself performs name lookups.
     let mut valid_doc = Document::new();
     valid_doc.try_insert("user_id".to_string(), DataValue::Number(ExactNumber::Int(42))).unwrap();
     valid_doc.try_insert("verified".to_string(), DataValue::Bool(true)).unwrap();
@@ -1740,7 +1743,7 @@ fn test_gate_schema_09_typed_struct_parity_zero_cost_access() {
     assert_eq!(mat.get_slot(0), Some(&DataValue::Number(ExactNumber::Int(42))));
     assert_eq!(mat.get_slot(1), Some(&DataValue::Bool(true)));
 
-    // 2. Missing required field fails closed without partial initialization
+    // 2. Missing required field returns MissingField instead of a materialized result.
     let mut incomplete_doc = Document::new();
     incomplete_doc.try_insert("user_id".to_string(), DataValue::Number(ExactNumber::Int(42))).unwrap();
     assert!(
