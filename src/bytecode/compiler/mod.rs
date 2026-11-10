@@ -64,11 +64,18 @@ pub(super) struct ScopeCleanup {
 }
 
 #[derive(Debug, Clone)]
+pub(super) struct BytecodeEffectThunk {
+    pub(super) stmts: Vec<Stmt>,
+    pub(super) captures: Vec<(String, Register)>,
+}
+
+#[derive(Debug, Clone)]
 pub(super) struct Scope {
     pub(super) locals: HashMap<String, (Register, bool)>,
-    pub(super) effect_thunks: HashMap<String, Vec<Stmt>>,
+    pub(super) effect_thunks: HashMap<String, BytecodeEffectThunk>,
     pub(super) depth: usize,
     pub(super) cleanups: Vec<ScopeCleanup>,
+    pub(super) is_thunk_boundary: bool,
 }
 
 #[derive(Debug, Clone)]

@@ -411,6 +411,7 @@ impl Compiler {
             effect_thunks: HashMap::new(),
             depth: 0,
             cleanups: Vec::new(),
+            is_thunk_boundary: false,
         };
         if func_def.is_method {
             scope.locals.insert("self".to_string(), (0, false));

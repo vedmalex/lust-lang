@@ -153,19 +153,76 @@ impl Compiler {
         Ok(acc_reg)
     }
 
-    pub(super) fn compile_effect_run_sync(&mut self, stmts: &[Stmt]) -> Result<Register> {
+    pub(super) fn build_effect_thunk(
+        &mut self,
+        name: &str,
+        stmts: &[Stmt],
+    ) -> Result<BytecodeEffectThunk> {
+        let mut locally_bound = HashSet::new();
+        let mut free_vars = HashSet::new();
+        validate_and_find_captures_in_stmts(stmts, &mut locally_bound, &mut free_vars)?;
+
+        let mut sorted_vars: Vec<String> = free_vars.into_iter().collect();
+        sorted_vars.sort();
+
+        let mut captures = Vec::new();
+        for var_name in sorted_vars {
+            if self.lookup_effect_thunk(&var_name).is_some() {
+                return Err(LustError::CompileError(format!(
+                    "Effect thunk '{var_name}' cannot be captured in nested effect"
+                )));
+            }
+            if let Ok(src_reg) = self.resolve_local(&var_name) {
+                let loc_ty = self.functions[self.current_function]
+                    .register_types
+                    .get(&src_reg);
+                let is_int = match loc_ty {
+                    Some(TypeKind::Int) => true,
+                    Some(TypeKind::Named(s)) if s == "int" || s == "i64" => true,
+                    _ => false,
+                };
+                if !is_int {
+                    return Err(LustError::CompileError(format!(
+                        "Unsupported capture type for '{var_name}': only read-only integers are supported, found {loc_ty:?}"
+                    )));
+                }
+
+                let snapshot_reg = self.next_local_slot();
+                if let Some(scope) = self.scopes.last_mut() {
+                    scope.locals.insert(
+                        format!("(__thunk_cap_{}_{})", name, var_name),
+                        (snapshot_reg, false),
+                    );
+                }
+                self.register_type(snapshot_reg, TypeKind::Int);
+                self.emit(Instruction::Move(snapshot_reg, src_reg), 0);
+                captures.push((var_name, snapshot_reg));
+            }
+        }
+
+        Ok(BytecodeEffectThunk {
+            stmts: stmts.to_vec(),
+            captures,
+        })
+    }
+
+    pub(super) fn compile_effect_run_sync(
+        &mut self,
+        thunk: &BytecodeEffectThunk,
+    ) -> Result<Register> {
         let result_reg = self.next_local_slot();
         if let Some(scope) = self.scopes.last_mut() {
             scope
                 .locals
                 .insert(format!("(thunk_res_{})", result_reg), (result_reg, false));
         }
+        self.register_type(result_reg, TypeKind::Int);
         self.emit(Instruction::LoadNil(result_reg), 0);
         let saved_thunk_return = self.thunk_return_target.take();
         self.thunk_return_target = Some((result_reg, Vec::new()));
 
-        self.begin_scope();
-        for stmt in stmts {
+        self.begin_thunk_scope(&thunk.captures);
+        for stmt in &thunk.stmts {
             self.compile_stmt(stmt)?;
             self.reset_temp_registers();
         }
@@ -182,4 +239,244 @@ impl Compiler {
         self.reset_temp_registers();
         Ok(result_reg)
     }
+}
+
+fn validate_and_find_captures_in_expr(
+    expr: &Expr,
+    locally_bound: &HashSet<String>,
+    free_vars: &mut HashSet<String>,
+) -> Result<()> {
+    match &expr.kind {
+        ExprKind::Literal(_) => Ok(()),
+        ExprKind::Identifier(name) => {
+            if !locally_bound.contains(name) {
+                free_vars.insert(name.clone());
+            }
+            Ok(())
+        }
+        ExprKind::Binary { left, right, .. } => {
+            validate_and_find_captures_in_expr(left, locally_bound, free_vars)?;
+            validate_and_find_captures_in_expr(right, locally_bound, free_vars)?;
+            Ok(())
+        }
+        ExprKind::Unary { operand, .. } => {
+            validate_and_find_captures_in_expr(operand, locally_bound, free_vars)
+        }
+        ExprKind::Call { callee, args, .. } => {
+            validate_and_find_captures_in_expr(callee, locally_bound, free_vars)?;
+            for a in args {
+                validate_and_find_captures_in_expr(a, locally_bound, free_vars)?;
+            }
+            Ok(())
+        }
+        ExprKind::MethodCall { receiver, args, .. } => {
+            validate_and_find_captures_in_expr(receiver, locally_bound, free_vars)?;
+            for a in args {
+                validate_and_find_captures_in_expr(a, locally_bound, free_vars)?;
+            }
+            Ok(())
+        }
+        ExprKind::FieldAccess { object, .. } => {
+            validate_and_find_captures_in_expr(object, locally_bound, free_vars)
+        }
+        ExprKind::Index { object, index } => {
+            validate_and_find_captures_in_expr(object, locally_bound, free_vars)?;
+            validate_and_find_captures_in_expr(index, locally_bound, free_vars)?;
+            Ok(())
+        }
+        ExprKind::Array(elems) | ExprKind::Tuple(elems) => {
+            for e in elems {
+                validate_and_find_captures_in_expr(e, locally_bound, free_vars)?;
+            }
+            Ok(())
+        }
+        ExprKind::Map(pairs) => {
+            for (k, v) in pairs {
+                validate_and_find_captures_in_expr(k, locally_bound, free_vars)?;
+                validate_and_find_captures_in_expr(v, locally_bound, free_vars)?;
+            }
+            Ok(())
+        }
+        ExprKind::StructLiteral { fields, .. } => {
+            for f in fields {
+                validate_and_find_captures_in_expr(&f.value, locally_bound, free_vars)?;
+            }
+            Ok(())
+        }
+        ExprKind::EnumConstructor { args, .. } => {
+            for a in args {
+                validate_and_find_captures_in_expr(a, locally_bound, free_vars)?;
+            }
+            Ok(())
+        }
+        ExprKind::Lambda { .. } => Err(LustError::CompileError(
+            "Lambdas are not supported inside effect thunk".into(),
+        )),
+        ExprKind::Paren(inner)
+        | ExprKind::Cast { expr: inner, .. }
+        | ExprKind::TypeCheck { expr: inner, .. } => {
+            validate_and_find_captures_in_expr(inner, locally_bound, free_vars)
+        }
+        ExprKind::IsPattern { expr: inner, .. } => {
+            validate_and_find_captures_in_expr(inner, locally_bound, free_vars)
+        }
+        ExprKind::If {
+            condition,
+            then_branch,
+            else_branch,
+        } => {
+            validate_and_find_captures_in_expr(condition, locally_bound, free_vars)?;
+            validate_and_find_captures_in_expr(then_branch, locally_bound, free_vars)?;
+            if let Some(eb) = else_branch {
+                validate_and_find_captures_in_expr(eb, locally_bound, free_vars)?;
+            }
+            Ok(())
+        }
+        ExprKind::Block(stmts) => {
+            let mut inner_bound = locally_bound.clone();
+            validate_and_find_captures_in_stmts(stmts, &mut inner_bound, free_vars)
+        }
+        ExprKind::EffectBlock(_) => Err(LustError::CompileError(
+            "Nested effect blocks are not supported".into(),
+        )),
+        ExprKind::Return(exprs) => {
+            for e in exprs {
+                validate_and_find_captures_in_expr(e, locally_bound, free_vars)?;
+            }
+            Ok(())
+        }
+        ExprKind::Range { start, end, .. } => {
+            validate_and_find_captures_in_expr(start, locally_bound, free_vars)?;
+            validate_and_find_captures_in_expr(end, locally_bound, free_vars)?;
+            Ok(())
+        }
+    }
+}
+
+fn validate_and_find_captures_in_stmts(
+    stmts: &[Stmt],
+    locally_bound: &mut HashSet<String>,
+    free_vars: &mut HashSet<String>,
+) -> Result<()> {
+    for stmt in stmts {
+        match &stmt.kind {
+            StmtKind::Local {
+                bindings,
+                initializer,
+            } => {
+                if let Some(inits) = initializer {
+                    for i in inits {
+                        validate_and_find_captures_in_expr(i, locally_bound, free_vars)?;
+                    }
+                }
+                for b in bindings {
+                    locally_bound.insert(b.name.clone());
+                }
+            }
+            StmtKind::Assign { targets, values } => {
+                for v in values {
+                    validate_and_find_captures_in_expr(v, locally_bound, free_vars)?;
+                }
+                for t in targets {
+                    if let ExprKind::Identifier(name) = &t.kind {
+                        if !locally_bound.contains(name) {
+                            return Err(LustError::CompileError(format!(
+                                "Write to captured variable '{name}' is not supported in effect thunk"
+                            )));
+                        }
+                    } else {
+                        validate_and_find_captures_in_expr(t, locally_bound, free_vars)?;
+                    }
+                }
+            }
+            StmtKind::CompoundAssign { target, op: _, value } => {
+                validate_and_find_captures_in_expr(value, locally_bound, free_vars)?;
+                if let ExprKind::Identifier(name) = &target.kind {
+                    if !locally_bound.contains(name) {
+                        return Err(LustError::CompileError(format!(
+                            "Write to captured variable '{name}' is not supported in effect thunk"
+                        )));
+                    }
+                } else {
+                    validate_and_find_captures_in_expr(target, locally_bound, free_vars)?;
+                }
+            }
+            StmtKind::Expr(e) => {
+                validate_and_find_captures_in_expr(e, locally_bound, free_vars)?;
+            }
+            StmtKind::If {
+                condition,
+                then_block,
+                elseif_branches,
+                else_block,
+            } => {
+                validate_and_find_captures_in_expr(condition, locally_bound, free_vars)?;
+                let mut then_bound = locally_bound.clone();
+                validate_and_find_captures_in_stmts(then_block, &mut then_bound, free_vars)?;
+                for (c, body) in elseif_branches {
+                    validate_and_find_captures_in_expr(c, locally_bound, free_vars)?;
+                    let mut elif_bound = locally_bound.clone();
+                    validate_and_find_captures_in_stmts(body, &mut elif_bound, free_vars)?;
+                }
+                if let Some(eb) = else_block {
+                    let mut else_bound = locally_bound.clone();
+                    validate_and_find_captures_in_stmts(eb, &mut else_bound, free_vars)?;
+                }
+            }
+            StmtKind::While { condition, body } => {
+                validate_and_find_captures_in_expr(condition, locally_bound, free_vars)?;
+                let mut body_bound = locally_bound.clone();
+                validate_and_find_captures_in_stmts(body, &mut body_bound, free_vars)?;
+            }
+            StmtKind::ForNumeric {
+                variable,
+                start,
+                end,
+                step,
+                body,
+            } => {
+                validate_and_find_captures_in_expr(start, locally_bound, free_vars)?;
+                validate_and_find_captures_in_expr(end, locally_bound, free_vars)?;
+                if let Some(s) = step {
+                    validate_and_find_captures_in_expr(s, locally_bound, free_vars)?;
+                }
+                let mut body_bound = locally_bound.clone();
+                body_bound.insert(variable.clone());
+                validate_and_find_captures_in_stmts(body, &mut body_bound, free_vars)?;
+            }
+            StmtKind::ForIn {
+                variables,
+                iterator,
+                body,
+            } => {
+                validate_and_find_captures_in_expr(iterator, locally_bound, free_vars)?;
+                let mut body_bound = locally_bound.clone();
+                for v in variables {
+                    body_bound.insert(v.clone());
+                }
+                validate_and_find_captures_in_stmts(body, &mut body_bound, free_vars)?;
+            }
+            StmtKind::Return(exprs) => {
+                if exprs.is_empty() {
+                    return Err(LustError::CompileError(
+                        "Effect thunk return must return an integer value".into(),
+                    ));
+                }
+                for e in exprs {
+                    validate_and_find_captures_in_expr(e, locally_bound, free_vars)?;
+                }
+            }
+            StmtKind::Break | StmtKind::Continue => {}
+            StmtKind::Block(inner) | StmtKind::Scoped(inner) => {
+                let mut inner_bound = locally_bound.clone();
+                validate_and_find_captures_in_stmts(inner, &mut inner_bound, free_vars)?;
+            }
+            StmtKind::Defer(_) | StmtKind::ErrDefer(_) => {
+                return Err(LustError::CompileError(
+                    "Cleanups (defer/errdefer) are not supported inside effect thunk".into(),
+                ));
+            }
+        }
+    }
+    Ok(())
 }

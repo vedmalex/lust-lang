@@ -60,13 +60,32 @@ impl Compiler {
             effect_thunks: HashMap::new(),
             depth,
             cleanups: Vec::new(),
+            is_thunk_boundary: false,
         });
     }
 
-    pub(super) fn lookup_effect_thunk(&self, name: &str) -> Option<Vec<Stmt>> {
+    pub(super) fn begin_thunk_scope(&mut self, captures: &[(String, Register)]) {
+        let depth = self.scopes.last().map(|s| s.depth + 1).unwrap_or(0);
+        let mut locals = HashMap::new();
+        for (name, reg) in captures {
+            locals.insert(name.clone(), (*reg, false));
+        }
+        self.scopes.push(Scope {
+            locals,
+            effect_thunks: HashMap::new(),
+            depth,
+            cleanups: Vec::new(),
+            is_thunk_boundary: true,
+        });
+    }
+
+    pub(super) fn lookup_effect_thunk(&self, name: &str) -> Option<BytecodeEffectThunk> {
         for scope in self.scopes.iter().rev() {
             if let Some(thunk) = scope.effect_thunks.get(name) {
                 return Some(thunk.clone());
+            }
+            if scope.is_thunk_boundary {
+                break;
             }
         }
         None
@@ -102,6 +121,9 @@ impl Compiler {
         for scope in self.scopes.iter().rev() {
             if let Some(&(reg, _)) = scope.locals.get(name) {
                 return Ok(reg);
+            }
+            if scope.is_thunk_boundary {
+                break;
             }
         }
 

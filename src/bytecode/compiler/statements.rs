@@ -14,21 +14,49 @@ impl Compiler {
                             init_expr = inner;
                         }
                         if let ExprKind::EffectBlock(stmts) = &init_expr.kind {
+                            let thunk = self.build_effect_thunk(&bindings[0].name, stmts)?;
                             if let Some(scope) = self.scopes.last_mut() {
                                 scope
                                     .effect_thunks
-                                    .insert(bindings[0].name.clone(), stmts.clone());
+                                    .insert(bindings[0].name.clone(), thunk);
                             }
                             return Ok(());
+                        }
+                        if let ExprKind::Identifier(name) = &init_expr.kind {
+                            if self.lookup_effect_thunk(name).is_some() {
+                                return Err(LustError::CompileError(format!(
+                                    "Effect thunk '{name}' cannot be aliased or copied"
+                                )));
+                            }
                         }
                     }
                 }
 
                 let mut binding_regs = Vec::new();
-                for binding in bindings {
+                for (idx, binding) in bindings.iter().enumerate() {
                     let reg = self.next_local_slot();
                     if let Some(type_ann) = &binding.type_annotation {
                         self.register_type(reg, type_ann.kind.clone());
+                    } else if let Some(values) = initializer {
+                        if let Some(init_expr) = values.get(idx) {
+                            match &init_expr.kind {
+                                ExprKind::Literal(Literal::Integer(_)) => {
+                                    self.register_type(reg, TypeKind::Int);
+                                }
+                                ExprKind::Identifier(src_name) => {
+                                    if let Ok(src_reg) = self.resolve_local(src_name) {
+                                        if let Some(tk) = self.functions[self.current_function]
+                                            .register_types
+                                            .get(&src_reg)
+                                            .cloned()
+                                        {
+                                            self.register_type(reg, tk);
+                                        }
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
                     }
                     binding_regs.push((binding.name.clone(), reg));
                 }
@@ -85,6 +113,25 @@ impl Compiler {
             }
 
             StmtKind::Assign { targets, values } => {
+                for target in targets {
+                    if let ExprKind::Identifier(name) = &target.kind {
+                        if self.lookup_effect_thunk(name).is_some() {
+                            return Err(LustError::CompileError(format!(
+                                "Effect thunk '{name}' cannot be reassigned or mutated"
+                            )));
+                        }
+                    }
+                }
+                for val in values {
+                    if let ExprKind::Identifier(name) = &val.kind {
+                        if self.lookup_effect_thunk(name).is_some() {
+                            return Err(LustError::CompileError(format!(
+                                "Effect thunk '{name}' cannot be aliased or copied"
+                            )));
+                        }
+                    }
+                }
+
                 if targets.len() == 1 && values.len() == 1 {
                     if let (
                         ExprKind::Identifier(target_name),
@@ -127,6 +174,13 @@ impl Compiler {
             }
 
             StmtKind::CompoundAssign { target, op, value } => {
+                if let ExprKind::Identifier(name) = &target.kind {
+                    if self.lookup_effect_thunk(name).is_some() {
+                        return Err(LustError::CompileError(format!(
+                            "Effect thunk '{name}' cannot be reassigned or mutated"
+                        )));
+                    }
+                }
                 match &target.kind {
                     ExprKind::Identifier(name) => {
                         let (target_reg, target_is_local, target_name) =
@@ -255,6 +309,16 @@ impl Compiler {
                         jumps.push(jump_pos);
                     }
                     return Ok(());
+                }
+
+                for val in values {
+                    if let ExprKind::Identifier(name) = &val.kind {
+                        if self.lookup_effect_thunk(name).is_some() {
+                            return Err(LustError::CompileError(format!(
+                                "Effect thunk '{name}' cannot escape or be used as a value"
+                            )));
+                        }
+                    }
                 }
 
                 let ret_reg = if values.is_empty() {

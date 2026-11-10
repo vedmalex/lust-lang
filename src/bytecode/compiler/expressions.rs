@@ -31,6 +31,12 @@ impl Compiler {
             }
 
             ExprKind::Identifier(name) => {
+                if self.lookup_effect_thunk(name).is_some() {
+                    return Err(LustError::CompileError(format!(
+                        "Effect thunk '{name}' cannot escape or be used as a value"
+                    )));
+                }
+
                 if let Ok(source_reg) = self.resolve_local(name) {
                     return Ok(source_reg);
                 }
@@ -368,11 +374,12 @@ impl Compiler {
                         rec = inner;
                     }
                     if let ExprKind::Identifier(name) = &rec.kind {
-                        if let Some(thunk_stmts) = self.lookup_effect_thunk(name) {
-                            return self.compile_effect_run_sync(&thunk_stmts);
+                        if let Some(thunk) = self.lookup_effect_thunk(name) {
+                            return self.compile_effect_run_sync(&thunk);
                         }
                     } else if let ExprKind::EffectBlock(stmts) = &rec.kind {
-                        return self.compile_effect_run_sync(stmts);
+                        let thunk = self.build_effect_thunk("<anon>", stmts)?;
+                        return self.compile_effect_run_sync(&thunk);
                     }
                 }
 
@@ -611,6 +618,7 @@ impl Compiler {
                     effect_thunks: HashMap::new(),
                     depth: 0,
                     cleanups: Vec::new(),
+                    is_thunk_boundary: false,
                 };
                 for (param_name, _param_type) in params {
                     let reg = self.allocate_register();
