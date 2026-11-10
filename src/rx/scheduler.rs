@@ -1,12 +1,13 @@
 //! RxScheduler coordinating virtual/physical execution, task queues, and participant join tracking.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
 use super::clock::{SharedClock, VirtualClock};
 use super::timer::RxTimerService;
+use super::RxError;
 
 /// Identifier for tracking active participants of a subscription scope.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -18,6 +19,7 @@ pub struct ScopeJoinCoordinator {
     next_id: AtomicU64,
     // scope_id -> set of active participants
     participants: Mutex<HashMap<u64, Vec<ParticipantId>>>,
+    closed_scopes: Mutex<HashSet<u64>>,
     condvar: Condvar,
 }
 
@@ -26,16 +28,34 @@ impl ScopeJoinCoordinator {
         Self {
             next_id: AtomicU64::new(1),
             participants: Mutex::new(HashMap::new()),
+            closed_scopes: Mutex::new(HashSet::new()),
             condvar: Condvar::new(),
         }
     }
 
     /// Register a new active participant for a given scope.
-    pub fn register_participant(&self, scope_id: u64) -> ParticipantId {
+    /// Fails closed if admission has already been closed for this scope.
+    pub fn register_participant(&self, scope_id: u64) -> Result<ParticipantId, RxError> {
+        let closed = self.closed_scopes.lock().unwrap();
+        if closed.contains(&scope_id) {
+            return Err(RxError::Cancelled);
+        }
         let id = ParticipantId(self.next_id.fetch_add(1, Ordering::SeqCst));
         let mut map = self.participants.lock().unwrap();
         map.entry(scope_id).or_default().push(id);
-        id
+        Ok(id)
+    }
+
+    /// Close admission for a scope so that no new participants can register.
+    pub fn close_admission(&self, scope_id: u64) {
+        let mut closed = self.closed_scopes.lock().unwrap();
+        closed.insert(scope_id);
+    }
+
+    /// Atomically close admission and wait until all registered participants have exited.
+    pub fn close_and_wait_quiescent(&self, scope_id: u64, timeout: Option<Duration>) -> bool {
+        self.close_admission(scope_id);
+        self.wait_for_quiescence(scope_id, timeout)
     }
 
     /// Acknowledge that a participant has completely exited.
@@ -54,6 +74,12 @@ impl ScopeJoinCoordinator {
     pub fn active_participants(&self, scope_id: u64) -> usize {
         let map = self.participants.lock().unwrap();
         map.get(&scope_id).map_or(0, |list| list.len())
+    }
+
+    /// Check if admission has been closed for a scope.
+    pub fn is_admission_closed(&self, scope_id: u64) -> bool {
+        let closed = self.closed_scopes.lock().unwrap();
+        closed.contains(&scope_id)
     }
 
     /// Block or wait until all participants for the given scope have exited.
@@ -98,12 +124,17 @@ pub struct RxScheduler {
     pub timers: Arc<RxTimerService>,
     pub coordinator: Arc<ScopeJoinCoordinator>,
     ready_tasks: Mutex<VecDeque<ReadyTask>>,
+    max_ready_tasks: usize,
     next_task_seq: AtomicU64,
     stopped: AtomicBool,
 }
 
 impl RxScheduler {
     pub fn new_virtual() -> Self {
+        Self::new_virtual_with_capacity(1024)
+    }
+
+    pub fn new_virtual_with_capacity(max_ready_tasks: usize) -> Self {
         let clock: SharedClock = Arc::new(VirtualClock::new(0));
         let timers = Arc::new(RxTimerService::new());
         let coordinator = Arc::new(ScopeJoinCoordinator::new());
@@ -111,32 +142,35 @@ impl RxScheduler {
             clock,
             timers,
             coordinator,
-            ready_tasks: Mutex::new(VecDeque::new()),
+            ready_tasks: Mutex::new(VecDeque::with_capacity(max_ready_tasks.min(4096))),
+            max_ready_tasks,
             next_task_seq: AtomicU64::new(1),
             stopped: AtomicBool::new(false),
         }
     }
 
-    pub fn new_with_clock(clock: SharedClock) -> Self {
+    pub fn new_with_clock(clock: SharedClock, max_ready_tasks: usize) -> Self {
         let timers = Arc::new(RxTimerService::new());
         let coordinator = Arc::new(ScopeJoinCoordinator::new());
         Self {
             clock,
             timers,
             coordinator,
-            ready_tasks: Mutex::new(VecDeque::new()),
+            ready_tasks: Mutex::new(VecDeque::with_capacity(max_ready_tasks.min(4096))),
+            max_ready_tasks,
             next_task_seq: AtomicU64::new(1),
             stopped: AtomicBool::new(false),
         }
     }
 
     /// Enqueue a cooperative task to run in the scheduler.
-    pub fn schedule_task<F>(&self, priority: u8, task: F)
+    /// Returns Err(RxError::BackpressureOverflow) if ready queue capacity is exceeded.
+    pub fn schedule_task<F>(&self, priority: u8, task: F) -> Result<(), RxError>
     where
         F: FnOnce() + Send + 'static,
     {
         if self.stopped.load(Ordering::SeqCst) {
-            return;
+            return Err(RxError::Cancelled);
         }
         let sequence = self.next_task_seq.fetch_add(1, Ordering::SeqCst);
         let entry = ReadyTask {
@@ -145,7 +179,11 @@ impl RxScheduler {
             task: Box::new(task),
         };
         let mut queue = self.ready_tasks.lock().unwrap();
+        if queue.len() >= self.max_ready_tasks {
+            return Err(RxError::BackpressureOverflow);
+        }
         queue.push_back(entry);
+        Ok(())
     }
 
     /// Execute a single pending task if available.
@@ -155,7 +193,7 @@ impl RxScheduler {
         let now = self.clock.now_nanos();
         let expired = self.timers.poll_expired(now);
         for action in expired {
-            self.schedule_task(10, action);
+            let _ = self.schedule_task(10, action);
         }
 
         // Take the next ready task

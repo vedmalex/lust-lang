@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use lust::rx::{
-    BoundedQueue, BufferOptions, EnqueueResult, OverflowStrategy, RxClock,
+    BoundedQueue, BufferOptions, EnqueueResult, OverflowStrategy, RxClock, RxError,
     RxScheduler, RxTimerService, ScopeJoinCoordinator, VirtualClock,
 };
 
@@ -98,6 +98,46 @@ fn test_rx_buffer_options_validation() {
 }
 
 #[test]
+fn test_rx_bounded_queue_single_oversized_item_rejected() {
+    // Capacity: 5 items, max 32 bytes
+    let opts = BufferOptions::new(5, 32, 1, 8, OverflowStrategy::Fail).unwrap();
+    let mut q: BoundedQueue<String> = BoundedQueue::new(opts);
+
+    // Oversized item: String whose charged bytes exceed 32
+    let huge_str = "a".repeat(100);
+    assert_eq!(q.try_enqueue(huge_str), EnqueueResult::ItemTooLarge);
+    assert_eq!(q.len(), 0);
+    assert_eq!(q.charged_bytes(), 0);
+}
+
+#[test]
+fn test_rx_bounded_queue_isolated_item_limit_with_ample_bytes() {
+    // Max items = 2, max bytes = 1,000,000 (ample bytes)
+    let opts = BufferOptions::new(2, 1_000_000, 1, 500_000, OverflowStrategy::Fail).unwrap();
+    let mut q: BoundedQueue<i64> = BoundedQueue::new(opts);
+
+    assert_eq!(q.try_enqueue(1), EnqueueResult::Enqueued);
+    assert_eq!(q.try_enqueue(2), EnqueueResult::Enqueued);
+    // Even though bytes are ample (16 / 1,000,000), items reached cap (2)
+    assert_eq!(q.try_enqueue(3), EnqueueResult::OverflowError);
+    assert_eq!(q.len(), 2);
+}
+
+#[test]
+fn test_rx_bounded_queue_isolated_byte_limit_with_ample_items() {
+    // Max items = 1,000 (ample items), max bytes = 16 bytes (holds 2 i64s)
+    let opts = BufferOptions::new(1000, 16, 500, 8, OverflowStrategy::Fail).unwrap();
+    let mut q: BoundedQueue<i64> = BoundedQueue::new(opts);
+
+    assert_eq!(q.try_enqueue(100), EnqueueResult::Enqueued);
+    assert_eq!(q.try_enqueue(200), EnqueueResult::Enqueued);
+    // Items are 2/1000, but bytes are 16/16 -> overflows on bytes
+    assert_eq!(q.try_enqueue(300), EnqueueResult::OverflowError);
+    assert_eq!(q.len(), 2);
+    assert_eq!(q.charged_bytes(), 16);
+}
+
+#[test]
 fn test_rx_bounded_queue_dual_limits_and_fail_strategy() {
     // Queue max: 3 items, 24 bytes (each i64 = 8 bytes)
     let opts = BufferOptions::new(3, 24, 1, 8, OverflowStrategy::Fail).unwrap();
@@ -170,7 +210,7 @@ fn test_rx_bounded_queue_drop_newest_and_drop_oldest() {
 }
 
 #[test]
-fn test_rx_scope_join_coordinator_quiescence() {
+fn test_rx_scope_join_coordinator_closed_admission_and_quiescence() {
     let coordinator = Arc::new(ScopeJoinCoordinator::new());
     let scope_id = 42;
 
@@ -178,12 +218,20 @@ fn test_rx_scope_join_coordinator_quiescence() {
     assert!(coordinator.wait_for_quiescence(scope_id, Some(Duration::from_millis(10))));
 
     // Register two participants
-    let p1 = coordinator.register_participant(scope_id);
-    let p2 = coordinator.register_participant(scope_id);
+    let p1 = coordinator.register_participant(scope_id).unwrap();
+    let p2 = coordinator.register_participant(scope_id).unwrap();
     assert_eq!(coordinator.active_participants(scope_id), 2);
 
     // Timeout while participants are active
     assert!(!coordinator.wait_for_quiescence(scope_id, Some(Duration::from_millis(10))));
+
+    // Close admission: new participant registration must fail closed with RxError::Cancelled
+    coordinator.close_admission(scope_id);
+    assert!(coordinator.is_admission_closed(scope_id));
+    assert_eq!(
+        coordinator.register_participant(scope_id),
+        Err(RxError::Cancelled)
+    );
 
     // P1 exits
     coordinator.acknowledge_exit(scope_id, p1);
@@ -197,8 +245,8 @@ fn test_rx_scope_join_coordinator_quiescence() {
         coord_clone.acknowledge_exit(scope_id, p2);
     });
 
-    // Blocking wait until quiescent succeeds
-    assert!(coordinator.wait_for_quiescence(scope_id, Some(Duration::from_secs(1))));
+    // Atomic close_and_wait_quiescent succeeds once p2 exits
+    assert!(coordinator.close_and_wait_quiescent(scope_id, Some(Duration::from_secs(1))));
     assert_eq!(coordinator.active_participants(scope_id), 0);
 }
 
@@ -209,9 +257,11 @@ fn test_rx_scheduler_task_execution_and_virtual_time_advancement() {
 
     // Schedule task at t=0
     let s1 = steps_counter.clone();
-    scheduler.schedule_task(1, move || {
-        s1.fetch_add(10, Ordering::SeqCst);
-    });
+    assert!(scheduler
+        .schedule_task(1, move || {
+            s1.fetch_add(10, Ordering::SeqCst);
+        })
+        .is_ok());
 
     // Schedule timer for t=5000 nanos
     let s2 = steps_counter.clone();
@@ -228,4 +278,19 @@ fn test_rx_scheduler_task_execution_and_virtual_time_advancement() {
     assert_eq!(total_steps, 2);
     assert_eq!(steps_counter.load(Ordering::SeqCst), 30); // 10 + 20
     assert_eq!(scheduler.clock.now_nanos(), 5000);
+}
+
+#[test]
+fn test_rx_scheduler_bounded_ready_queue_overflow() {
+    // Scheduler with tight capacity of 2 ready tasks
+    let scheduler = RxScheduler::new_virtual_with_capacity(2);
+
+    assert!(scheduler.schedule_task(1, || {}).is_ok());
+    assert!(scheduler.schedule_task(1, || {}).is_ok());
+
+    // 3rd task exceeds ready capacity -> BackpressureOverflow
+    assert_eq!(
+        scheduler.schedule_task(1, || {}),
+        Err(RxError::BackpressureOverflow)
+    );
 }
