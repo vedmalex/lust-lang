@@ -1215,29 +1215,431 @@ fn test_gate_schema_05_unsupported_escape_fails_closed() {
 // ============================================================================
 // Gate-SCHEMA-06: Streaming JSONL Memory Cap
 // ============================================================================
-#[test]
-fn test_gate_schema_06_streaming_jsonl_memory_cap() {
-    // Oversized line exceeding byte limit must fail closed without unbounded buffering
-    let mut opts = JsonlReaderOptions::default();
-    opts.max_line_bytes = 32;
 
-    let long_line = format!(r#"{{"long_field": "{}"}}"#, "a".repeat(100));
-    let mut reader = jsonl::JsonlReader::with_options(long_line.as_bytes(), opts);
-    let first = reader.next();
-    assert!(first.is_some(), "stream should yield an error entry");
-    let res = first.unwrap();
-    assert!(
-        matches!(res, Err(ref e) if matches!(e.kind, LineErrorKind::Limit)),
-        "oversized line must fail closed with Limit error"
+#[derive(Clone, Default)]
+struct Gate06ReadTracker {
+    bytes_read: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    read_calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl Gate06ReadTracker {
+    fn new() -> Self {
+        Self::default()
+    }
+
+    fn bytes_read(&self) -> usize {
+        self.bytes_read.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    fn read_calls(&self) -> usize {
+        self.read_calls.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+/// Finite lazy std::io::Read fixture emitting repeated bytes without allocating the complete stream.
+struct LazyHostileLineReader {
+    pos: usize,
+    total_len: usize,
+    lf_pos: Option<usize>,
+    max_emit_per_read: usize,
+    tracker: Gate06ReadTracker,
+}
+
+impl LazyHostileLineReader {
+    fn new(total_len: usize, lf_pos: Option<usize>, tracker: Gate06ReadTracker) -> Self {
+        Self {
+            pos: 0,
+            total_len,
+            lf_pos,
+            max_emit_per_read: jsonl::DEFAULT_CHUNK_SIZE,
+            tracker,
+        }
+    }
+}
+
+impl std::io::Read for LazyHostileLineReader {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if self.pos >= self.total_len || buf.is_empty() {
+            return Ok(0);
+        }
+        let remaining = self.total_len - self.pos;
+        let to_emit = buf.len().min(remaining).min(self.max_emit_per_read);
+        if to_emit == 0 {
+            return Ok(0);
+        }
+
+        buf[..to_emit].fill(b'a');
+        if let Some(nl) = self.lf_pos {
+            if nl >= self.pos && nl < self.pos + to_emit {
+                buf[nl - self.pos] = b'\n';
+            }
+        }
+
+        self.pos += to_emit;
+        self.tracker.bytes_read.fetch_add(to_emit, std::sync::atomic::Ordering::SeqCst);
+        self.tracker.read_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(to_emit)
+    }
+}
+
+/// Finite lazy std::io::Read fixture emitting small valid JSONL records on the fly without preallocation.
+struct LazyValidRecordsReader {
+    current_index: usize,
+    total_records: usize,
+    buffer: [u8; 64],
+    buf_pos: usize,
+    buf_len: usize,
+    tracker: Gate06ReadTracker,
+}
+
+impl LazyValidRecordsReader {
+    fn new(total_records: usize, tracker: Gate06ReadTracker) -> Self {
+        Self {
+            current_index: 0,
+            total_records,
+            buffer: [0u8; 64],
+            buf_pos: 0,
+            buf_len: 0,
+            tracker,
+        }
+    }
+}
+
+impl std::io::Read for LazyValidRecordsReader {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        let mut written = 0;
+        while written < buf.len() {
+            if self.buf_pos < self.buf_len {
+                let avail = self.buf_len - self.buf_pos;
+                let needed = buf.len() - written;
+                let to_copy = avail.min(needed);
+                buf[written..written + to_copy].copy_from_slice(&self.buffer[self.buf_pos..self.buf_pos + to_copy]);
+                self.buf_pos += to_copy;
+                written += to_copy;
+            } else if self.current_index < self.total_records {
+                use std::io::Write;
+                let mut cursor = std::io::Cursor::new(&mut self.buffer[..]);
+                write!(cursor, "{{\"id\":{}}}\n", self.current_index).unwrap();
+                self.buf_len = cursor.position() as usize;
+                self.buf_pos = 0;
+                self.current_index += 1;
+            } else {
+                break;
+            }
+        }
+        if written > 0 {
+            self.tracker.bytes_read.fetch_add(written, std::sync::atomic::Ordering::SeqCst);
+            self.tracker.read_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+        Ok(written)
+    }
+}
+
+fn assert_hostile_line_case(
+    total_len: usize,
+    lf_pos: Option<usize>,
+    case_desc: &str,
+) -> (usize, usize) {
+    let line_limit = 16 * 1024;
+    let buffered_limit = 32 * 1024;
+    let tracker = Gate06ReadTracker::new();
+    let fixture = LazyHostileLineReader::new(total_len, lf_pos, tracker.clone());
+
+    let opts = JsonlReaderOptions::default()
+        .with_max_line_bytes(line_limit)
+        .with_max_buffered_bytes(buffered_limit);
+
+    let mut reader = jsonl::JsonlReader::with_options(fixture, opts);
+
+    // 1. Assert effective options match requested
+    assert_eq!(
+        reader.options().max_line_bytes,
+        line_limit,
+        "{case_desc}: effective max_line_bytes"
+    );
+    assert_eq!(
+        reader.options().max_buffered_bytes,
+        buffered_limit,
+        "{case_desc}: effective max_buffered_bytes"
     );
 
-    // Blank lines rejected by default
-    let blank_stream = "{\"a\": 1}\n\n{\"b\": 2}\n";
-    let default_reader = jsonl::JsonlReader::new(blank_stream.as_bytes());
-    let results: Vec<_> = default_reader.collect();
-    assert_eq!(results.len(), 2);
-    assert!(results[0].is_ok(), "first record valid");
-    assert!(results[1].is_err(), "blank line without skip must fail closed and terminate");
+    // 2. Observe capacity at construction
+    let cap_init = reader.retained_buffer_bytes();
+    assert!(
+        cap_init <= 32 * 1024,
+        "{case_desc}: initial retained buffer {cap_init} > 32 KiB"
+    );
+    let mut max_cap = cap_init;
+
+    // 3. Pull first item: must fail closed with LineErrorKind::Limit and LINE_TOO_LONG
+    let first = reader.next();
+    assert!(first.is_some(), "{case_desc}: stream should yield an error entry");
+    let err = first.unwrap().expect_err(&format!("{case_desc}: expected error entry"));
+    assert_eq!(
+        err.kind,
+        LineErrorKind::Limit,
+        "{case_desc}: error kind must be Limit"
+    );
+    assert_eq!(
+        err.code,
+        "LINE_TOO_LONG",
+        "{case_desc}: error code must be LINE_TOO_LONG"
+    );
+
+    // 4. Retained capacity immediately after error must remain bounded
+    let cap_err = reader.retained_buffer_bytes();
+    max_cap = max_cap.max(cap_err);
+    assert!(
+        cap_err <= 32 * 1024,
+        "{case_desc}: retained buffer after error {cap_err} > 32 KiB"
+    );
+
+    // 5. Delivered bytes bound: delivered bytes <= line_limit + DEFAULT_CHUNK_SIZE
+    let delivered_bytes = tracker.bytes_read();
+    let max_allowed_bytes = line_limit + jsonl::DEFAULT_CHUNK_SIZE;
+    assert!(
+        delivered_bytes <= max_allowed_bytes,
+        "{case_desc}: delivered bytes {delivered_bytes} exceeded line_limit + DEFAULT_CHUNK_SIZE ({max_allowed_bytes})"
+    );
+
+    // 6. Repeated next() returns None and does NOT perform additional reads
+    let reads_after_err = tracker.read_calls();
+    let bytes_after_err = tracker.bytes_read();
+
+    let term1 = reader.next();
+    assert!(term1.is_none(), "{case_desc}: subsequent next() must be None");
+    assert_eq!(
+        tracker.read_calls(),
+        reads_after_err,
+        "{case_desc}: terminal next() must not perform I/O reads"
+    );
+    assert_eq!(
+        tracker.bytes_read(),
+        bytes_after_err,
+        "{case_desc}: terminal next() must not read bytes"
+    );
+
+    let cap_term1 = reader.retained_buffer_bytes();
+    max_cap = max_cap.max(cap_term1);
+    assert!(
+        cap_term1 <= 32 * 1024,
+        "{case_desc}: retained buffer after term1 {cap_term1} > 32 KiB"
+    );
+
+    let term2 = reader.next();
+    assert!(term2.is_none(), "{case_desc}: second terminal next() must be None");
+    assert_eq!(
+        tracker.read_calls(),
+        reads_after_err,
+        "{case_desc}: second terminal next() must not perform I/O"
+    );
+    assert_eq!(
+        tracker.bytes_read(),
+        bytes_after_err,
+        "{case_desc}: second terminal next() must not read bytes"
+    );
+
+    let cap_term2 = reader.retained_buffer_bytes();
+    max_cap = max_cap.max(cap_term2);
+    assert!(
+        cap_term2 <= 32 * 1024,
+        "{case_desc}: retained buffer after term2 {cap_term2} > 32 KiB"
+    );
+
+    println!(
+        "[{case_desc}] observed max capacity: {} bytes, delivered: {} bytes, reads: {}",
+        max_cap,
+        delivered_bytes,
+        reads_after_err
+    );
+
+    (max_cap, delivered_bytes)
+}
+
+#[test]
+fn test_gate_schema_06_streaming_jsonl_memory_cap() {
+    // 1. Hostile lines at 1 MiB and 16 MiB, no LF and far-end LF, plus LF in crossing chunk
+    let (cap_1m_nolf, bytes_1m_nolf) = assert_hostile_line_case(
+        1024 * 1024,
+        None,
+        "Hostile 1 MiB no-LF",
+    );
+    let (cap_1m_farend, bytes_1m_farend) = assert_hostile_line_case(
+        1024 * 1024,
+        Some(1024 * 1024 - 1),
+        "Hostile 1 MiB far-end LF",
+    );
+    let (cap_16m_nolf, bytes_16m_nolf) = assert_hostile_line_case(
+        16 * 1024 * 1024,
+        None,
+        "Hostile 16 MiB no-LF",
+    );
+    let (cap_16m_farend, bytes_16m_farend) = assert_hostile_line_case(
+        16 * 1024 * 1024,
+        Some(16 * 1024 * 1024 - 1),
+        "Hostile 16 MiB far-end LF",
+    );
+    let (cap_cross_lf, bytes_cross_lf) = assert_hostile_line_case(
+        1024 * 1024,
+        Some(16 * 1024 + 100),
+        "Hostile 1 MiB LF in crossing chunk",
+    );
+
+    // Enforce that observed capacity bounds are identical (<= 32 KiB) across both advertised lengths
+    let hostile_max_cap = cap_1m_nolf
+        .max(cap_1m_farend)
+        .max(cap_16m_nolf)
+        .max(cap_16m_farend)
+        .max(cap_cross_lf);
+    assert!(
+        hostile_max_cap <= 32 * 1024,
+        "Max observed hostile capacity {hostile_max_cap} exceeds 32 KiB bound"
+    );
+    assert_eq!(
+        cap_1m_nolf, cap_16m_nolf,
+        "Observed capacity must be invariant to total advertised length"
+    );
+    assert_eq!(
+        bytes_1m_nolf, bytes_16m_nolf,
+        "Delivered bytes must be invariant to total advertised length"
+    );
+    assert_eq!(
+        bytes_1m_nolf, bytes_1m_farend,
+        "Delivered bytes must be invariant to LF position at far end (1 MiB)"
+    );
+    assert_eq!(
+        bytes_16m_nolf, bytes_16m_farend,
+        "Delivered bytes must be invariant to LF position at far end (16 MiB)"
+    );
+    assert_eq!(
+        bytes_1m_nolf, bytes_cross_lf,
+        "Delivered bytes must be invariant when LF is located in crossing chunk"
+    );
+
+    // 2. Original short-line Limit case
+    {
+        let mut opts = JsonlReaderOptions::default();
+        opts.max_line_bytes = 32;
+
+        let long_line = format!(r#"{{"long_field": "{}"}}"#, "a".repeat(100));
+        let mut reader = jsonl::JsonlReader::with_options(long_line.as_bytes(), opts);
+        let first = reader.next();
+        assert!(first.is_some(), "stream should yield an error entry");
+        let res = first.unwrap();
+        assert!(
+            matches!(res, Err(ref e) if matches!(e.kind, LineErrorKind::Limit)),
+            "oversized line must fail closed with Limit error"
+        );
+        let err = res.as_ref().unwrap_err();
+        assert_eq!(err.code, "LINE_TOO_LONG");
+        assert!(reader.next().is_none(), "next after limit must be None");
+    }
+
+    // 3. Lazy stream of small valid records, one pull at a time
+    {
+        let total_records = 2000;
+        let tracker = Gate06ReadTracker::new();
+        let fixture = LazyValidRecordsReader::new(total_records, tracker.clone());
+        let opts = JsonlReaderOptions::default()
+            .with_max_line_bytes(16 * 1024)
+            .with_max_buffered_bytes(32 * 1024);
+        let mut reader = jsonl::JsonlReader::with_options(fixture, opts);
+
+        assert_eq!(reader.options().max_line_bytes, 16 * 1024);
+        assert_eq!(reader.options().max_buffered_bytes, 32 * 1024);
+
+        let mut max_valid_cap = reader.retained_buffer_bytes();
+        assert!(max_valid_cap <= 32 * 1024);
+
+        let mut record_count = 0;
+        while let Some(res) = reader.next() {
+            let val = res.expect("valid JSONL record expected");
+            if let DataValue::Document(doc) = &val {
+                let id_val = doc.get("id").and_then(|v| v.as_i64());
+                assert_eq!(
+                    id_val,
+                    Some(record_count as i64),
+                    "record id must match sequential index"
+                );
+            } else {
+                panic!("expected Document record");
+            }
+            record_count += 1;
+
+            // Retained buffer capacity sampled after every pull must stay within 32 KiB
+            let current_cap = reader.retained_buffer_bytes();
+            max_valid_cap = max_valid_cap.max(current_cap);
+            assert!(
+                current_cap <= 32 * 1024,
+                "Retained buffer {} exceeded 32 KiB at record {}",
+                current_cap,
+                record_count
+            );
+
+            // Verify inspecting state between pulls causes no reads
+            let reads_before = tracker.read_calls();
+            let _ = reader.retained_buffer_bytes();
+            let _ = reader.live_memory_bytes();
+            assert_eq!(
+                tracker.read_calls(),
+                reads_before,
+                "inspecting state between pulls must cause no additional reads"
+            );
+
+            // Dropped each record explicitly at end of pull iteration
+            drop(val);
+        }
+
+        assert_eq!(record_count, total_records);
+        assert!(reader.next().is_none(), "stream at EOF yields None");
+
+        // Sample at EOF
+        let eof_cap = reader.retained_buffer_bytes();
+        max_valid_cap = max_valid_cap.max(eof_cap);
+        assert!(
+            eof_cap <= 32 * 1024,
+            "Retained buffer at EOF {} exceeded 32 KiB",
+            eof_cap
+        );
+
+        println!(
+            "[Gate-06 valid stream] records: {}, max retained capacity: {} bytes, total bytes read: {}",
+            record_count,
+            max_valid_cap,
+            tracker.bytes_read()
+        );
+    }
+
+    // 4. Blank-line fail-closed (valid, blank error, stop before next valid record)
+    {
+        let blank_stream = "{\"a\": 1}\n\n{\"b\": 2}\n";
+        let mut default_reader = jsonl::JsonlReader::new(blank_stream.as_bytes());
+
+        let first = default_reader.next();
+        assert!(first.is_some(), "first record must be present");
+        assert!(first.unwrap().is_ok(), "first record valid");
+
+        let second = default_reader.next();
+        assert!(second.is_some(), "blank line must emit an error");
+        let err = second.unwrap().expect_err("blank line must fail closed");
+        assert_eq!(
+            err.kind,
+            LineErrorKind::BlankLine,
+            "blank line error kind must be BlankLine"
+        );
+
+        let third = default_reader.next();
+        assert!(
+            third.is_none(),
+            "stream must terminate before the next valid record"
+        );
+
+        let fourth = default_reader.next();
+        assert!(fourth.is_none(), "stream remains terminated");
+    }
 }
 
 // ============================================================================
