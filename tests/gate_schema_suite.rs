@@ -1694,10 +1694,30 @@ fn test_gate_schema_08_redos_regex_resource_bounding() {
         "backreferences must be rejected"
     );
 
-    // 2. Bounded DFA pattern succeeds within deterministic steps
+    // 2. Functional acceptance and rejection smoke checks (not deterministic work evidence)
     let re = BoundedRegex::new(r"^[a-z]+@[a-z]+\.[a-z]+$").expect("valid email regex");
     assert!(re.is_match("user@example.com").unwrap());
     assert!(!re.is_match("invalid-email").unwrap());
+
+    // 3. Reported search-call counts and match results on selected adversarial inputs
+    // These assertions check reported search-call counts and match results,
+    // not work inside a DFA call.
+    let no_match_re = BoundedRegex::new("a*z").expect("valid regex");
+    let long_a = "a".repeat(20_000);
+    let (found, stats) = no_match_re.find_with_stats(&long_a).expect("execution succeeds");
+    assert_eq!(found, None);
+    assert_eq!(stats.dfa_searches, 1);
+
+    let match_re = BoundedRegex::new("a+b").expect("valid regex");
+    for &n in &[10_000usize, 20_000usize] {
+        let input = format!("{}c{}b", "a".repeat(n), "a".repeat(n));
+        let (m, stats) = match_re.find_with_stats(&input).expect("execution succeeds");
+        let m = m.expect("match must be present");
+        assert_eq!(m.start, n + 1);
+        assert_eq!(m.end, 2 * n + 2);
+        assert_eq!(m.text, format!("{}b", "a".repeat(n)));
+        assert_eq!(stats.dfa_searches, 2);
+    }
 }
 
 // ============================================================================
