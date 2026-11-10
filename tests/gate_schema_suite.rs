@@ -639,6 +639,14 @@ fn test_gate_schema_05_backend_effect_cost_parity() {
     lust_mir_set_status(0);
     let clif_success = clif_func(5, 0);
     assert_eq!(
+        lust_mir_get_status(), 0,
+        "Cranelift status must be 0 on normal success call"
+    );
+    assert!(
+        lust_mir_get_gas() >= 0,
+        "Cranelift remaining gas must be nonnegative on normal success call"
+    );
+    assert_eq!(
         clif_success, 50,
         "Cranelift backend must produce expected result 50 on success path"
     );
@@ -651,12 +659,53 @@ fn test_gate_schema_05_backend_effect_cost_parity() {
     lust_mir_set_status(0);
     let clif_fail = clif_func(5, 1);
     assert_eq!(
+        lust_mir_get_status(), 0,
+        "Cranelift status must be 0 on normal failure branch call"
+    );
+    assert!(
+        lust_mir_get_gas() >= 0,
+        "Cranelift remaining gas must be nonnegative on normal failure branch call"
+    );
+    assert_eq!(
         clif_fail, -1,
         "Cranelift backend must produce expected failure result -1"
     );
     assert_eq!(
         vm_fail, clif_fail,
         "Bytecode VM and Cranelift backend must produce identical results on failure branch"
+    );
+
+    // Ample-budget execution control of (1000, 0) on both backends
+    vm.clear_gas_budget();
+    let vm_ample_val = vm.call("compute_with_effect", vec![Value::Int(1000), Value::Int(0)])
+        .expect("Bytecode VM execution with ample budget must succeed");
+    let vm_ample = match vm_ample_val {
+        Value::Int(v) => v,
+        other => panic!("Bytecode VM returned unexpected value: {:?}", other),
+    };
+    assert_eq!(
+        vm_ample, 10000,
+        "Bytecode VM must produce expected result 10000 on ample budget"
+    );
+
+    lust_mir_set_gas(10_000_000);
+    lust_mir_set_status(0);
+    let clif_ample = clif_func(1000, 0);
+    assert_eq!(
+        lust_mir_get_status(), 0,
+        "Cranelift status must be 0 on ample-budget call"
+    );
+    assert!(
+        lust_mir_get_gas() >= 0,
+        "Cranelift remaining gas must be nonnegative on ample-budget call"
+    );
+    assert_eq!(
+        clif_ample, 10000,
+        "Cranelift backend must produce expected result 10000 on ample budget"
+    );
+    assert_eq!(
+        vm_ample, clif_ample,
+        "Bytecode VM and Cranelift backend must produce identical results on ample budget"
     );
 
     // ------------------------------------------------------------------------
@@ -724,14 +773,34 @@ fn test_gate_schema_05_backend_effect_cost_parity() {
     vm.clear_gas_budget();
     vm.set_memory_budget_bytes(1024 * 1024).expect("memory budget config must succeed");
     vm.reset_memory_counter().expect("memory counter reset must succeed");
-    let _ = vm.call("compute_with_effect", vec![Value::Int(10), Value::Int(0)])
+    let vm_alloc_val = vm.call("compute_with_effect", vec![Value::Int(10), Value::Int(0)])
         .expect("VM execution for allocation measurement must succeed");
+    let vm_alloc_res = match vm_alloc_val {
+        Value::Int(v) => v,
+        other => panic!("Bytecode VM returned unexpected value: {:?}", other),
+    };
+    assert_eq!(
+        vm_alloc_res, 100,
+        "VM execution for allocation measurement must return 100"
+    );
     let vm_allocated_bytes = vm.memory_used_bytes();
 
     lust_mir_set_gas(1_000_000);
     lust_mir_set_status(0);
     let clif_mem_before = lust_mir_get_memory_used();
-    let _ = clif_func(10, 0);
+    let clif_alloc_res = clif_func(10, 0);
+    assert_eq!(
+        lust_mir_get_status(), 0,
+        "Cranelift status must be 0 on allocation measurement call"
+    );
+    assert!(
+        lust_mir_get_gas() >= 0,
+        "Cranelift remaining gas must be nonnegative on allocation measurement call"
+    );
+    assert_eq!(
+        clif_alloc_res, 100,
+        "Cranelift execution for allocation measurement must return 100"
+    );
     let clif_allocated_bytes = (lust_mir_get_memory_used() - clif_mem_before) as usize;
 
     assert!(
@@ -757,6 +826,390 @@ fn test_gate_schema_05_backend_effect_cost_parity() {
         vm_allocated_bytes,
         clif_allocated_bytes
     );
+}
+
+fn parse_gate05_fn(src: &str) -> (lust::ast::FunctionDef, Vec<lust::ast::Item>) {
+    let mut interner = lust::intern::Interner::new();
+    let mut lexer = lust::lexer::Lexer::new(src, &mut interner);
+    let mut parser = lust::parser::Parser::from_lexer(&mut lexer).expect("lexer must tokenize program");
+    let items = parser.parse().expect("parser must parse program items");
+    let mut func_def_opt = None;
+    for item in &items {
+        if let lust::ast::ItemKind::Function(func_def) = &item.kind {
+            func_def_opt = Some(func_def.clone());
+            break;
+        }
+    }
+    (func_def_opt.expect("Function must be parsed"), items)
+}
+
+fn compile_gate05_vm(items: &[lust::ast::Item]) -> lust::vm::VM {
+    let mut compiler = lust::Compiler::new();
+    let bytecode_fns = compiler.compile_module(items)
+        .expect("Bytecode VM backend must compile program");
+    let mut vm = lust::vm::VM::new();
+    vm.load_functions(bytecode_fns);
+    vm
+}
+
+// ----------------------------------------------------------------------------
+// Gate-05 focused tests
+// ----------------------------------------------------------------------------
+
+#[test]
+fn test_gate_schema_05_uninvoked_thunk_is_lazy() {
+    use lust::bytecode::Value;
+    use lust::mir::cranelift_backend::jit_engine::{
+        CraneliftJitCompiler, lust_mir_get_gas, lust_mir_get_memory_used, lust_mir_get_status,
+        lust_mir_set_gas, lust_mir_set_status,
+    };
+    use lust::mir::lowering::AstLowering;
+
+    let ctrl_src = r#"
+        function control(): int
+            return 123
+        end
+    "#;
+
+    let uninvoked_src = r#"
+        function uninvoked(): int
+            local eff = effect do
+                local arr = [7, 8, 9]
+                return arr[0]:unwrap()
+            end
+            return 123
+        end
+    "#;
+
+    let invoked_src = r#"
+        function invoked(): int
+            local eff = effect do
+                local arr = [7, 8, 9]
+                return arr[0]:unwrap()
+            end
+            return eff:run_sync()
+        end
+    "#;
+
+    // 1. Control execution (no thunk, returns 123)
+    let (ctrl_def, ctrl_items) = parse_gate05_fn(ctrl_src);
+    let mut ctrl_vm = compile_gate05_vm(&ctrl_items);
+    ctrl_vm.clear_gas_budget();
+    ctrl_vm.set_memory_budget_bytes(1024 * 1024).unwrap();
+    ctrl_vm.reset_memory_counter().unwrap();
+    let vm_ctrl_val = ctrl_vm.call("control", vec![]).unwrap();
+    assert_eq!(vm_ctrl_val, Value::Int(123));
+    let vm_ctrl_alloc = ctrl_vm.memory_used_bytes();
+
+    let mir_ctrl = AstLowering::lower_function(&ctrl_def).expect("MIR lowering must succeed");
+    let mut jit_ctrl = CraneliftJitCompiler::new().expect("JIT init must succeed");
+    let code_ptr_ctrl = jit_ctrl.compile_function(&mir_ctrl).expect("JIT compile must succeed");
+    let clif_ctrl_fn: extern "C" fn() -> i64 = unsafe { core::mem::transmute(code_ptr_ctrl) };
+    lust_mir_set_gas(1_000_000);
+    lust_mir_set_status(0);
+    let clif_mem_before = lust_mir_get_memory_used();
+    let clif_ctrl_val = clif_ctrl_fn();
+    assert_eq!(lust_mir_get_status(), 0);
+    assert!(lust_mir_get_gas() >= 0);
+    assert_eq!(clif_ctrl_val, 123);
+    let clif_ctrl_alloc = (lust_mir_get_memory_used() - clif_mem_before) as usize;
+
+    // 2. Uninvoked execution (thunk constructed with array body, returns 123 without invoking)
+    let (uninvoked_def, uninvoked_items) = parse_gate05_fn(uninvoked_src);
+    let mut uninvoked_vm = compile_gate05_vm(&uninvoked_items);
+    uninvoked_vm.clear_gas_budget();
+    uninvoked_vm.set_memory_budget_bytes(1024 * 1024).unwrap();
+    uninvoked_vm.reset_memory_counter().unwrap();
+    let vm_uninvoked_val = uninvoked_vm.call("uninvoked", vec![]).unwrap();
+    assert_eq!(vm_uninvoked_val, Value::Int(123));
+    let vm_uninvoked_alloc = uninvoked_vm.memory_used_bytes();
+
+    let mir_uninvoked = AstLowering::lower_function(&uninvoked_def).expect("MIR lowering must succeed");
+    let mut jit_uninvoked = CraneliftJitCompiler::new().expect("JIT init must succeed");
+    let code_ptr_uninvoked = jit_uninvoked.compile_function(&mir_uninvoked).expect("JIT compile must succeed");
+    let clif_uninvoked_fn: extern "C" fn() -> i64 = unsafe { core::mem::transmute(code_ptr_uninvoked) };
+    lust_mir_set_gas(1_000_000);
+    lust_mir_set_status(0);
+    let clif_mem_before = lust_mir_get_memory_used();
+    let clif_uninvoked_val = clif_uninvoked_fn();
+    assert_eq!(lust_mir_get_status(), 0);
+    assert!(lust_mir_get_gas() >= 0);
+    assert_eq!(clif_uninvoked_val, 123);
+    let clif_uninvoked_alloc = (lust_mir_get_memory_used() - clif_mem_before) as usize;
+
+    // Parity check on return values:
+    assert_eq!(vm_uninvoked_val, Value::Int(clif_uninvoked_val));
+
+    // Measured allocation attributable to the body is zero:
+    let vm_body_delta = vm_uninvoked_alloc.saturating_sub(vm_ctrl_alloc);
+    assert_eq!(
+        vm_body_delta, 0,
+        "VM body allocation for uninvoked thunk must be 0 (uninvoked={vm_uninvoked_alloc}, ctrl={vm_ctrl_alloc})"
+    );
+    let clif_body_delta = clif_uninvoked_alloc.saturating_sub(clif_ctrl_alloc);
+    assert_eq!(
+        clif_body_delta, 0,
+        "Cranelift body allocation for uninvoked thunk must be 0 (uninvoked={clif_uninvoked_alloc}, ctrl={clif_ctrl_alloc})"
+    );
+
+    // 3. Invoked execution (positive control: returns 7 with positive allocation increase over uninvoked)
+    let (invoked_def, invoked_items) = parse_gate05_fn(invoked_src);
+    let mut invoked_vm = compile_gate05_vm(&invoked_items);
+    invoked_vm.clear_gas_budget();
+    invoked_vm.set_memory_budget_bytes(1024 * 1024).unwrap();
+    invoked_vm.reset_memory_counter().unwrap();
+    let vm_invoked_val = invoked_vm.call("invoked", vec![]).unwrap();
+    assert_eq!(vm_invoked_val, Value::Int(7));
+    let vm_invoked_alloc = invoked_vm.memory_used_bytes();
+
+    let mir_invoked = AstLowering::lower_function(&invoked_def).expect("MIR lowering must succeed");
+    let mut jit_invoked = CraneliftJitCompiler::new().expect("JIT init must succeed");
+    let code_ptr_invoked = jit_invoked.compile_function(&mir_invoked).expect("JIT compile must succeed");
+    let clif_invoked_fn: extern "C" fn() -> i64 = unsafe { core::mem::transmute(code_ptr_invoked) };
+    lust_mir_set_gas(1_000_000);
+    lust_mir_set_status(0);
+    let clif_mem_before = lust_mir_get_memory_used();
+    let clif_invoked_val = clif_invoked_fn();
+    assert_eq!(lust_mir_get_status(), 0);
+    assert!(lust_mir_get_gas() >= 0);
+    assert_eq!(clif_invoked_val, 7);
+    let clif_invoked_alloc = (lust_mir_get_memory_used() - clif_mem_before) as usize;
+
+    assert_eq!(vm_invoked_val, Value::Int(clif_invoked_val));
+    assert!(
+        vm_invoked_alloc > vm_uninvoked_alloc,
+        "VM invoked allocation ({vm_invoked_alloc}) must be greater than uninvoked ({vm_uninvoked_alloc})"
+    );
+    assert!(
+        clif_invoked_alloc > clif_uninvoked_alloc,
+        "Cranelift invoked allocation ({clif_invoked_alloc}) must be greater than uninvoked ({clif_uninvoked_alloc})"
+    );
+}
+
+#[test]
+fn test_gate_schema_05_capture_snapshot() {
+    use lust::bytecode::Value;
+    use lust::mir::cranelift_backend::jit_engine::{
+        CraneliftJitCompiler, lust_mir_get_gas, lust_mir_get_status, lust_mir_set_gas,
+        lust_mir_set_status,
+    };
+    use lust::mir::lowering::AstLowering;
+
+    let src_reassign = r#"
+        function capture_reassign(x: int): int
+            local eff = effect do
+                return x
+            end
+            x = 99
+            return eff:run_sync() + x
+        end
+    "#;
+
+    let src_shadow = r#"
+        function capture_shadow(x: int): int
+            local eff = effect do
+                return x
+            end
+            local x: int = 99
+            return eff:run_sync() + x
+        end
+    "#;
+
+    for (name, src) in [("capture_reassign", src_reassign), ("capture_shadow", src_shadow)] {
+        let (func_def, items) = parse_gate05_fn(src);
+
+        // Bytecode VM
+        let mut vm = compile_gate05_vm(&items);
+        vm.clear_gas_budget();
+        let vm_res_val = vm.call(name, vec![Value::Int(7)])
+            .expect("VM execution must succeed");
+        let vm_res = match vm_res_val {
+            Value::Int(v) => v,
+            other => panic!("VM returned unexpected: {:?}", other),
+        };
+
+        // Cranelift
+        let mir_fn = AstLowering::lower_function(&func_def)
+            .expect("MIR lowering must succeed");
+        let mut jit = CraneliftJitCompiler::new()
+            .expect("Cranelift JIT backend must initialize");
+        let code_ptr = jit.compile_function(&mir_fn)
+            .expect("Cranelift JIT compilation must succeed");
+        let clif_fn: extern "C" fn(i64) -> i64 = unsafe { core::mem::transmute(code_ptr) };
+
+        lust_mir_set_gas(1_000_000);
+        lust_mir_set_status(0);
+        let clif_res = clif_fn(7);
+        assert_eq!(lust_mir_get_status(), 0);
+        assert!(lust_mir_get_gas() >= 0);
+
+        assert_eq!(clif_res, 106, "{name} on Cranelift must be 106, got {clif_res}");
+        assert_eq!(vm_res, 106, "{name} on VM must be 106, got {vm_res}");
+    }
+}
+
+#[test]
+fn test_gate_schema_05_thunk_return_resumes_caller() {
+    use lust::bytecode::Value;
+    use lust::mir::cranelift_backend::jit_engine::{
+        CraneliftJitCompiler, lust_mir_get_gas, lust_mir_get_status, lust_mir_set_gas,
+        lust_mir_set_status,
+    };
+    use lust::mir::lowering::AstLowering;
+
+    let src = r#"
+        function thunk_return_resumes(): int
+            local eff = effect do
+                return 7
+            end
+            local res: int = eff:run_sync()
+            return res + 5
+        end
+    "#;
+
+    let (func_def, items) = parse_gate05_fn(src);
+
+    // Bytecode VM
+    let mut vm = compile_gate05_vm(&items);
+    vm.clear_gas_budget();
+    let vm_res_val = vm.call("thunk_return_resumes", vec![])
+        .expect("VM execution must succeed");
+    let vm_res = match vm_res_val {
+        Value::Int(v) => v,
+        other => panic!("VM returned unexpected: {:?}", other),
+    };
+    assert_eq!(vm_res, 12, "Bytecode VM must resume caller after thunk return, expecting 12");
+
+    // Cranelift
+    let mir_fn = AstLowering::lower_function(&func_def)
+        .expect("MIR lowering must succeed");
+    let mut jit = CraneliftJitCompiler::new()
+        .expect("Cranelift JIT backend must initialize");
+    let code_ptr = jit.compile_function(&mir_fn)
+        .expect("Cranelift JIT compilation must succeed");
+    let clif_fn: extern "C" fn() -> i64 = unsafe { core::mem::transmute(code_ptr) };
+
+    lust_mir_set_gas(1_000_000);
+    lust_mir_set_status(0);
+    let clif_res = clif_fn();
+    assert_eq!(lust_mir_get_status(), 0);
+    assert!(lust_mir_get_gas() >= 0);
+    assert_eq!(clif_res, 12, "Cranelift must resume caller after thunk return, expecting 12");
+    assert_eq!(vm_res, clif_res, "Both backends must agree on resumed result 12");
+}
+
+#[test]
+fn test_gate_schema_05_repeated_invocation_reruns_body() {
+    use lust::bytecode::Value;
+    use lust::mir::cranelift_backend::jit_engine::{
+        CraneliftJitCompiler, lust_mir_get_gas, lust_mir_get_memory_used, lust_mir_get_status,
+        lust_mir_set_gas, lust_mir_set_status,
+    };
+    use lust::mir::lowering::AstLowering;
+
+    let src = r#"
+        function repeated_invocations(count: int): int
+            local eff = effect do
+                local arr = [7, 8, 9]
+                return arr[0]:unwrap()
+            end
+            local sum: int = 0
+            local i: int = 0
+            while i < count do
+                sum = sum + eff:run_sync()
+                i = i + 1
+            end
+            return sum
+        end
+    "#;
+
+    let (func_def, items) = parse_gate05_fn(src);
+
+    let mir_fn = AstLowering::lower_function(&func_def)
+        .expect("MIR lowering must succeed");
+    let mut jit = CraneliftJitCompiler::new()
+        .expect("Cranelift JIT backend must initialize");
+    let code_ptr = jit.compile_function(&mir_fn)
+        .expect("Cranelift JIT compilation must succeed");
+    let clif_fn: extern "C" fn(i64) -> i64 = unsafe { core::mem::transmute(code_ptr) };
+
+    let mut vm_costs = Vec::new();
+    let mut clif_costs = Vec::new();
+
+    let expected_results = [0, 7, 14];
+
+    for count in 0..=2 {
+        // VM run
+        let mut vm = compile_gate05_vm(&items);
+        vm.clear_gas_budget();
+        vm.set_memory_budget_bytes(1024 * 1024).unwrap();
+        vm.reset_memory_counter().unwrap();
+        let vm_res_val = vm.call("repeated_invocations", vec![Value::Int(count)])
+            .expect("VM execution must succeed");
+        let vm_res = match vm_res_val {
+            Value::Int(v) => v,
+            other => panic!("VM returned unexpected: {:?}", other),
+        };
+        assert_eq!(
+            vm_res, expected_results[count as usize],
+            "VM result for count {count} must be {}", expected_results[count as usize]
+        );
+        vm_costs.push(vm.memory_used_bytes());
+
+        // Cranelift run
+        lust_mir_set_gas(1_000_000);
+        lust_mir_set_status(0);
+        let mem_before = lust_mir_get_memory_used();
+        let clif_res = clif_fn(count);
+        assert_eq!(lust_mir_get_status(), 0);
+        assert!(lust_mir_get_gas() >= 0);
+        assert_eq!(
+            clif_res, expected_results[count as usize],
+            "Cranelift result for count {count} must be {}", expected_results[count as usize]
+        );
+        clif_costs.push((lust_mir_get_memory_used() - mem_before) as usize);
+
+        assert_eq!(vm_res, clif_res, "Parity between VM and Cranelift for count {count}");
+    }
+
+    // Allocation assertions per backend:
+    // D1 > D0 and D2 - D1 == D1 - D0
+    let (v0, v1, v2) = (vm_costs[0], vm_costs[1], vm_costs[2]);
+    assert!(v1 > v0, "VM D1 ({v1}) must be greater than D0 ({v0})");
+    assert_eq!(v2 - v1, v1 - v0, "VM D2 - D1 ({}) must equal D1 - D0 ({})", v2 - v1, v1 - v0);
+
+    let (c0, c1, c2) = (clif_costs[0], clif_costs[1], clif_costs[2]);
+    assert!(c1 > c0, "Cranelift D1 ({c1}) must be greater than D0 ({c0})");
+    assert_eq!(c2 - c1, c1 - c0, "Cranelift D2 - D1 ({}) must equal D1 - D0 ({})", c2 - c1, c1 - c0);
+}
+
+#[test]
+fn test_gate_schema_05_unsupported_escape_fails_closed() {
+    use lust::mir::lowering::{AstLowering, MirLowerError};
+
+    let src = r#"
+        function escape_thunk(): int
+            local eff = effect do
+                return 42
+            end
+            return eff
+        end
+    "#;
+
+    let (func_def, _items) = parse_gate05_fn(src);
+
+    let lower_res = AstLowering::lower_function(&func_def);
+    match lower_res {
+        Err(MirLowerError::UnlowerableExpression(msg)) => {
+            assert!(
+                msg.contains("cannot escape or be used as a value"),
+                "Diagnostic must mention thunk escape/value rejection, got: {msg}"
+            );
+        }
+        other => {
+            panic!("Expected Err(MirLowerError::UnlowerableExpression) for escaping thunk, got: {other:?}");
+        }
+    }
 }
 
 // ============================================================================
