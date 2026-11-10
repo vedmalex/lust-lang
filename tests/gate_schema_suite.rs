@@ -153,25 +153,263 @@ fn test_gate_schema_03_lifetime_abi_isolation() {
 // ============================================================================
 #[test]
 fn test_gate_schema_04_opt_in_dce_authority() {
-    let mut config = LustConfig::pure();
-    config.set_strict_capabilities(true);
+    use lust::codegen_zig::{analyze_runtime_requirements, tree_shake_items, ZigCodegen};
+    use object::{Object, ObjectSymbol};
 
-    // Without explicit grant, unauthorized standard modules are denied
+    let dir = temp_test_dir("gate04_authority");
+    fs::create_dir_all(&dir).unwrap();
+
+    let mut strict_config = LustConfig::pure();
+    strict_config.set_strict_capabilities(true);
+
+    // Baseline config checks
     assert!(
-        !config.is_std_module_allowed("@std/os"),
+        !strict_config.is_std_module_allowed("@std/os"),
         "Unauthorized os module must be denied in strict mode"
     );
     assert!(
-        !config.is_std_module_allowed("@std/io"),
+        !strict_config.is_std_module_allowed("@std/io"),
         "Unauthorized io module must be denied in strict mode"
     );
 
-    // When granted, permitted module passes
-    config.allow_std_module("bson");
+    // 1. Compile errors for unpermitted std module (@std/os or @std/io):
+    // 1a. Import: import statement & use statement
+    let import_file = dir.join("deny_import.lust");
+    fs::write(
+        &import_file,
+        "import os from \"@std/os\"\nfunction main(): int return 0 end\n",
+    )
+    .unwrap();
+    let mut loader = ModuleLoader::new(dir.clone()).with_config(strict_config.clone());
+    let res_import = loader.load_program_from_entry(import_file.to_str().unwrap());
     assert!(
-        config.is_std_module_allowed("@std/bson"),
+        res_import.is_err(),
+        "import of unpermitted @std/os must be a compile error"
+    );
+
+    let use_io_file = dir.join("deny_use_io.lust");
+    fs::write(
+        &use_io_file,
+        "use std.io\nfunction main(): int return 0 end\n",
+    )
+    .unwrap();
+    let mut loader = ModuleLoader::new(dir.clone()).with_config(strict_config.clone());
+    let res_use_io = loader.load_program_from_entry(use_io_file.to_str().unwrap());
+    assert!(
+        res_use_io.is_err(),
+        "use import of unpermitted std.io must be a compile error"
+    );
+
+    // 1b. Alias: use ... as ...
+    let alias_os_file = dir.join("deny_alias_os.lust");
+    fs::write(
+        &alias_os_file,
+        "use std.os as my_os\nfunction main(): int return 0 end\n",
+    )
+    .unwrap();
+    let mut loader = ModuleLoader::new(dir.clone()).with_config(strict_config.clone());
+    let res_alias = loader.load_program_from_entry(alias_os_file.to_str().unwrap());
+    assert!(
+        res_alias.is_err(),
+        "alias of unpermitted std.os must be a compile error"
+    );
+
+    let alias_io_file = dir.join("deny_alias_io.lust");
+    fs::write(
+        &alias_io_file,
+        "use std.io as my_io\nfunction main(): int return 0 end\n",
+    )
+    .unwrap();
+    let mut loader = ModuleLoader::new(dir.clone()).with_config(strict_config.clone());
+    let res_alias_io = loader.load_program_from_entry(alias_io_file.to_str().unwrap());
+    assert!(
+        res_alias_io.is_err(),
+        "alias of unpermitted std.io must be a compile error"
+    );
+
+    // 1c. Re-export: pub use ...
+    let reexport_os_file = dir.join("deny_reexport_os.lust");
+    fs::write(
+        &reexport_os_file,
+        "pub use std.os\nfunction main(): int return 0 end\n",
+    )
+    .unwrap();
+    let mut loader = ModuleLoader::new(dir.clone()).with_config(strict_config.clone());
+    let res_reexport_os = loader.load_program_from_entry(reexport_os_file.to_str().unwrap());
+    assert!(
+        res_reexport_os.is_err(),
+        "re-export of unpermitted std.os must be a compile error"
+    );
+
+    let reexport_io_file = dir.join("deny_reexport_io.lust");
+    fs::write(
+        &reexport_io_file,
+        "pub use std.io\nfunction main(): int return 0 end\n",
+    )
+    .unwrap();
+    let mut loader = ModuleLoader::new(dir.clone()).with_config(strict_config.clone());
+    let res_reexport_io = loader.load_program_from_entry(reexport_io_file.to_str().unwrap());
+    assert!(
+        res_reexport_io.is_err(),
+        "re-export of unpermitted std.io must be a compile error"
+    );
+
+    // 1d. Dynamic import: import("@std/os") or import("@std/io")
+    let dynamic_os_file = dir.join("deny_dyn_os.lust");
+    fs::write(
+        &dynamic_os_file,
+        "function main(): int\n    local m = import(\"@std/os\")\n    return 0\nend\n",
+    )
+    .unwrap();
+    let mut loader = ModuleLoader::new(dir.clone()).with_config(strict_config.clone());
+    let res_dyn_os = loader.load_program_from_entry(dynamic_os_file.to_str().unwrap());
+    assert!(
+        res_dyn_os.is_err(),
+        "dynamic import of unpermitted @std/os must be a compile error"
+    );
+
+    let dynamic_io_file = dir.join("deny_dyn_io.lust");
+    fs::write(
+        &dynamic_io_file,
+        "function main(): int\n    local m = import(\"@std/io\")\n    return 0\nend\n",
+    )
+    .unwrap();
+    let mut loader = ModuleLoader::new(dir.clone()).with_config(strict_config.clone());
+    let res_dyn_io = loader.load_program_from_entry(dynamic_io_file.to_str().unwrap());
+    assert!(
+        res_dyn_io.is_err(),
+        "dynamic import of unpermitted @std/io must be a compile error"
+    );
+
+    // 2. The denial happens before any host effect of that module runs. Assert effect was not observed.
+    let witness_file = dir.join("host_effect_observed.txt");
+    let effect_file = dir.join("deny_effect.lust");
+    fs::write(
+        &effect_file,
+        format!(
+            "import os from \"@std/os\"\nfunction main(): int\n    os.create_file(\"{}\")\n    return 0\nend\n",
+            witness_file.display()
+        ),
+    )
+    .unwrap();
+    let mut loader = ModuleLoader::new(dir.clone()).with_config(strict_config.clone());
+    let res_effect = loader.load_program_from_entry(effect_file.to_str().unwrap());
+    assert!(
+        res_effect.is_err(),
+        "compilation must fail before host effect can run"
+    );
+    assert!(
+        !witness_file.exists(),
+        "host effect must not be observed: witness file was created!"
+    );
+
+    // 3. Permitted module (@std/bson after an explicit allow) still imports
+    let mut permitted_config = LustConfig::pure();
+    permitted_config.set_strict_capabilities(true);
+    permitted_config.allow_std_module("bson");
+    assert!(
+        permitted_config.is_std_module_allowed("@std/bson"),
         "Permitted module must pass authorization check"
     );
+
+    let bson_file = dir.join("allow_bson.lust");
+    fs::write(
+        &bson_file,
+        "import bson from \"@std/bson\"\nfunction main(): int return 42 end\n",
+    )
+    .unwrap();
+    let mut loader_permitted = ModuleLoader::new(dir.clone()).with_config(permitted_config);
+    let prog_bson = loader_permitted
+        .load_program_from_entry(bson_file.to_str().unwrap())
+        .expect("permitted @std/bson must import successfully");
+    assert_eq!(prog_bson.modules.len(), 1);
+    assert!(
+        prog_bson.modules[0]
+            .imports
+            .module_aliases
+            .contains_key("bson"),
+        "@std/bson alias must be registered on permitted import"
+    );
+
+    // 4. Dead-code elimination: compiled artifact and link output do not contain denied host entries
+    let dce_file = dir.join("dce_program.lust");
+    fs::write(
+        &dce_file,
+        "function compute(x: int): int\n    return x * 2 + 1\nend\n",
+    )
+    .unwrap();
+    let mut loader_dce = ModuleLoader::new(dir.clone()).with_config(strict_config.clone());
+    let prog_dce = loader_dce
+        .load_program_from_entry(dce_file.to_str().unwrap())
+        .expect("pure program must compile successfully");
+
+    let shaken = tree_shake_items(&prog_dce.modules[0].items, false);
+    let opts = analyze_runtime_requirements(&shaken, false, None);
+    assert!(
+        !opts.needs_print,
+        "print runtime must not be needed for pure compute"
+    );
+
+    let mut codegen = ZigCodegen::with_options(opts);
+    let compiled_artifact = codegen
+        .generate_program(&shaken)
+        .expect("AOT codegen must succeed");
+
+    // Check compiled source artifact directly
+    assert!(
+        !compiled_artifact.contains("__lust_print"),
+        "compiled artifact must not contain __lust_print"
+    );
+    assert!(
+        !compiled_artifact.contains("__lust_println"),
+        "compiled artifact must not contain __lust_println"
+    );
+    assert!(
+        !compiled_artifact.contains("std.c.write"),
+        "compiled artifact must not contain host std.c.write entry"
+    );
+    assert!(
+        !compiled_artifact.contains("fwrite"),
+        "compiled artifact must not contain host fwrite entry"
+    );
+    assert!(
+        !compiled_artifact.contains("os.remove_file"),
+        "compiled artifact must not contain host os.remove_file entry"
+    );
+    assert!(
+        !compiled_artifact.contains("os.sleep"),
+        "compiled artifact must not contain host os.sleep entry"
+    );
+
+    // Check compiled binary / link output artifact
+    let zig_path = dir.join("dce_artifact.zig");
+    let obj_path = dir.join("dce_artifact.o");
+    fs::write(&zig_path, &compiled_artifact).unwrap();
+    let obj_output = std::process::Command::new("zig")
+        .arg("build-obj")
+        .arg(&zig_path)
+        .arg(format!("-femit-bin={}", obj_path.display()))
+        .output()
+        .expect("invoke zig build-obj to produce compiled link artifact");
+    assert!(obj_output.status.success(), "zig build-obj must succeed");
+
+    let obj_bytes = fs::read(&obj_path).expect("read compiled binary artifact");
+    let obj_file = object::File::parse(&*obj_bytes).expect("parse compiled binary artifact");
+    for sym in obj_file.symbols() {
+        let name = sym.name().unwrap_or_default();
+        assert!(
+            name != "__lust_print" && name != "__lust_println" && name != "write_stdout" && name != "write_file",
+            "compiled link artifact must not contain host write entry: {}",
+            name
+        );
+        assert!(
+            !name.contains("fwrite") && !name.contains("remove_file") && !name.contains("os_sleep"),
+            "compiled link artifact must not contain host entry: {}",
+            name
+        );
+    }
+
+    let _ = fs::remove_dir_all(dir);
 }
 
 // ============================================================================

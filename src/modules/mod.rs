@@ -417,10 +417,63 @@ impl ModuleLoader {
         None
     }
 
+    fn extract_dynamic_import_target(line: &str) -> Option<String> {
+        let trimmed = line.trim();
+        if trimmed.starts_with("//") || trimmed.starts_with("--") {
+            return None;
+        }
+        for kw in ["import(", "require("] {
+            let mut search_from = 0;
+            while let Some(pos) = line[search_from..].find(kw) {
+                let actual_pos = search_from + pos;
+                let after = line[actual_pos + kw.len()..].trim_start();
+                if let Some(quote) = after.chars().next() {
+                    if quote == '"' || quote == '\'' {
+                        let inner = &after[1..];
+                        if let Some(end_quote) = inner.find(quote) {
+                            let target = &inner[..end_quote];
+                            return Some(target.to_string());
+                        }
+                    }
+                }
+                search_from = actual_pos + kw.len();
+            }
+        }
+        None
+    }
+
     fn process_data_imports(&mut self, source: &str, current_file: &Path) -> Result<String> {
         let mut result = String::with_capacity(source.len());
         for line in source.lines() {
-            if let Some((ident, import_path)) = Self::parse_import_statement(line) {
+            let processed_line = if line.trim_start().starts_with("use @std/") || line.trim_start().starts_with("pub use @std/") {
+                line.replace("@std/", "std.")
+            } else {
+                line.to_string()
+            };
+
+            if let Some(target) = Self::extract_dynamic_import_target(&processed_line) {
+                if crate::builtins::is_virtual_std_module(&target) {
+                    if !self.config.is_std_module_allowed(&target) {
+                        return Err(LustError::CompileError(format!(
+                            "CapabilityDenied: dynamic import of module '{}' is not enabled in this sandbox",
+                            target
+                        )));
+                    }
+                }
+            }
+
+            if let Some((ident, import_path)) = Self::parse_import_statement(&processed_line) {
+                if crate::builtins::is_virtual_std_module(&import_path) {
+                    if !self.config.is_std_module_allowed(&import_path) {
+                        return Err(LustError::CompileError(format!(
+                            "CapabilityDenied: module '{}' is not enabled in this sandbox",
+                            import_path
+                        )));
+                    }
+                    let canon = crate::builtins::canonical_std_module_name(&import_path);
+                    result.push_str(&format!("use std.{} as {}\n", canon, ident));
+                    continue;
+                }
                 if import_path.ends_with(".json") {
                     let resolved = if import_path.starts_with("./") || import_path.starts_with("../") {
                         current_file.parent().unwrap_or(Path::new(".")).join(&import_path)
@@ -443,7 +496,7 @@ impl ModuleLoader {
                     continue;
                 }
             }
-            result.push_str(line);
+            result.push_str(&processed_line);
             result.push('\n');
         }
         Ok(result)
@@ -997,11 +1050,247 @@ impl ModuleLoader {
             }
         }
 
+        self.validate_dynamic_imports(&module.items)?;
+
         module
             .imports
             .module_aliases
             .entry(self.simple_tail(&module.path).to_string())
             .or_insert_with(|| module.path.clone());
+        Ok(())
+    }
+
+    fn validate_dynamic_imports(&self, items: &[Item]) -> Result<()> {
+        for item in items {
+            match &item.kind {
+                ItemKind::Script(stmts) => {
+                    for stmt in stmts {
+                        self.validate_dynamic_imports_in_stmt(stmt)?;
+                    }
+                }
+                ItemKind::Function(func) => {
+                    for stmt in &func.body {
+                        self.validate_dynamic_imports_in_stmt(stmt)?;
+                    }
+                }
+                ItemKind::Impl(impl_block) => {
+                    for method in &impl_block.methods {
+                        for stmt in &method.body {
+                            self.validate_dynamic_imports_in_stmt(stmt)?;
+                        }
+                    }
+                }
+                ItemKind::Trait(trait_def) => {
+                    for method in &trait_def.methods {
+                        if let Some(default_impl) = &method.default_impl {
+                            for stmt in default_impl {
+                                self.validate_dynamic_imports_in_stmt(stmt)?;
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_dynamic_imports_in_stmt(&self, stmt: &crate::ast::Stmt) -> Result<()> {
+        use crate::ast::StmtKind;
+        match &stmt.kind {
+            StmtKind::Local { initializer, .. } => {
+                if let Some(values) = initializer {
+                    for expr in values {
+                        self.validate_dynamic_imports_in_expr(expr)?;
+                    }
+                }
+            }
+            StmtKind::Assign { targets, values } => {
+                for expr in targets {
+                    self.validate_dynamic_imports_in_expr(expr)?;
+                }
+                for expr in values {
+                    self.validate_dynamic_imports_in_expr(expr)?;
+                }
+            }
+            StmtKind::CompoundAssign { target, value, .. } => {
+                self.validate_dynamic_imports_in_expr(target)?;
+                self.validate_dynamic_imports_in_expr(value)?;
+            }
+            StmtKind::Expr(expr) => self.validate_dynamic_imports_in_expr(expr)?,
+            StmtKind::If {
+                condition,
+                then_block,
+                elseif_branches,
+                else_block,
+            } => {
+                self.validate_dynamic_imports_in_expr(condition)?;
+                for s in then_block {
+                    self.validate_dynamic_imports_in_stmt(s)?;
+                }
+                for (cond, block) in elseif_branches {
+                    self.validate_dynamic_imports_in_expr(cond)?;
+                    for s in block {
+                        self.validate_dynamic_imports_in_stmt(s)?;
+                    }
+                }
+                if let Some(block) = else_block {
+                    for s in block {
+                        self.validate_dynamic_imports_in_stmt(s)?;
+                    }
+                }
+            }
+            StmtKind::While { condition, body } => {
+                self.validate_dynamic_imports_in_expr(condition)?;
+                for s in body {
+                    self.validate_dynamic_imports_in_stmt(s)?;
+                }
+            }
+            StmtKind::ForNumeric {
+                start,
+                end,
+                step,
+                body,
+                ..
+            } => {
+                self.validate_dynamic_imports_in_expr(start)?;
+                self.validate_dynamic_imports_in_expr(end)?;
+                if let Some(step) = step {
+                    self.validate_dynamic_imports_in_expr(step)?;
+                }
+                for s in body {
+                    self.validate_dynamic_imports_in_stmt(s)?;
+                }
+            }
+            StmtKind::ForIn { iterator, body, .. } => {
+                self.validate_dynamic_imports_in_expr(iterator)?;
+                for s in body {
+                    self.validate_dynamic_imports_in_stmt(s)?;
+                }
+            }
+            StmtKind::Return(values) => {
+                for expr in values {
+                    self.validate_dynamic_imports_in_expr(expr)?;
+                }
+            }
+            StmtKind::Block(stmts) | StmtKind::Scoped(stmts) => {
+                for s in stmts {
+                    self.validate_dynamic_imports_in_stmt(s)?;
+                }
+            }
+            StmtKind::Break | StmtKind::Continue => {}
+            StmtKind::Defer(s) | StmtKind::ErrDefer(s) => {
+                self.validate_dynamic_imports_in_stmt(s)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_dynamic_imports_in_expr(&self, expr: &crate::ast::Expr) -> Result<()> {
+        use crate::ast::{ExprKind, Literal};
+        match &expr.kind {
+            ExprKind::Call { callee, args, .. } => {
+                let is_dynamic_import = match &callee.kind {
+                    ExprKind::Identifier(name) => name == "import" || name == "require",
+                    ExprKind::FieldAccess { object, field } => {
+                        (field == "import" || field == "require")
+                            && matches!(&object.kind, ExprKind::Identifier(name) if name == "lua")
+                    }
+                    _ => false,
+                };
+                if is_dynamic_import {
+                    if let Some(arg) = args.first() {
+                        if let ExprKind::Literal(Literal::String(mod_name)) = &arg.kind {
+                            if crate::builtins::is_virtual_std_module(mod_name) {
+                                if !self.config.is_std_module_allowed(mod_name) {
+                                    return Err(LustError::CompileError(format!(
+                                        "CapabilityDenied: dynamic import of module '{}' is not enabled in this sandbox",
+                                        mod_name
+                                    )));
+                                }
+                            }
+                        }
+                    }
+                }
+                self.validate_dynamic_imports_in_expr(callee)?;
+                for arg in args {
+                    self.validate_dynamic_imports_in_expr(arg)?;
+                }
+            }
+            ExprKind::MethodCall { receiver, args, .. } => {
+                self.validate_dynamic_imports_in_expr(receiver)?;
+                for arg in args {
+                    self.validate_dynamic_imports_in_expr(arg)?;
+                }
+            }
+            ExprKind::Binary { left, right, .. } => {
+                self.validate_dynamic_imports_in_expr(left)?;
+                self.validate_dynamic_imports_in_expr(right)?;
+            }
+            ExprKind::Unary { operand, .. } => self.validate_dynamic_imports_in_expr(operand)?,
+            ExprKind::FieldAccess { object, .. } => self.validate_dynamic_imports_in_expr(object)?,
+            ExprKind::Index { object, index } => {
+                self.validate_dynamic_imports_in_expr(object)?;
+                self.validate_dynamic_imports_in_expr(index)?;
+            }
+            ExprKind::Array(elements) | ExprKind::Tuple(elements) => {
+                for element in elements {
+                    self.validate_dynamic_imports_in_expr(element)?;
+                }
+            }
+            ExprKind::Map(entries) => {
+                for (k, v) in entries {
+                    self.validate_dynamic_imports_in_expr(k)?;
+                    self.validate_dynamic_imports_in_expr(v)?;
+                }
+            }
+            ExprKind::StructLiteral { fields, .. } => {
+                for field in fields {
+                    self.validate_dynamic_imports_in_expr(&field.value)?;
+                }
+            }
+            ExprKind::EnumConstructor { args, .. } => {
+                for arg in args {
+                    self.validate_dynamic_imports_in_expr(arg)?;
+                }
+            }
+            ExprKind::Lambda { body, .. } => self.validate_dynamic_imports_in_expr(body)?,
+            ExprKind::Paren(inner) => self.validate_dynamic_imports_in_expr(inner)?,
+            ExprKind::Cast { expr, .. } => self.validate_dynamic_imports_in_expr(expr)?,
+            ExprKind::TypeCheck { expr, .. } => self.validate_dynamic_imports_in_expr(expr)?,
+            ExprKind::IsPattern { expr, .. } => self.validate_dynamic_imports_in_expr(expr)?,
+            ExprKind::If {
+                condition,
+                then_branch,
+                else_branch,
+            } => {
+                self.validate_dynamic_imports_in_expr(condition)?;
+                self.validate_dynamic_imports_in_expr(then_branch)?;
+                if let Some(other) = else_branch {
+                    self.validate_dynamic_imports_in_expr(other)?;
+                }
+            }
+            ExprKind::Block(stmts) => {
+                for s in stmts {
+                    self.validate_dynamic_imports_in_stmt(s)?;
+                }
+            }
+            ExprKind::Return(values) => {
+                for value in values {
+                    self.validate_dynamic_imports_in_expr(value)?;
+                }
+            }
+            ExprKind::Range { start, end, .. } => {
+                self.validate_dynamic_imports_in_expr(start)?;
+                self.validate_dynamic_imports_in_expr(end)?;
+            }
+            ExprKind::Literal(_) | ExprKind::Identifier(_) => {}
+            ExprKind::EffectBlock(stmts) => {
+                for s in stmts {
+                    self.validate_dynamic_imports_in_stmt(s)?;
+                }
+            }
+        }
         Ok(())
     }
 
